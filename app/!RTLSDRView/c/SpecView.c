@@ -188,7 +188,7 @@ static unsigned long debug_reads_bad_g = 0;
 static double debug_db_min_g = 0.0;
 static double debug_db_max_g = 0.0;
 static double debug_db_dc_g = 0.0;
-static unsigned char debug_first_bytes_g[8];
+static unsigned char debug_first_bytes_g[12];
 static unsigned char debug_byte_min_g = 255;
 static unsigned char debug_byte_max_g = 0;
 
@@ -410,21 +410,31 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
            at the graphics cursor (GFX_Move'd position) instead of the
            text cursor; VDU 4 reverts. */
         {
-            char line1[32], line2[32], line3[32];
+            char line1[32], line2[32], line3[24], line4[24], line5[24];
             sprintf(line1, "ok=%lu bad=%lu",
                     debug_reads_ok_g, debug_reads_bad_g);
-            sprintf(line2, "min=%.0f max=%.0f dc=%.0f",
-                    debug_db_min_g, debug_db_max_g, debug_db_dc_g);
-            /* Raw ADC byte range across the WHOLE frame (not just the
-               first 4 bytes) -- second real run showed min=max=46dB
-               across the whole non-DC spectrum, i.e. under 1dB of
-               variation everywhere except DC. This tells us whether
-               that's because the ADC itself sees almost no signal swing
-               (byte_min/byte_max close together, near 127) or whether
-               real swing is present and something downstream is
-               flattening it. */
-            sprintf(line3, "byte %u..%u",
-                    (unsigned)debug_byte_min_g, (unsigned)debug_byte_max_g);
+            /* Third real run: byte range was 0..129 (real, substantial
+               variation -- not a stuck buffer) yet dc=93 dominated a
+               flat ~42dB noise floor everywhere else, and the byte
+               range sat entirely BELOW the expected ~127.5 centre
+               rather than spread around it -- asymmetric in a way
+               healthy I/Q data shouldn't be. Showing 12 consecutive raw
+               bytes (not just min/max) to see the actual shape: real
+               noise should look unpredictable sample to sample; a stuck
+               pattern (repeats, a fixed step, all-same-parity) would
+               point at a bug instead of a front-end/RF issue. */
+            sprintf(line2, "byte %u..%u dc=%.0f",
+                    (unsigned)debug_byte_min_g, (unsigned)debug_byte_max_g,
+                    debug_db_dc_g);
+            sprintf(line3, "%02X %02X %02X %02X",
+                    debug_first_bytes_g[0], debug_first_bytes_g[1],
+                    debug_first_bytes_g[2], debug_first_bytes_g[3]);
+            sprintf(line4, "%02X %02X %02X %02X",
+                    debug_first_bytes_g[4], debug_first_bytes_g[5],
+                    debug_first_bytes_g[6], debug_first_bytes_g[7]);
+            sprintf(line5, "%02X %02X %02X %02X",
+                    debug_first_bytes_g[8], debug_first_bytes_g[9],
+                    debug_first_bytes_g[10], debug_first_bytes_g[11]);
             GFX_VDU(5);
             GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
@@ -432,6 +442,10 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
             GFX_Write0(line2);
             GFX_Move(ox + 4, oy - 132);
             GFX_Write0(line3);
+            GFX_Move(ox + 4, oy - 188);
+            GFX_Write0(line4);
+            GFX_Move(ox + 4, oy - 244);
+            GFX_Write0(line5);
             GFX_VDU(4);
         }
 
