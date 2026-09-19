@@ -189,6 +189,8 @@ static double debug_db_min_g = 0.0;
 static double debug_db_max_g = 0.0;
 static double debug_db_dc_g = 0.0;
 static unsigned char debug_first_bytes_g[8];
+static unsigned char debug_byte_min_g = 255;
+static unsigned char debug_byte_max_g = 0;
 
 /* ---- in-place iterative radix-2 DIT FFT, fixed N=FFT_SIZE ---- */
 static void fft256(double *re, double *im)
@@ -336,10 +338,25 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
     for (i = 0; i < BATCH_READS; i++) {
         got = os_gbpb_read4(stream_handle_g, scratch, IQ_BYTES);
         if (got == IQ_BYTES) {
+            int j;
             memcpy(iq_frame_g, scratch, IQ_BYTES);
             any_ok = 1;
             debug_reads_ok_g++;
             memcpy(debug_first_bytes_g, iq_frame_g, sizeof(debug_first_bytes_g));
+            /* raw byte range across the WHOLE frame, not just the first
+               4 bytes -- distinguishes "the ADC genuinely sees almost no
+               swing" from "the FFT/scaling math is flattening real
+               variation". See the debug_*_g comment above. */
+            debug_byte_min_g = 255;
+            debug_byte_max_g = 0;
+            for (j = 0; j < IQ_BYTES; j++) {
+                if (iq_frame_g[j] < debug_byte_min_g) {
+                    debug_byte_min_g = iq_frame_g[j];
+                }
+                if (iq_frame_g[j] > debug_byte_max_g) {
+                    debug_byte_max_g = iq_frame_g[j];
+                }
+            }
         } else {
             debug_reads_bad_g++;
         }
@@ -398,14 +415,16 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                     debug_reads_ok_g, debug_reads_bad_g);
             sprintf(line2, "min=%.0f max=%.0f dc=%.0f",
                     debug_db_min_g, debug_db_max_g, debug_db_dc_g);
-            sprintf(line3, "b0=%02X,%02X,%02X,%02X",
-                    debug_first_bytes_g[0], debug_first_bytes_g[1],
-                    debug_first_bytes_g[2], debug_first_bytes_g[3]);
-            /* 20-unit spacing overlapped badly on the first real run --
-               this system font's line height is clearly taller than
-               that. 56 units is a generous guess, not a measured value
-               (nothing in this project has drawn Wimp text before now
-               to measure against). */
+            /* Raw ADC byte range across the WHOLE frame (not just the
+               first 4 bytes) -- second real run showed min=max=46dB
+               across the whole non-DC spectrum, i.e. under 1dB of
+               variation everywhere except DC. This tells us whether
+               that's because the ADC itself sees almost no signal swing
+               (byte_min/byte_max close together, near 127) or whether
+               real swing is present and something downstream is
+               flattening it. */
+            sprintf(line3, "byte %u..%u",
+                    (unsigned)debug_byte_min_g, (unsigned)debug_byte_max_g);
             GFX_VDU(5);
             GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
