@@ -942,11 +942,53 @@ struct-padding data abort, and the disabled upconvert-bypass GPIO).
 **Milestone 1 gate: PASS**, by the plan's own definition of the goal --
 proving the *architecture* (idle-driven streaming + FFT + window +
 redraw, without freezing the desktop), not achieving broadcast-quality
-spectral resolution. The FM station itself not yet standing out clearly
-from the DC spike/noise floor is real, but secondary: display scale
-(`DB_FLOOR`/`DB_CEIL`) and tuner gain (LNA/mixer AGC never explicitly
-verified — only a single fixed VGA write happens every tune, matching
-upstream's own default-gain tuning path, not a full manual gain API)
-are explicitly deferred to a follow-on signal-quality pass, along with
-everything else in "Deferred" above (waterfall, demod, tuning UI,
-gain control UI).
+spectral resolution. Merged to `main` via PR #1.
+
+## Phase 2, follow-on: signal-quality pass (gain + display scale)
+
+With milestone 1 merged, picked up the deferred signal-quality gap: the
+FM station wasn't yet standing out clearly from the DC spike/noise
+floor. Two candidate causes going in -- tuner gain, and the fixed
+`DB_FLOOR`/`DB_CEIL` display range.
+
+**Gain: verified correct, not the problem.** Rather than guess at R820T/
+R828D gain register bits again (the exact mistake that cost real time
+earlier in this project -- see the R820T_I2C_ADDR and I2C-bitrev
+findings above), fetched the actual upstream source directly this time
+(`tuner_r82xx.c` and `librtlsdr.c` from the rtlsdr-blog fork, raw GitHub
+content, read in full) rather than trusting memory or a summarizer.
+Findings:
+- `rtlsdr_open()` never calls any gain-setting function at all --
+  `rtlsdr_set_tuner_gain_mode()`/`rtlsdr_set_tuner_gain()` are public API
+  calls real applications (`rtl_sdr`, gqrx) make themselves after
+  opening the device. Our port never calling them either is faithful to
+  upstream, not a gap.
+- Our `r82xx_init_array`'s untouched register values already leave LNA
+  in auto/AGC mode (reg 0x05 bit4=0) and Mixer in auto/AGC mode (reg
+  0x07 bit4=1) -- verified bit-for-bit against upstream's own
+  auto-vs-manual convention (`r82xx_set_gain()`'s bit4 writes). Both
+  already match what upstream's own explicit auto-gain call would set,
+  before we'd ever call it.
+- Our `r82xx_set_vga_gain()` (0x08 -> 16.3dB, written unconditionally on
+  every `r82xx_set_freq()`) is byte-for-byte identical to upstream's own
+  function of the same name, called from the same place in upstream's
+  own `r82xx_set_freq()` -- and upstream calls it *after* its own
+  gain-mode setup, meaning even a real dongle with explicit
+  `rtlsdr_set_tuner_gain_mode(dev, 0)` ends up at this same fixed VGA
+  value after any retune. Our port's gain configuration is confirmed
+  faithful to a genuinely working real-world default, not under-gained.
+
+**Display scale: replaced the fixed-constant guessing with per-frame
+auto-scaling.** Three iterations of picking `DB_FLOOR`/`DB_CEIL` by hand
+(see above) kept failing because the right range depends on absolute
+signal strength, which isn't knowable in advance. `compute_spectrum()`
+now computes each frame's own min/max dB across all bins and maps that
+range to the window height, excluding a small band of bins
+(`DC_EXCLUDE_BINS`) around the display centre from the min/max
+calculation so the DC-spike artifact can't dominate the range and crush
+everything else toward zero -- the exact failure mode every fixed
+`DB_CEIL` guess kept hitting. The DC bin is still plotted, just not used
+to pick the scale. This is the standard auto-scaling technique real
+spectrum analyzers use, and removes the guessing entirely rather than
+requiring a fourth constant to tune. Rebuilt, not yet re-verified on
+hardware as of this note.
