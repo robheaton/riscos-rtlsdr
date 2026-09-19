@@ -8,25 +8,39 @@ and milestones — start there.
 
 ## Status
 
-**Phase 1 (milestones 1-4) is done, confirmed on real hardware.**
-RTL-SDR works end-to-end on RISC OS: an **RTL-SDR Blog V4** dongle
-(R828D tuner + upconverter), VID `0BDA` / PID `2838`, found via
-`*USBDevices` → `DeviceFS_CallDevice` control transfers → baseband init
-→ tuner identified and locked → sample rate configured →
-**sustained bulk streaming measured at 25.6-25.8 MB/s — over 5x the
-~4.8 MB/s a real SDR needs.** No libusb, no existing driver to build on;
-this talks to the dongle entirely through RISC OS's own native USB
-interface.
+**Phase 1 (milestones 1-4): enumeration through control transfers and
+baseband/tuner bring-up are confirmed on real hardware.** An
+**RTL-SDR Blog V4** dongle (R828D tuner + upconverter), VID `0BDA` /
+PID `2838`, found via `*USBDevices` → `DeviceFS_CallDevice` control
+transfers → baseband init → tuner identified and locked → sample rate
+configured. No libusb, no existing driver to build on; this talks to
+the dongle entirely through RISC OS's own native USB interface.
 
-**Phase 2, milestone 1 (`!RTLSDRView`, a live spectrum display) is also
-done, confirmed on real hardware.** A real Wimp GUI app: continuous
-idle-driven USB reads, a hand-written FFT, and a live-updating bar-graph
-redraw, all running inside the Wimp event loop without freezing the
-desktop. Confirmed on real hardware with a real antenna: the display
-genuinely updates live from real received RF power. Signal-quality
-polish (making a station stand out clearly from the DC-spike/noise
-floor, tuner gain, demodulation, a tuning UI) is explicitly deferred —
-see `docs/PLAN.md`'s "Phase 2" section.
+⚠️ **Milestone 4's bulk-streaming result is now known to be wrong and
+should NOT be treated as settled.** It originally reported "25.6 MB/s
+sustained throughput", but that number only ever verified byte
+*counts* returned by `OS_GBPB`, never actual byte *content*. A phase 2
+diagnostic (see `docs/PLAN.md`'s milestone 5) proved via a sentinel-fill
+test that `OS_GBPB` reason 4 against this bulk endpoint reports a full
+transfer while genuinely writing only ~2 real bytes per call,
+zero-padding the rest — meaning the real sustained data rate was
+actually closer to ~50KB/s (about 1% of the ~4.8MB/s target), not 5x
+over it. **Root cause found**: this is a documented, ~20-year-old
+RISC OS DeviceFS USB characteristic (short reads get silently padded
+to the requested size, with no reliable way to learn the true transfer
+size from the public API) — not a bug introduced by this project. See
+`docs/PLAN.md` for the primary source and full evidence.
+
+**Phase 2, milestone 1 (`!RTLSDRView`, a live spectrum display): the
+architecture is confirmed on real hardware** — a real Wimp GUI app,
+continuous idle-driven USB reads, a hand-written FFT, and a
+live-updating bar-graph redraw, all running inside the Wimp event loop
+without freezing the desktop. Given the milestone 4 finding above, the
+displayed spectrum should currently be treated as showing whatever
+`OS_GBPB`'s zero-padded reads actually produce, not confirmed genuine
+RF content — signal-quality work is blocked on the bulk-read
+investigation, not just gain/display-scale polish as first thought. See
+`docs/PLAN.md`'s "Phase 2" section for the full history.
 
 Getting here was a real diagnostic journey — full blow-by-blow in
 `docs/PLAN.md`, including several real bugs only found by actually

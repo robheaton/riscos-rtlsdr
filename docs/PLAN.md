@@ -1086,3 +1086,82 @@ that the bytes were genuine sample content. If milestone 5 confirms
 `OS_GBPB` under-writes the buffer while over-reporting success, that
 number may need re-verifying with a content check of its own, not just
 treated as settled. Pending a real run.
+
+**Real run result -- conclusive, and significant.** Sentinel test:
+`touched == size` for EVERY tested size, 2 through 1024 bytes -- proving
+`OS_GBPB` genuinely writes the entire requested buffer every time, not
+leaving stale memory behind (ruling out the earlier "buffer just never
+gets fully written" theory outright). But the actual bytes written are
+telling: only the first TWO bytes are ever non-zero; every byte from
+position 2 onward is a real, deliberate write of `0x00`, at every tested
+size. The repeatability test confirms this isn't frozen/cached data --
+all ten consecutive 2-byte prefixes differ (`B1 73`, `82 98`, `43 8D`,
+`68 4B`, `93 9C`, `58 A9`, `A2 6C`, `8E B9`, `69 98`, `A1 6D`), so
+genuinely fresh USB data is arriving each call.
+
+**Conclusion**: the underlying USB transfer appears to deliver exactly
+2 real bytes (one I/Q sample pair) per `OS_GBPB` reason-4 call,
+regardless of requested buffer size, with RISC OS's DeviceFS zero-
+filling the remainder while still reporting the FULL requested count as
+"transferred" -- rather than returning an honest short count or
+blocking until genuinely more data is ready.
+
+**This overturns milestone 4's headline result.** "25.6 MB/s sustained
+throughput" (docs/PLAN.md, phase 1) used the identical call and the
+identical `len - bytes_not_transferred` counting formula, and never
+checked content. At the sustained test's own measured rate (~125,901
+reads over 5.0s, ~25,180 reads/sec), if each read genuinely carries only
+2 real bytes, the ACTUAL sample data rate is roughly 25,180 * 2 =
+**~50KB/s -- about 1% of the ~4.8MB/s target**, not 5x over it as
+previously reported. The measured "throughput" almost certainly
+reflected how fast a buffer can be zero-padded, not genuine USB
+transfer speed. **The milestone 4 PASS verdict from phase 1 should be
+treated as unconfirmed pending further investigation, not as a settled
+result.** This is a genuine correction to a previously-reported
+finding, not just a new open question.
+
+**Root cause found**: RISC OS's own community technical documentation
+confirms this is a known, longstanding DeviceFS USB characteristic, not
+a bug introduced by this project. From the "DeviceFS USB technical"
+wiki page (riscos.info, dated 2006, notes gathered from
+comp.sys.acorn.programmer and driver-author experimentation):
+
+> "When the transfer has occurred, the buffer will be filled with the
+> USB data and then padded until it is full ... This padding is
+> unfortunate as it is impossible to determine the actual amount of
+> data transferred using the public API. This can be worked around by
+> accessing the actual transfer size which is in the 11th word from the
+> DeviceFS driver's handle. ... If you can get away without abusing this
+> knowledge it is probably wise to do so, as it is relying on the
+> private internal workings of the USB Driver."
+
+And under "Summary of problems and unknowns": *"It would be nice to get
+rid of the padding of short reads and the need to probe internal USB
+Driver workspace to get the real transfer size."* -- confirming RISC
+OS's own driver-writing community considers this padding-of-short-reads
+behavior a known wart, not something this project misused or
+misunderstood. The doc's own caveat ("only used with non-bulk pipes, so
+this may be inaccurate for other transfer types") means it isn't a
+perfect match for our bulk-endpoint case, but our own sentinel-test
+evidence (short-of-request data padded with zeros while the public API
+reports full success) lines up with this description closely enough
+that it's very likely the same underlying DeviceFS buffer-padding
+mechanism, just reached via the higher-level `OS_Find`+`OS_GBPB` +
+special-field path this project uses rather than the low-level
+module-driver API (`DeviceFS_CallDevice`/UpCalls) that wiki page
+documents.
+
+**What a real fix would need**: per that doc, getting the TRUE transfer
+size requires reading an undocumented word (the "11th word from the
+DeviceFS driver's handle") -- itself obtained via UpCall 10, a
+mechanism normally used by module drivers, not applications. This is
+explicitly flagged by RISC OS's own community as fragile ("private
+internal workings"), and it's not even confirmed to apply cleanly to
+bulk pipes specifically. This is a real platform-level limitation of
+the public `OS_Find`/`OS_GBPB` DeviceFS USB API for high-rate bulk
+streaming, not something fixable by changing read size, pacing, or
+buffer handling in this project's own C code -- all of which have now
+been tried (size sweep in milestone 4, `BATCH_READS` 8 vs 1, sentinel
+verification across 10 sizes) without effect.
+
+Source: [DeviceFS USB technical (riscos.info)](https://www.riscos.info/index.php/DeviceFS_USB_technical)
