@@ -1,5 +1,6 @@
 {
  "setup": [
+  "Set DeskLib$Path @.desklib.",
   "CDir o"
  ],
  "compiles": [
@@ -12,11 +13,23 @@
    "cmd": "cc -c -za1 -Otime -apcs 3/32bit -throwback -I,C: c.R82XX -o o.R82XX",
    "out": "o.R82XX",
    "src": "c.R82XX"
+  },
+  {
+   "cmd": "cc -c -za1 -Otime -apcs 3/32bit -throwback -I,C: c.Driver -o o.Driver",
+   "out": "o.Driver",
+   "src": "c.Driver"
+  },
+  {
+   "cmd": "cc -c -za1 -Otime -apcs 3/32bit -throwback -I,C: c.SpecView -o o.SpecView",
+   "out": "o.SpecView",
+   "src": "c.SpecView"
   }
  ],
  "finals": [
-  "link -o RTLSDR o.RTLSDR o.R82XX C:o.stubs-32",
+  "link -o RTLSDR o.RTLSDR o.R82XX o.Driver C:o.stubs-32",
+  "link -o RTLSDRView o.SpecView o.Driver o.R82XX DeskLib:o.DeskLib C:o.stubs-32",
   "CDir out",
-  "Copy RTLSDR out.RTLSDR ~C~V"
+  "Copy RTLSDR out.RTLSDR ~C~V",
+  "Copy RTLSDRView out.RTLSDRView ~C~V"
  ]
 }

@@ -762,3 +762,132 @@ and a gain control UI. That's a substantial new phase of work, not a
 continuation of the current diagnostic loop — worth treating as its own
 planning discussion rather than assuming the same milestone-by-milestone
 structure applies.
+
+## Phase 2, milestone 1: live spectrum display (`!RTLSDRView`)
+
+Pushed the completed phase 1 work to GitHub
+(https://github.com/robheaton/riscos-rtlsdr, private repo, matching the
+convention of this user's other native RISC OS projects), then scoped
+phase 2's first milestone: a real Wimp GUI app showing a live-updating
+spectrum trace. No demodulation, no audio, no tuning UI yet — the goal
+is to prove the *architecture* (continuous USB reads inside a Wimp idle
+handler without freezing the desktop, an FFT, and a redraw loop), which
+everything after this builds on.
+
+### Refactor: `c/Driver.c` / `h/Driver.h` (behaviour-preserving)
+
+Extracted the non-`main()` device-control functions out of
+`c/RTLSDR.c` into a new shared `c/Driver.c`/`h/Driver.h`: `find_device`,
+`usb_ctrl_transfer`, `rtlsdr_read_reg`/`write_reg`, `rtlsdr_demod_read_reg`/
+`write_reg`, `rtlsdr_probe_tuner`, `rtlsdr_init_baseband`,
+`rtlsdr_tuner_postinit`, `rtlsdr_set_sample_rate`, `rtlsdr_reset_buffer`,
+`os_find_open`/`os_find_close`/`os_gbpb_read4`. Every function moved
+verbatim — same behaviour, only relocated — so `!RTLSDRView` (the new
+app) can reuse the same proven bringup code instead of duplicating it.
+`RTLSDR.c` now keeps only `main()` and the milestone 2-4 diagnostic
+functions, calling into `Driver.c`.
+
+**Regression-tested on real hardware and confirmed behaviour-preserving**:
+rebuilt `!RTLSDR` against the refactored code, ran it on the Pi (direct
+execution, not TaskWindow, per the established rule) — all four
+milestones passed again, with throughput actually slightly *higher* than
+the original run: **25,784,525 bytes/sec** (125,901 reads over 5.0s) vs.
+the original 25,600,205 bytes/sec. Milestone 4 gate: PASS. Confirms the
+extraction changed nothing about behaviour, only where the code lives.
+
+### First real-hardware run: `Wimp_CreateWindow` data abort, root-caused and fixed
+
+First build ran the full device bringup identically to `!RTLSDR` (tuner
+PLL lock succeeded again, same trace as before) then crashed with
+"Internal error: abort on data transfer" inside `Wimp_CreateWindow`
+itself (postmortem backtrace: `create_spectrum_window` -> `main` ->
+shared library function -> fault). Root cause: `wimp_colourflags.cols`
+(the window-colours field in DeskLib's `Wimp.h`) mixes `unsigned char`
+fields with `unsigned int` bitfields in the same struct -- a combination
+where Norcroft can insert padding that breaks the byte-for-byte layout
+the real Wimp SWI expects, even though the OTHER bitfield unions used
+here (`window_flags`, `icon_flags`) are homogeneous `unsigned int`
+throughout and don't have this problem. The window_block was being
+filled via the `.cols.titlefore` etc. bitfield view; DeskLib provides an
+alternate `.vals.colours[7]`/`.vals.extra` byte-array view of the exact
+same field specifically for this reason. **Fix attempt 1**: switched to `.vals.colours[N]` (a plain byte array,
+same field, no bitfields). Rebuilt, ran again: **identical crash, same
+fixed address (&FC1A0078)**. That ruled out the value-level fix as
+sufficient: rewriting *how* the colour bytes were written didn't fix
+the union's *size* -- `wimp_colourflags` still has the `.cols` bitfield
+member in its type, so Norcroft can still pad the union out past its
+intended 8 bytes to fit that member's alignment, regardless of which
+member is actually used to write into it. That silently shifts every
+window_block field after `colours` relative to the offset the real Wimp
+SWI expects. **Fix attempt 2** (the one that matters): stopped using
+`window_block`/`wimp_colourflags` for construction entirely. Defined a
+local `raw_window_block` struct mirroring the same 88-byte field-by-field
+layout by hand (verified offset by offset against the real block
+layout), using only plain `unsigned char`/`int`/pointer/`short` fields
+for the colours (no bitfields at all, so no padding ambiguity is even
+possible there), while still reusing `window_flags`/`icon_flags` for the
+other flag fields -- those ARE safe, being homogeneous
+all-`unsigned-int` bitfield unions matching their own `.value` alias
+exactly, unlike `wimp_colourflags`'s char+int mix. Cast to
+`(window_block *)` only at the `Wimp_CreateWindow` call site. Notable
+because every "grounding" example found for this project
+(`riscos-rdpclient`'s windows) builds windows from
+`Wimp_LoadTemplate`-loaded blocks, never a hand-filled one -- so this
+particular field-filling path had no proven-working precedent to check
+against before the first real run.
+
+**Confirmed fixed on real hardware**: the raw-struct rewrite ran clean --
+a real `RTLSDRView` window opened (blue titlebar, no crash), the desktop
+stayed responsive throughout (Filer windows visible and usable behind
+it), proving the core architecture (device bringup, idle-driven USB
+reads, window creation, redraw loop) all work together without
+reintroducing the freeze risk phase 1 fought to fix. The one visible
+issue: the work area rendered solid black -- `BAR_SCALE` (a flat linear
+`power * constant`) was wildly oversaturating every one of the 256
+bins to full height, so contiguous black bars painted the whole window
+black. **Fix**: replaced the linear scale with a saturating
+`power/(power+K)` curve (still no sqrt/log -- see R82XX.c's PLL loop for
+the same avoid-libm reasoning) which stays informative even if the
+constant is guessed wrong by an order of magnitude, unlike a flat
+multiply which either clips everything or shows nothing. **Second real run**: window opened cleanly (confirming the
+`raw_window_block` fix), work area was no longer solid black -- but
+showed only a single thin vertical line at the horizontal centre, on an
+otherwise blank white background. That's the classic RTL-SDR DC-spike
+artifact, correctly centred by the FFT-shift, but it revealed the
+saturating `power/(power+K)` curve still can't work here: a DC spike
+typically sits 40-60dB above the noise floor (10^4-10^6x in raw power),
+which no single linear-ish curve can show alongside the noise floor
+without one end vanishing. **Switched to an actual log scale**
+(`10*log10(power+1)`, `DB_FLOOR`/`DB_CEIL` linear-mapped to bar height)
+-- and since a genuinely useful spectrum display needs this regardless,
+tested whether `log10()` (a real libm function CALL, unlike the plain
+`+,-,*,/` on doubles already confirmed working via Driver.c) would even
+*link* against `C:o.stubs-32`, rather than guessing and burning another
+hardware round-trip: **it linked cleanly, rc=0, no unresolved symbols**.
+libm calls are confirmed available on this toolchain after all. **Third real run**: window opened fine, but the display looked
+identical to the pre-log version -- a single thin line at centre,
+otherwise blank. Root cause: `DB_FLOOR=30` clipped everything below
+30dB to invisible, and the actual noise floor (most likely genuinely
+quiet RF -- no/weak antenna -- rather than a bug, since the DC spike, an
+ADC/mixer artifact rather than a received signal, still showed at full
+height) sat below that. **Fix**: `DB_FLOOR=0` is not a re-guess, it's
+the actual mathematical floor -- `power = re^2+im^2 >= 0` always, so
+`10*log10(power+1) >= 0` always, meaning any floor above 0 was clipping
+real data for no principled reason. Pending a fourth real run.
+
+### `!RTLSDRView`: in progress
+
+Building the new app now: hand-built `window_block` (no Templates editor
+available in this environment), a ring buffer filled by bounded batches
+of `os_gbpb_read4(1024)` calls inside a `event_NULL` idle handler
+(matching `riscos-rdpclient`'s `Status,fff` `Time_Monotonic()`-throttled
+pattern — the same proven idle-update mechanism, not a new one), a
+hand-written radix-2 FFT with offline-precomputed twiddle factors (C89,
+no runtime `sin()`/`cos()`), and a `Wimp_RedrawWindow`/`GFX_RectangleFill`
+bar-graph redraw. Linking against DeskLib: a prebuilt 32-bit
+`DeskLib32` library already exists at
+`~/Development/riscos-rdpclient/rdpclient/build/DeskLib32` (built once via
+that project's `builddesklib.py`, which compiles all ~516 DeskLib source
+objects with `-apcs 3/32bit` since the official prebuilt DeskLib doesn't
+match this toolchain's 32-bit APCS variant) — reusing that instead of
+rebuilding DeskLib from scratch for this project.

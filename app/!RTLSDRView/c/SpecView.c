@@ -1,0 +1,503 @@
+/* SpecView.c -- !RTLSDRView: a live spectrum display for the RTL-SDR
+   RISC OS driver. Phase 2, milestone 1 (see ../../../docs/PLAN.md):
+   proves the architecture (continuous USB reads inside a Wimp idle
+   handler without freezing the desktop, an FFT, and a redraw loop) that
+   everything after this builds on. No demodulation, no audio, no tuning
+   UI yet -- fixed at 100.0MHz (FM broadcast band), 2.4 MSPS.
+
+   Device bringup (find_device, baseband/tuner init, sample rate, raw
+   OS_Find/OS_GBPB stream I/O) reuses c/Driver.c -- the same code proven
+   across !RTLSDR's milestones 1-4, not reimplemented here.
+
+   No Templates-editor GUI is available in this environment, so the
+   window is built programmatically (a hand-filled window_block passed
+   to Wimp_CreateWindow), not loaded from a template file.
+
+   The FFT itself still avoids any libm call (sqrt/sin/cos/log): its
+   twiddle table is precomputed offline (matches upstream reasoning for
+   avoiding runtime trig -- see R82XX.c's sigma-delta PLL loop comments).
+   The display SCALE, though, does call log10() (see compute_spectrum) --
+   a first real run with a purely linear/rational power scale showed why
+   that's not optional here: RTL-SDR's classic DC-spike artifact sits
+   40-60dB above the noise floor (10^4-10^6x in raw power), which no
+   single linear-ish curve can show alongside the noise floor without one
+   end vanishing or the other saturating (confirmed: it did exactly that,
+   twice, with two different linear-family scales -- see docs/PLAN.md).
+   log10() was avoided in the very first version purely because runtime
+   libm CALLS (distinct from +,-,*,/ on doubles, which were already
+   confirmed working via Driver.c's sample-rate math) were unconfirmed
+   against this toolchain's link setup -- resolved by just trying it
+   through the build service, which would fail at LINK time with a clear
+   "undefined symbol" if unavailable, rather than needing a hardware
+   round-trip to find out.
+
+   C89 only (Norcroft): all declarations at top of block, no // comments. */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include "DeskLib:Core.h"
+#include "DeskLib:Wimp.h"
+#include "DeskLib:WimpSWIs.h"
+#include "DeskLib:Window.h"
+#include "DeskLib:Event.h"
+#include "DeskLib:GFX.h"
+#include "DeskLib:Time.h"
+#include "RTLSDR.h"
+#include "R82XX.h"
+#include "Driver.h"
+
+/* ---- FFT / spectrum geometry ----
+   256-point complex FFT. Reading exactly one frame (256 complex I,Q byte
+   pairs = 512 bytes) per os_gbpb_read4() call matches one of the sizes
+   milestone 4's sweep proved fully reliable (64/128/256/512/1024 bytes
+   all 5/5 instant; 2048 blocked ~110s) -- deliberately staying inside
+   that known-safe boundary rather than picking an arbitrary frame size. */
+#define FFT_SIZE      256
+#define NUM_BINS      FFT_SIZE   /* one bar per complex output bin --
+                                     covers the full -Fs/2..+Fs/2 range,
+                                     not just half (unlike a real-input
+                                     FFT), since our input is complex I/Q */
+#define IQ_BYTES      (FFT_SIZE * 2)
+
+#define BIN_WIDTH_OS  2
+#define WORK_WIDTH    (NUM_BINS * BIN_WIDTH_OS)  /* 512 OS units */
+#define WORK_HEIGHT   300                        /* OS units */
+
+/* Reads pumped per Null event, regardless of the display refresh
+   throttle below -- draining the USB stream and updating the display
+   are separate concerns: drain every idle tick (so the RTL2832U's
+   internal buffering never backs up), redraw only every UPDATE_INTERVAL_CS
+   centiseconds (so a plain full-window repaint at native Wimp_Poll rate
+   doesn't waste CPU/flicker). 8 reads * 512 bytes = 4KB/tick; at the
+   25+ MB/s sustained rate milestone 4 measured for single reads, this is
+   comfortably fast, but the real achievable pump rate depends on
+   Wimp_Poll's own call frequency, which differs from milestone 4's tight
+   do-while loop -- worth watching on the first real run. */
+#define BATCH_READS       8
+#define UPDATE_INTERVAL_CS 20   /* ~5Hz redraw */
+
+/* dB-ish display range for compute_spectrum()'s 10*log10(power+1) scale.
+   DB_FLOOR=0 is not a guess: power = re^2+im^2 >= 0 always, so the log
+   argument (power+1) is always >= 1, so db = 10*log10(power+1) can
+   mathematically never go below 0 -- any floor above 0 clips real,
+   already-weak data to invisible for no reason. A third real run with
+   DB_FLOOR=30 showed exactly that: everything but the DC spike sat below
+   30dB and vanished entirely (see docs/PLAN.md) -- most likely genuinely
+   quiet RF (no/weak antenna) rather than a display bug, since the DC
+   spike (an ADC/mixer artifact, not a received signal) still showed.
+   DB_CEIL is still a guess for where the DC spike itself tops out. */
+#define DB_FLOOR 0.0
+#define DB_CEIL  90.0
+
+/* ---- twiddle table: cos/sin(-2*pi*k/FFT_SIZE), k=0..FFT_SIZE/2-1 ----
+   Precomputed offline (Python), not generated by any runtime trig call. */
+static const double twiddle_cos[FFT_SIZE / 2] = {
+    1.0000000000, 0.9996988187, 0.9987954562, 0.9972904567,
+    0.9951847267, 0.9924795346, 0.9891765100, 0.9852776424,
+    0.9807852804, 0.9757021300, 0.9700312532, 0.9637760658,
+    0.9569403357, 0.9495281806, 0.9415440652, 0.9329927988,
+    0.9238795325, 0.9142097557, 0.9039892931, 0.8932243012,
+    0.8819212643, 0.8700869911, 0.8577286100, 0.8448535652,
+    0.8314696123, 0.8175848132, 0.8032075315, 0.7883464276,
+    0.7730104534, 0.7572088465, 0.7409511254, 0.7242470830,
+    0.7071067812, 0.6895405447, 0.6715589548, 0.6531728430,
+    0.6343932842, 0.6152315906, 0.5956993045, 0.5758081914,
+    0.5555702330, 0.5349976199, 0.5141027442, 0.4928981922,
+    0.4713967368, 0.4496113297, 0.4275550934, 0.4052413140,
+    0.3826834324, 0.3598950365, 0.3368898534, 0.3136817404,
+    0.2902846773, 0.2667127575, 0.2429801799, 0.2191012402,
+    0.1950903220, 0.1709618888, 0.1467304745, 0.1224106752,
+    0.0980171403, 0.0735645636, 0.0490676743, 0.0245412285,
+    0.0000000000, -0.0245412285, -0.0490676743, -0.0735645636,
+    -0.0980171403, -0.1224106752, -0.1467304745, -0.1709618888,
+    -0.1950903220, -0.2191012402, -0.2429801799, -0.2667127575,
+    -0.2902846773, -0.3136817404, -0.3368898534, -0.3598950365,
+    -0.3826834324, -0.4052413140, -0.4275550934, -0.4496113297,
+    -0.4713967368, -0.4928981922, -0.5141027442, -0.5349976199,
+    -0.5555702330, -0.5758081914, -0.5956993045, -0.6152315906,
+    -0.6343932842, -0.6531728430, -0.6715589548, -0.6895405447,
+    -0.7071067812, -0.7242470830, -0.7409511254, -0.7572088465,
+    -0.7730104534, -0.7883464276, -0.8032075315, -0.8175848132,
+    -0.8314696123, -0.8448535652, -0.8577286100, -0.8700869911,
+    -0.8819212643, -0.8932243012, -0.9039892931, -0.9142097557,
+    -0.9238795325, -0.9329927988, -0.9415440652, -0.9495281806,
+    -0.9569403357, -0.9637760658, -0.9700312532, -0.9757021300,
+    -0.9807852804, -0.9852776424, -0.9891765100, -0.9924795346,
+    -0.9951847267, -0.9972904567, -0.9987954562, -0.9996988187
+};
+
+static const double twiddle_sin[FFT_SIZE / 2] = {
+    -0.0000000000, -0.0245412285, -0.0490676743, -0.0735645636,
+    -0.0980171403, -0.1224106752, -0.1467304745, -0.1709618888,
+    -0.1950903220, -0.2191012402, -0.2429801799, -0.2667127575,
+    -0.2902846773, -0.3136817404, -0.3368898534, -0.3598950365,
+    -0.3826834324, -0.4052413140, -0.4275550934, -0.4496113297,
+    -0.4713967368, -0.4928981922, -0.5141027442, -0.5349976199,
+    -0.5555702330, -0.5758081914, -0.5956993045, -0.6152315906,
+    -0.6343932842, -0.6531728430, -0.6715589548, -0.6895405447,
+    -0.7071067812, -0.7242470830, -0.7409511254, -0.7572088465,
+    -0.7730104534, -0.7883464276, -0.8032075315, -0.8175848132,
+    -0.8314696123, -0.8448535652, -0.8577286100, -0.8700869911,
+    -0.8819212643, -0.8932243012, -0.9039892931, -0.9142097557,
+    -0.9238795325, -0.9329927988, -0.9415440652, -0.9495281806,
+    -0.9569403357, -0.9637760658, -0.9700312532, -0.9757021300,
+    -0.9807852804, -0.9852776424, -0.9891765100, -0.9924795346,
+    -0.9951847267, -0.9972904567, -0.9987954562, -0.9996988187,
+    -1.0000000000, -0.9996988187, -0.9987954562, -0.9972904567,
+    -0.9951847267, -0.9924795346, -0.9891765100, -0.9852776424,
+    -0.9807852804, -0.9757021300, -0.9700312532, -0.9637760658,
+    -0.9569403357, -0.9495281806, -0.9415440652, -0.9329927988,
+    -0.9238795325, -0.9142097557, -0.9039892931, -0.8932243012,
+    -0.8819212643, -0.8700869911, -0.8577286100, -0.8448535652,
+    -0.8314696123, -0.8175848132, -0.8032075315, -0.7883464276,
+    -0.7730104534, -0.7572088465, -0.7409511254, -0.7242470830,
+    -0.7071067812, -0.6895405447, -0.6715589548, -0.6531728430,
+    -0.6343932842, -0.6152315906, -0.5956993045, -0.5758081914,
+    -0.5555702330, -0.5349976199, -0.5141027442, -0.4928981922,
+    -0.4713967368, -0.4496113297, -0.4275550934, -0.4052413140,
+    -0.3826834324, -0.3598950365, -0.3368898534, -0.3136817404,
+    -0.2902846773, -0.2667127575, -0.2429801799, -0.2191012402,
+    -0.1950903220, -0.1709618888, -0.1467304745, -0.1224106752,
+    -0.0980171403, -0.0735645636, -0.0490676743, -0.0245412285
+};
+
+/* ---- global state ---- */
+static char device_name_g[16];
+static int stream_handle_g = 0;
+static unsigned char iq_frame_g[IQ_BYTES];
+static int bin_height_g[NUM_BINS];
+static unsigned int next_update_time_g;
+static window_handle spectrum_window_g;
+
+/* ---- in-place iterative radix-2 DIT FFT, fixed N=FFT_SIZE ---- */
+static void fft256(double *re, double *im)
+{
+    unsigned int i, j, k;
+    unsigned int len, half, step;
+    unsigned int bit;
+    double tr, ti, wr, wi, ur, ui;
+
+    /* bit-reversal permutation */
+    j = 0;
+    for (i = 0; i < FFT_SIZE - 1; i++) {
+        if (i < j) {
+            tr = re[i]; re[i] = re[j]; re[j] = tr;
+            ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+        bit = FFT_SIZE >> 1;
+        while (j & bit) {
+            j &= ~bit;
+            bit >>= 1;
+        }
+        j |= bit;
+    }
+
+    /* iterative Cooley-Tukey, block length doubling each stage */
+    for (len = 2; len <= FFT_SIZE; len <<= 1) {
+        half = len >> 1;
+        step = FFT_SIZE / len; /* stride into the full-size twiddle table */
+        for (i = 0; i < FFT_SIZE; i += len) {
+            for (k = 0; k < half; k++) {
+                wr = twiddle_cos[k * step];
+                wi = twiddle_sin[k * step];
+                ur = re[i + k];
+                ui = im[i + k];
+                tr = re[i + k + half] * wr - im[i + k + half] * wi;
+                ti = re[i + k + half] * wi + im[i + k + half] * wr;
+                re[i + k] = ur + tr;
+                im[i + k] = ui + ti;
+                re[i + k + half] = ur - tr;
+                im[i + k + half] = ui - ti;
+            }
+        }
+    }
+}
+
+/* Converts the last-read I/Q frame to power-spectrum bar heights,
+   FFT-shifted so the tuned frequency sits in the middle of the display
+   (bin 0 of a complex FFT is 0Hz baseband; negative frequencies wrap to
+   the upper half, so swapping halves gives the usual centred view). */
+static void compute_spectrum(void)
+{
+    static double re[FFT_SIZE];
+    static double im[FFT_SIZE];
+    int i;
+    int src;
+    double power, db, scaled;
+
+    for (i = 0; i < FFT_SIZE; i++) {
+        re[i] = (double)iq_frame_g[2 * i] - 127.5;
+        im[i] = (double)iq_frame_g[2 * i + 1] - 127.5;
+    }
+
+    fft256(re, im);
+
+    for (i = 0; i < NUM_BINS; i++) {
+        src = (i + NUM_BINS / 2) % NUM_BINS;
+        power = re[src] * re[src] + im[src] * im[src];
+        db = 10.0 * log10(power + 1.0); /* +1 avoids log10(0) */
+        scaled = (db - DB_FLOOR) / (DB_CEIL - DB_FLOOR) * (double)WORK_HEIGHT;
+        if (scaled > (double)WORK_HEIGHT) {
+            scaled = (double)WORK_HEIGHT;
+        }
+        if (scaled < 0.0) {
+            scaled = 0.0;
+        }
+        bin_height_g[i] = (int)scaled;
+    }
+}
+
+static void cleanup_and_exit(void)
+{
+    if (stream_handle_g != 0) {
+        os_find_close(stream_handle_g);
+        stream_handle_g = 0;
+    }
+    Event_CloseDown(); /* calls exit(); does not return */
+}
+
+static void report_and_die(const char *msg)
+{
+    os_error err;
+
+    err.errnum = 1;
+    strncpy(err.errmess, msg, sizeof(err.errmess) - 1);
+    err.errmess[sizeof(err.errmess) - 1] = '\0';
+    Wimp_ReportError(&err, 0, "RTLSDRView");
+    exit(1);
+}
+
+static BOOL Null_spectrum(event_pollblock *event, void *reference)
+{
+    unsigned char scratch[IQ_BYTES];
+    int i;
+    int got;
+    int any_ok;
+
+    UNUSED_ARG(event);
+    UNUSED_ARG(reference);
+
+    any_ok = 0;
+    for (i = 0; i < BATCH_READS; i++) {
+        got = os_gbpb_read4(stream_handle_g, scratch, IQ_BYTES);
+        if (got == IQ_BYTES) {
+            memcpy(iq_frame_g, scratch, IQ_BYTES);
+            any_ok = 1;
+        }
+        /* short read or error: drop this attempt, keep the last good
+           frame, try again next idle tick -- see the file header for
+           why raw-stream oddities are treated cautiously rather than
+           as fatal here. */
+    }
+
+    if (any_ok && Time_Monotonic() >= next_update_time_g) {
+        compute_spectrum();
+        Window_ForceRedraw(spectrum_window_g, 0, -WORK_HEIGHT, WORK_WIDTH, 0);
+        next_update_time_g = Time_Monotonic() + UPDATE_INTERVAL_CS;
+    }
+
+    return FALSE;
+}
+
+static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
+{
+    window_redrawblock r;
+    BOOL more;
+    int ox, oy;
+    int i;
+
+    UNUSED_ARG(event);
+    UNUSED_ARG(reference);
+
+    r.window = spectrum_window_g;
+    Wimp_RedrawWindow(&r, &more);
+
+    while (more) {
+        /* (rect, scroll) are the window's on-screen box and scroll
+           offset -- constant for this whole redraw loop, unlike
+           cliprect, which changes each iteration. Standard RISC OS
+           work-area-to-screen conversion: screen = os_origin + work,
+           where os_origin is derived once from rect/scroll. */
+        ox = r.rect.min.x - r.scroll.x;
+        oy = r.rect.max.y - r.scroll.y;
+
+        Wimp_SetColour((int)colour_BLACK);
+        for (i = 0; i < NUM_BINS; i++) {
+            GFX_RectangleFill(ox + i * BIN_WIDTH_OS, oy - WORK_HEIGHT,
+                               BIN_WIDTH_OS - 1, bin_height_g[i]);
+        }
+
+        Wimp_GetRectangle(&r, &more);
+    }
+    return TRUE;
+}
+
+static BOOL Close_spectrum(event_pollblock *event, void *reference)
+{
+    UNUSED_ARG(event);
+    UNUSED_ARG(reference);
+    cleanup_and_exit();
+    return TRUE; /* unreached */
+}
+
+static BOOL Quit_message(event_pollblock *event, void *reference)
+{
+    if (event->data.message.header.action == message_QUIT) {
+        cleanup_and_exit();
+    }
+    return FALSE;
+}
+
+/* Mirrors window_block field-for-field (same 88-byte layout Wimp_CreateWindow
+   expects -- verified offset by offset against the real block layout: 0
+   screenrect, 16 scroll, 24 behind, 28 flags, 32 colours, 40 workarearect,
+   56 titleflags, 60 workflags, 64 spritearea, 68 minsize, 72 title, 84
+   numicons), but WITHOUT window_block's own `colours` field
+   (wimp_colourflags), which mixes `unsigned char` fields with `unsigned
+   int` bitfields in the same struct -- a combination where Norcroft can
+   pad the union out past its intended 8 bytes to fit the bitfield's
+   alignment, silently shifting every field after `colours` relative to
+   what the real Wimp SWI expects. Confirmed the hard way: window_block
+   crashed Wimp_CreateWindow with a data abort deep in the Wimp's own
+   processing of the block, and rewriting only the VALUES (still via
+   window_block's .colours field) did not fix it -- same crash, same
+   address, because the union's SIZE was the actual problem, not which
+   member was used to write into it. See docs/PLAN.md. Every other field
+   here reuses window_flags/icon_flags, which are safe: homogeneous
+   unsigned-int bitfields matching their own .value alias exactly, with
+   no mixed-type padding risk. */
+typedef struct {
+    wimp_box      screenrect;
+    wimp_point    scroll;
+    int           behind;
+    window_flags  flags;
+    unsigned char title_fore, title_back, work_fore, work_back;
+    unsigned char scroll_outer, scroll_inner, title_focus, colour_extra;
+    wimp_box      workarearect;
+    icon_flags    titleflags;
+    icon_flags    workflags;
+    void          *spritearea;
+    unsigned short minsize_x, minsize_y;
+    char          title_text[12];
+    unsigned int  numicons;
+} raw_window_block;
+
+static window_handle create_spectrum_window(void)
+{
+    raw_window_block rwb;
+    window_handle win;
+    os_error *err;
+
+    memset(&rwb, 0, sizeof(rwb));
+
+    rwb.screenrect.min.x = 200;
+    rwb.screenrect.min.y = 200;
+    rwb.screenrect.max.x = 200 + WORK_WIDTH;
+    rwb.screenrect.max.y = 200 + WORK_HEIGHT;
+    rwb.scroll.x = 0;
+    rwb.scroll.y = 0;
+    rwb.behind = -1;
+
+    rwb.flags.data.moveable = 1;
+    rwb.flags.data.titlebar = 1;
+    rwb.flags.data.closeicon = 1;
+    rwb.flags.data.newflags = 1;
+
+    rwb.title_fore = colour_BLACK;
+    rwb.title_back = colour_LIGHT_BLUE;
+    rwb.work_fore = colour_BLACK;
+    rwb.work_back = colour_WHITE;
+    rwb.scroll_outer = colour_GREY3;
+    rwb.scroll_inner = colour_WHITE;
+    rwb.title_focus = colour_LIGHT_BLUE;
+    rwb.colour_extra = 0;
+
+    rwb.workarearect.min.x = 0;
+    rwb.workarearect.min.y = -WORK_HEIGHT;
+    rwb.workarearect.max.x = WORK_WIDTH;
+    rwb.workarearect.max.y = 0;
+
+    rwb.titleflags.data.text = 1;
+
+    rwb.spritearea = NULL;
+    rwb.minsize_x = 0;
+    rwb.minsize_y = 0;
+
+    strcpy(rwb.title_text, "RTLSDRView");
+    rwb.numicons = 0;
+
+    err = Wimp_CreateWindow((window_block *)&rwb, &win);
+    if (err != NULL) {
+        report_and_die(err->errmess);
+    }
+    return win;
+}
+
+int main(void)
+{
+    int n;
+    int rc;
+    r82xx_t tuner;
+    char path[64];
+
+    Event_Initialise("RTLSDRView");
+
+    n = find_device();
+    if (n < 0) {
+        report_and_die("No RTL-SDR device found. Run !RTLSDR first to "
+                        "confirm the dongle is detected.");
+    }
+    sprintf(device_name_g, "usb%d", n);
+
+    rtlsdr_init_baseband(device_name_g);
+
+    if (rtlsdr_probe_tuner(device_name_g) != 2) {
+        report_and_die("R828D tuner not found -- see !RTLSDR's "
+                        "diagnostic output for details.");
+    }
+
+    rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x18, 1); /* enable I2C repeater */
+    rc = rtlsdr_tuner_postinit(device_name_g);
+    if (rc == 0) {
+        rc = r82xx_init(&tuner, device_name_g);
+    }
+    if (rc == 0) {
+        rc = r82xx_set_freq(&tuner, 100000000UL); /* 100MHz, FM broadcast */
+    }
+    rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x10, 1); /* disable I2C repeater */
+    if (rc != 0 || !tuner.has_lock) {
+        report_and_die("Tuner init/tune to 100MHz failed -- see "
+                        "!RTLSDR's diagnostic output for details.");
+    }
+
+    if (rtlsdr_set_sample_rate(device_name_g, 2400000UL) != 0) {
+        report_and_die("rtlsdr_set_sample_rate() failed.");
+    }
+
+    rtlsdr_reset_buffer(device_name_g);
+
+    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000:%s",
+            RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, device_name_g);
+    stream_handle_g = os_find_open(path);
+    if (stream_handle_g == 0) {
+        report_and_die("Could not open the bulk endpoint stream.");
+    }
+
+    spectrum_window_g = create_spectrum_window();
+    Window_Show(spectrum_window_g, open_CENTERED);
+
+    Event_Claim(event_REDRAW, spectrum_window_g, event_ANY, Redraw_spectrum, NULL);
+    Event_Claim(event_CLOSE, spectrum_window_g, event_ANY, Close_spectrum, NULL);
+    Event_Claim(event_USERMESSAGE, event_ANY, event_ANY, Quit_message, NULL);
+    Event_Claim(event_NULL, event_ANY, event_ANY, Null_spectrum, NULL);
+
+    next_update_time_g = Time_Monotonic();
+
+    while (TRUE) {
+        Event_Poll();
+    }
+
+    return 0; /* unreached */
+}
