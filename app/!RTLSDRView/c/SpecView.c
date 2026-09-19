@@ -401,12 +401,17 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
             sprintf(line3, "b0=%02X,%02X,%02X,%02X",
                     debug_first_bytes_g[0], debug_first_bytes_g[1],
                     debug_first_bytes_g[2], debug_first_bytes_g[3]);
+            /* 20-unit spacing overlapped badly on the first real run --
+               this system font's line height is clearly taller than
+               that. 56 units is a generous guess, not a measured value
+               (nothing in this project has drawn Wimp text before now
+               to measure against). */
             GFX_VDU(5);
-            GFX_Move(ox + 4, oy - 16);
+            GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
-            GFX_Move(ox + 4, oy - 36);
+            GFX_Move(ox + 4, oy - 76);
             GFX_Write0(line2);
-            GFX_Move(ox + 4, oy - 56);
+            GFX_Move(ox + 4, oy - 132);
             GFX_Write0(line3);
             GFX_VDU(4);
         }
