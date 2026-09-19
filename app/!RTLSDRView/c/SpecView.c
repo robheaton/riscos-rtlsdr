@@ -174,6 +174,22 @@ static int bin_height_g[NUM_BINS];
 static unsigned int next_update_time_g;
 static window_handle spectrum_window_g;
 
+/* Diagnostic-only globals, drawn as a text line during redraw (see
+   Redraw_spectrum). The single-line-only display has looked visually
+   IDENTICAL across four different scaling formulas -- that pattern (one
+   bin always maxed, every other bin always exactly zero, unaffected by
+   the scale) is what a perfectly constant input produces (all energy at
+   DC, exactly zero everywhere else), which is what iq_frame_g would
+   still contain if os_gbpb_read4() had never actually written real
+   samples into it. These counters/values make that visible on screen
+   instead of guessing from a photo. */
+static unsigned long debug_reads_ok_g = 0;
+static unsigned long debug_reads_bad_g = 0;
+static double debug_db_min_g = 0.0;
+static double debug_db_max_g = 0.0;
+static double debug_db_dc_g = 0.0;
+static unsigned char debug_first_bytes_g[8];
+
 /* ---- in-place iterative radix-2 DIT FFT, fixed N=FFT_SIZE ---- */
 static void fft256(double *re, double *im)
 {
@@ -270,6 +286,10 @@ static void compute_spectrum(void)
         range = 1.0;
     }
 
+    debug_db_min_g = db_min;
+    debug_db_max_g = db_max;
+    debug_db_dc_g = db[centre];
+
     for (i = 0; i < NUM_BINS; i++) {
         scaled = (db[i] - db_min) / range * (double)WORK_HEIGHT;
         if (scaled > (double)WORK_HEIGHT) {
@@ -318,6 +338,10 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
         if (got == IQ_BYTES) {
             memcpy(iq_frame_g, scratch, IQ_BYTES);
             any_ok = 1;
+            debug_reads_ok_g++;
+            memcpy(debug_first_bytes_g, iq_frame_g, sizeof(debug_first_bytes_g));
+        } else {
+            debug_reads_bad_g++;
         }
         /* short read or error: drop this attempt, keep the last good
            frame, try again next idle tick -- see the file header for
@@ -360,6 +384,24 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
         for (i = 0; i < NUM_BINS; i++) {
             GFX_RectangleFill(ox + i * BIN_WIDTH_OS, oy - WORK_HEIGHT,
                                BIN_WIDTH_OS - 1, bin_height_g[i]);
+        }
+
+        /* Diagnostic text line -- see the debug_*_g comment above. VDU 5
+           switches subsequent text output to plot at the graphics cursor
+           (GFX_Move'd position) instead of the text cursor; VDU 4
+           reverts. */
+        {
+            char dbgbuf[120];
+            sprintf(dbgbuf, "ok=%lu bad=%lu min=%.1fdB max=%.1fdB dc=%.1fdB "
+                             "b0=%02X,%02X,%02X,%02X",
+                    debug_reads_ok_g, debug_reads_bad_g, debug_db_min_g,
+                    debug_db_max_g, debug_db_dc_g, debug_first_bytes_g[0],
+                    debug_first_bytes_g[1], debug_first_bytes_g[2],
+                    debug_first_bytes_g[3]);
+            GFX_VDU(5);
+            GFX_Move(ox + 4, oy - 16);
+            GFX_Write0(dbgbuf);
+            GFX_VDU(4);
         }
 
         Wimp_GetRectangle(&r, &more);
