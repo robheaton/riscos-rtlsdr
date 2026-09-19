@@ -873,7 +873,39 @@ ADC/mixer artifact rather than a received signal, still showed at full
 height) sat below that. **Fix**: `DB_FLOOR=0` is not a re-guess, it's
 the actual mathematical floor -- `power = re^2+im^2 >= 0` always, so
 `10*log10(power+1) >= 0` always, meaning any floor above 0 was clipping
-real data for no principled reason. Pending a fourth real run.
+real data for no principled reason.
+
+**Fourth real run, WITH a real antenna connected**: user confirmed an
+antenna was attached for this test, tuned to 97.4MHz (a station
+confirmed locally strong). Screen recording showed the display genuinely
+is live-updating frame to frame (confirmed by diffing extracted frames --
+real pixel differences, not a frozen image), but still showed no visible
+bar variation beyond the same DC-spike line, even with real RF present.
+That ruled out "no antenna" as the explanation and pointed at something
+upstream of the display math entirely.
+
+**Found it**: `R82XX.c`'s `r82xx_set_freq()` has had a GPIO call
+disabled since phase 1 (`TEMPORARILY DISABLED: rtlsdr_set_bias_tee_gpio()`,
+skipped after repeated hangs during tuner-init GPIO access). Re-reading
+it now: this call controls the V4 board's RF switch between the antenna
+connector and the HF upconverter mixer -- separate from the tuner chip's
+own internal cable_1_in/air_in pins (which ARE written, just below the
+disabled block, and only pick which of the tuner's own differential
+inputs is live). Without it, the antenna signal may stay permanently
+routed through the upconverter regardless of tuned frequency, which
+would explain exactly this symptom: correct tuning, confirmed PLL lock,
+a real antenna, and still no visible VHF signal at 97.4MHz. **Re-enabled
+it** (`GPIO_UPCONVERT_PIN`, ON for HF/OFF for VHF+UHF, matching what
+band-switching already does for the tuner's own pins just below it).
+The historical hangs that caused it to be disabled in the first place
+happened under TaskWindow execution -- since firmly established (many
+runs, zero hangs) as the actual freeze cause, not GPIO access itself --
+so re-attempting this now, with far more operational confidence than
+phase 1 had, is a reasoned bet rather than repeating a known-bad
+experiment. Pending a fifth real run: the main thing to watch for is
+whether GPIO access reintroduces a hang (watch responsiveness closely;
+power-cycle + unplug/replug the dongle if it does, per the established
+recovery procedure) as well as whether it actually fixes VHF reception.
 
 ### `!RTLSDRView`: in progress
 

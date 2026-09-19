@@ -753,21 +753,30 @@ int r82xx_set_freq(r82xx_t *t, unsigned long freq_hz)
         if (rc < 0) return rc;
         TRACE("set_freq: wrote cable_2_in to 0x06");
 
-        /* TEMPORARILY DISABLED: rtlsdr_set_bias_tee_gpio() (SYS-block
-           GPD/GPOE/GPO register access, RTLSDR_BLOCK_SYS 0x3001-0x3004)
-           has frozen the whole machine on every real-hardware attempt so
-           far, at slightly different points each time (non-deterministic
-           -- looks hardware/USB-timing related, not a pure logic bug; see
-           docs/PLAN.md). This call only selects the V4 upconverter's RF
-           input path -- it doesn't affect whether the PLL locks (already
-           proven working, confirmed before this call ever runs) and
-           doesn't affect milestone 4's bulk-throughput test (which
-           doesn't care about RF path correctness, only USB byte counts).
-           Skipping it to make forward progress; revisit as its own
-           focused investigation once the rest of the pipeline is
-           confirmed, rather than risking another hang on the same
-           untested GPIO path. */
-        TRACE("set_freq: SKIPPING bias-tee GPIO (see comment above)");
+        /* Re-enabled (was disabled through all of phase 1's milestones --
+           see docs/PLAN.md). GPIO_UPCONVERT_PIN controls the V4's
+           board-level RF switch between the antenna connector and the HF
+           upconverter mixer: ON routes through the upconverter (needed
+           for HF, which r82xx_set_freq already upconverts before this
+           point), OFF bypasses it for direct VHF/UHF sampling. This is
+           NOT the same thing as the tuner chip's own internal cable_1_in/
+           air_in pins written just below -- those pick which of the
+           tuner's own differential inputs is live, but say nothing about
+           whether the antenna signal is physically routed through the
+           upconverter first. Left disabled through phase 1 because every
+           GPIO access (SYS block GPD/GPOE/GPO, RTLSDR_BLOCK_SYS
+           0x3001-0x3004) had frozen the whole machine -- but that was
+           always under TaskWindow execution, since established (many
+           runs, zero hangs since) as the actual freeze cause, not the
+           GPIO access itself. Phase 2's !RTLSDRView found a real symptom
+           this omission explains: correct tuning, PLL lock, and a real
+           antenna, but no visible VHF signal -- consistent with the
+           antenna staying routed through the upconverter instead of
+           bypassing it. */
+        TRACE("set_freq: setting upconvert-bypass GPIO");
+        rtlsdr_set_bias_tee_gpio(t->dev_name, GPIO_UPCONVERT_PIN,
+                                  (band == R82XX_BAND_HF) ? 1 : 0);
+        TRACE("set_freq: upconvert-bypass GPIO done");
 
         cable_1_in = (band == R82XX_BAND_VHF) ? 0x40 : 0x00;
         rc = r82xx_write_reg_mask(t, 0x05, cable_1_in, 0x40);
