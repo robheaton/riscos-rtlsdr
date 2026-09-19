@@ -1,7 +1,10 @@
 /* RTLSDR.c -- command-line diagnostic tool: runs milestones 1-4 in
    sequence (enumerate & identify, control-transfer proof, baseband+tuner
-   init, bulk streaming throughput) and reports pass/fail for each. See
-   ../../../docs/PLAN.md for the full project plan and history.
+   init, bulk streaming throughput) and reports pass/fail for each, then
+   milestone 5 (diagnostic, non-gating): verifies whether OS_GBPB reason
+   4 actually writes the bytes it claims to transfer, added after phase
+   2 found a "successful" 512-byte read that only touched ~2 real bytes.
+   See ../../../docs/PLAN.md for the full project plan and history.
 
    Device discovery and bringup (find_device, baseband/tuner init, sample
    rate, raw OS_Find/OS_GBPB stream I/O) live in Driver.c/Driver.h --
@@ -317,6 +320,92 @@ static int milestone2_register_probe(const char *dev)
     return 1;
 }
 
+/* ---- milestone 5 (diagnostic): does OS_GBPB reason 4 actually WRITE
+   the bytes it claims to transfer? ----
+
+   RTLSDRView (phase 2) found a 12-byte hex dump of a "successful" 512-
+   byte read (got==512, i.e. len-r3==0, every single time -- never a
+   short read) showing only the first ~2 bytes looking like real data,
+   with the rest exactly 0x00. That's ambiguous on its own: real data
+   COULD legitimately be 0x00 sometimes. This test removes that
+   ambiguity by pre-filling the destination buffer with a sentinel byte
+   (0xAA, never a value 0x00-centred ADC noise would produce as a run)
+   before each read, then counting how many bytes actually changed --
+   directly measuring how much of the buffer the SWI genuinely writes,
+   independent of what value ends up there. Also checks whether content
+   changes across consecutive reads at a fixed size (genuine streaming)
+   or stays frozen (a stuck/cached single packet being re-read). See
+   docs/PLAN.md -- this also bears on whether milestone 4's own 25.6
+   MB/s throughput number ever represented real sample content, since it
+   only ever checked byte counts. */
+
+#define M5_SENTINEL 0xAAu
+
+static void m5_dump_hex(const unsigned char *buf, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        printf("%02X ", buf[i]);
+    }
+}
+
+static void milestone5_read_primitive_diagnostic(int device_num)
+{
+    static const int sizes[] = { 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 };
+    char dev[16];
+    char path[64];
+    unsigned char buf[1024];
+    int handle;
+    int s, i, got, touched, dump_n;
+
+    printf("\n--- milestone 5 (diagnostic): raw OS_GBPB content "
+           "verification ---\n");
+    sprintf(dev, "usb%d", device_num);
+    rtlsdr_reset_buffer(dev);
+    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000:%s",
+            RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, dev);
+    handle = os_find_open(path);
+    if (handle == 0) {
+        printf("OS_Find FAILED -- aborting milestone 5 diagnostic.\n");
+        return;
+    }
+
+    printf("\n-- sentinel test: pre-fill with 0x%02X, read, count bytes "
+           "actually changed vs. what os_gbpb_read4() reports as "
+           "transferred --\n", M5_SENTINEL);
+    for (s = 0; s < 10; s++) {
+        memset(buf, M5_SENTINEL, sizeof(buf));
+        got = os_gbpb_read4(handle, buf, sizes[s]);
+        touched = 0;
+        for (i = 0; i < sizes[s]; i++) {
+            if (buf[i] != M5_SENTINEL) {
+                touched++;
+            }
+        }
+        dump_n = (sizes[s] < 16) ? sizes[s] : 16;
+        printf("size=%4d got=%4d touched=%4d first%2d: ",
+               sizes[s], got, touched, dump_n);
+        m5_dump_hex(buf, dump_n);
+        printf("\n");
+        fflush(stdout);
+    }
+
+    printf("\n-- repeatability test: 8-byte reads, 10 in a row (checking "
+           "for genuinely fresh content each time vs. a frozen/cached "
+           "packet) --\n");
+    for (i = 0; i < 10; i++) {
+        memset(buf, M5_SENTINEL, 8);
+        got = os_gbpb_read4(handle, buf, 8);
+        printf("read %2d: got=%d bytes: ", i, got);
+        m5_dump_hex(buf, 8);
+        printf("\n");
+        fflush(stdout);
+    }
+
+    os_find_close(handle);
+    printf("\n--- milestone 5 diagnostic done ---\n");
+}
+
 /* ---- entry point ---- */
 
 int main(void)
@@ -362,5 +451,11 @@ int main(void)
            "power-up-default ratio, which is a real candidate for why no "
            "streaming data ever arrived.\n");
 
-    return milestone4_streaming_test(n);
+    milestone4_streaming_test(n);
+
+    /* Diagnostic, not gating -- runs regardless of milestone 4's own
+       pass/fail so we get the content-verification data either way. */
+    milestone5_read_primitive_diagnostic(n);
+
+    return 0;
 }

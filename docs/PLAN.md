@@ -1046,4 +1046,43 @@ zero-padding pattern goes away. If it does, that confirms over-polling
 as the cause here, and reopens whether milestone 4's throughput number
 needs re-verifying with a content check, not just a byte-count check.
 If the pattern persists even at one read per tick, something else is
-going on and the sustained-throughput result stands. Pending a real run.
+going on and the sustained-throughput result stands.
+
+**Real run result: the pattern persisted even at BATCH_READS=1.** Hex
+dump: `F7 CC 00 00 00 00 00 00 00 00 00 00` -- same shape as before (two
+real-looking bytes, then exact zeros), unaffected by read pacing.
+`debug_reads_bad_g` has been exactly 0 across every single run --
+`os_gbpb_read4()` has never once reported a short read (its return
+value, `len` minus "bytes not transferred", has always equalled the
+full requested count). This rules out over-polling as the cause and
+narrows it to something more fundamental: `OS_GBPB` reason 4 against
+this bulk-endpoint stream appears to report a full transfer while only
+writing a small fraction of the destination buffer, at any read pacing.
+
+## Phase 2, follow-on: milestone 5 (diagnostic) -- verifying OS_GBPB content, not just counts
+
+Rather than keep patching `RTLSDRView`'s read loop blindly, built a
+focused diagnostic independent of the FFT/display code entirely, added
+to `!RTLSDR` as a new non-gating milestone 5
+(`milestone5_read_primitive_diagnostic()` in `c/RTLSDR.c`). Two tests,
+both against the same proven bulk-endpoint path milestone 4 uses:
+
+1. **Sentinel test**: pre-fills the destination buffer with `0xAA`
+   (a value plausible I/Q noise wouldn't produce as a long run) before
+   each read, across sizes 2/4/8/16/.../1024 bytes, then counts how many
+   bytes actually changed vs. what `os_gbpb_read4()` reports as
+   transferred. This removes the ambiguity a plain zero-check has (real
+   data could legitimately read as 0x00 sometimes) by measuring what the
+   SWI actually *writes*, independent of what value ends up there.
+2. **Repeatability test**: ten consecutive 8-byte reads, dumped in full,
+   to distinguish genuinely fresh USB data each call from a stuck/cached
+   single packet being re-read.
+
+This also bears directly on phase 1's own headline result: milestone
+4's 25.6 MB/s sustained-throughput number used the exact same
+`len - bytes_not_transferred` formula and the exact same bulk-endpoint
+path, and only ever checked that the count was large and fast -- never
+that the bytes were genuine sample content. If milestone 5 confirms
+`OS_GBPB` under-writes the buffer while over-reporting success, that
+number may need re-verifying with a content check of its own, not just
+treated as settled. Pending a real run.
