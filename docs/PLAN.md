@@ -990,5 +990,60 @@ everything else toward zero -- the exact failure mode every fixed
 `DB_CEIL` guess kept hitting. The DC bin is still plotted, just not used
 to pick the scale. This is the standard auto-scaling technique real
 spectrum analyzers use, and removes the guessing entirely rather than
-requiring a fourth constant to tune. Rebuilt, not yet re-verified on
-hardware as of this note.
+requiring a fourth constant to tune.
+
+**Real run with auto-scaling: no visible movement at all** (worse than
+the earlier fixed-scale runs, which at least showed one moving line).
+Added on-screen diagnostics directly in the window (successful/failed
+read counts, this frame's dB range, raw ADC byte min/max, and eventually
+a 12-byte hex dump of the last frame) rather than keep inferring from
+photos -- printf/stderr goes nowhere visible in a Wimp app, so the
+numbers get drawn into the window itself via `GFX_Write0` under `VDU 5`
+(graphics-cursor text mode). Took a few iterations to get the layout
+readable (a combined line overran the window width; 20-unit line
+spacing badly overlapped this system font's actual line height; settled
+on ~56-unit spacing, short per-line text).
+
+**What the diagnostics found, in order:**
+1. `ok=643240 bad=0` -- the read pipeline itself is completely healthy.
+   Ruled out "os_gbpb_read4 silently failing, buffer stuck at its
+   zero-initialized state" as the explanation for the DC-only display.
+2. `min=46 max=46 dc=93` -- the ENTIRE non-DC spectrum (251 bins) reads
+   within under 1dB of each other. Mathematically this is what flat
+   white noise produces under an FFT, so on its own this wasn't
+   necessarily a bug -- could just mean no distinguishable station
+   carrier is reaching the tuner.
+3. Raw byte range across the whole 512-byte frame: `0..129`, then
+   `0..214` on a later run -- real, substantial variation, but sitting
+   asymmetrically BELOW the expected ~127.5 ADC centre rather than
+   spread around it. Healthy I/Q data shouldn't look like that.
+4. **The actual smoking gun**: a 12-byte hex dump of consecutive raw
+   bytes from one frame showed `86 D6 00 00 00 00 00 00 00 00 00 00` --
+   two genuine-looking bytes, then a long run of exact zeros. Not noise
+   -- a deterministic pattern.
+
+**Working hypothesis**: `os_gbpb_read4()` is documented elsewhere in
+this project as a blocking, synchronous SWI call, and milestone 4's
+celebrated phase-1 throughput result (25.6 MB/s) only ever verified
+BYTE COUNTS, never the actual content of what came back -- and used the
+same kind of tight, back-to-back read loop `RTLSDRView`'s
+`BATCH_READS=8` also used (8 `os_gbpb_read4(512)` calls with zero
+pacing between them, every idle tick). If DeviceFS is polled for a full
+512-byte chunk faster than the RTL2832U can actually fill one at 4.8
+MB/s (~107 microseconds needed), it may report "512 of 512 bytes
+transferred" while only a couple of bytes are genuinely fresh USB data,
+with the rest being stale/zeroed padding from its own internal buffer
+-- rather than genuinely blocking until real data is ready, or
+returning an honest short count. **This would mean milestone 4's own
+25.6 MB/s result may never have verified genuine sample content
+either** -- a real open question about a previously "confirmed"
+phase-1 result, not just a `RTLSDRView`-specific bug.
+
+**Direct test**: dropped `BATCH_READS` from 8 to 1 (one
+`os_gbpb_read4(512)` call per idle tick, relying on natural `Wimp_Poll`
+call spacing for pacing instead of a tight loop) to see whether the
+zero-padding pattern goes away. If it does, that confirms over-polling
+as the cause here, and reopens whether milestone 4's throughput number
+needs re-verifying with a content check, not just a byte-count check.
+If the pattern persists even at one read per tick, something else is
+going on and the sustained-throughput result stands. Pending a real run.

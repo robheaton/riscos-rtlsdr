@@ -70,12 +70,21 @@
    are separate concerns: drain every idle tick (so the RTL2832U's
    internal buffering never backs up), redraw only every UPDATE_INTERVAL_CS
    centiseconds (so a plain full-window repaint at native Wimp_Poll rate
-   doesn't waste CPU/flicker). 8 reads * 512 bytes = 4KB/tick; at the
-   25+ MB/s sustained rate milestone 4 measured for single reads, this is
-   comfortably fast, but the real achievable pump rate depends on
-   Wimp_Poll's own call frequency, which differs from milestone 4's tight
-   do-while loop -- worth watching on the first real run. */
-#define BATCH_READS       8
+   doesn't waste CPU/flicker).
+
+   BATCH_READS was 8 (tight back-to-back os_gbpb_read4 calls, no pacing)
+   until a real run showed WHY that's suspect: the raw bytes returned
+   were mostly zero after the first couple, despite each read claiming
+   "512 of 512 bytes transferred". Milestone 4's phase-1 throughput
+   result (25.6 MB/s) only ever verified BYTE COUNTS, never content, and
+   used the exact same kind of tight back-to-back loop -- so it's
+   plausible DeviceFS returns "success" with mostly stale/zero padding
+   when polled faster than the RTL2832U can actually fill a 512-byte
+   chunk at 4.8 MB/s (~107us needed), rather than genuinely blocking
+   until real data is ready. Dropped to 1 read per idle tick as a direct
+   test: if the zero-padding stops, that confirms over-polling was the
+   cause; if it doesn't, something else is going on. See docs/PLAN.md. */
+#define BATCH_READS       1
 #define UPDATE_INTERVAL_CS 20   /* ~5Hz redraw */
 
 /* compute_spectrum() auto-scales EACH FRAME's own min/max dB range to
