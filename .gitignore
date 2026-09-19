@@ -1,0 +1,5 @@
+build/RTLSDR,ff8
+build/RTLSDR
+build/__pycache__/
+build/out/
+build/o/

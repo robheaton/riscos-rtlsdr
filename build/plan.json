@@ -1,0 +1,22 @@
+{
+ "setup": [
+  "CDir o"
+ ],
+ "compiles": [
+  {
+   "cmd": "cc -c -za1 -Otime -apcs 3/32bit -throwback -I,C: c.RTLSDR -o o.RTLSDR",
+   "out": "o.RTLSDR",
+   "src": "c.RTLSDR"
+  },
+  {
+   "cmd": "cc -c -za1 -Otime -apcs 3/32bit -throwback -I,C: c.R82XX -o o.R82XX",
+   "out": "o.R82XX",
+   "src": "c.R82XX"
+  }
+ ],
+ "finals": [
+  "link -o RTLSDR o.RTLSDR o.R82XX C:o.stubs-32",
+  "CDir out",
+  "Copy RTLSDR out.RTLSDR ~C~V"
+ ]
+}

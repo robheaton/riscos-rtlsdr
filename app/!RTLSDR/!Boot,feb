@@ -1,0 +1,2 @@
+| !Boot file for !RTLSDR
+Set RTLSDR$Dir <Obey$Dir>
