@@ -386,21 +386,28 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                                BIN_WIDTH_OS - 1, bin_height_g[i]);
         }
 
-        /* Diagnostic text line -- see the debug_*_g comment above. VDU 5
-           switches subsequent text output to plot at the graphics cursor
-           (GFX_Move'd position) instead of the text cursor; VDU 4
-           reverts. */
+        /* Diagnostic text, split across short lines so nothing gets
+           clipped by the window edge (a single combined line overran the
+           visible width on the first real run) -- see the debug_*_g
+           comment above. VDU 5 switches subsequent text output to plot
+           at the graphics cursor (GFX_Move'd position) instead of the
+           text cursor; VDU 4 reverts. */
         {
-            char dbgbuf[120];
-            sprintf(dbgbuf, "ok=%lu bad=%lu min=%.1fdB max=%.1fdB dc=%.1fdB "
-                             "b0=%02X,%02X,%02X,%02X",
-                    debug_reads_ok_g, debug_reads_bad_g, debug_db_min_g,
-                    debug_db_max_g, debug_db_dc_g, debug_first_bytes_g[0],
-                    debug_first_bytes_g[1], debug_first_bytes_g[2],
-                    debug_first_bytes_g[3]);
+            char line1[32], line2[32], line3[32];
+            sprintf(line1, "ok=%lu bad=%lu",
+                    debug_reads_ok_g, debug_reads_bad_g);
+            sprintf(line2, "min=%.0f max=%.0f dc=%.0f",
+                    debug_db_min_g, debug_db_max_g, debug_db_dc_g);
+            sprintf(line3, "b0=%02X,%02X,%02X,%02X",
+                    debug_first_bytes_g[0], debug_first_bytes_g[1],
+                    debug_first_bytes_g[2], debug_first_bytes_g[3]);
             GFX_VDU(5);
             GFX_Move(ox + 4, oy - 16);
-            GFX_Write0(dbgbuf);
+            GFX_Write0(line1);
+            GFX_Move(ox + 4, oy - 36);
+            GFX_Write0(line2);
+            GFX_Move(ox + 4, oy - 56);
+            GFX_Write0(line3);
             GFX_VDU(4);
         }
 
