@@ -40,10 +40,23 @@ ROOT = os.path.dirname(HERE)
 PLAN = os.path.join(HERE, "plan.json")
 APP_C = os.path.join(ROOT, "app", "!RTLSDR", "c")
 APP_H = os.path.join(ROOT, "app", "!RTLSDR", "h")
+VIEW_C = os.path.join(ROOT, "app", "!RTLSDRView", "c")
+VIEW_H = os.path.join(ROOT, "app", "!RTLSDRView", "h")
+# Reuse riscos-rdpclient's prebuilt 32-bit DeskLib (built once via that
+# project's builddesklib.py -- compiles all ~516 DeskLib source objects
+# with -apcs 3/32bit, since the official prebuilt DeskLib doesn't match
+# this toolchain's 32-bit APCS variant) rather than rebuilding DeskLib
+# from scratch for this project. See docs/PLAN.md, Phase 2 section.
+DESKLIB_HEADERS = os.path.join(
+    os.path.expanduser("~"), "Development", "desklib-module-src",
+    "!DeskLib", "include")
+DESKLIB32_LIB = os.path.join(
+    os.path.expanduser("~"), "Development", "riscos-rdpclient",
+    "rdpclient", "build", "DeskLib32")
 SERVER = "wss://build.riscos.online/ws"
 ARCH = "aarch32"
 TIMEOUT = 480
-ARTIFACT_NAME = "RTLSDR"
+ARTIFACT_NAMES = ["RTLSDR", "RTLSDRView"]
 # The build service collects artifacts by zipping a DIRECTORY (confirmed
 # from riscos-rdpclient/build/buildapp.py: write_yaml(script, "out")) --
 # not a single file by name. plan.json's finals step copies the linked
@@ -85,6 +98,7 @@ def build_zip():
     try:
         os.makedirs(os.path.join(stage, "c"))
         os.makedirs(os.path.join(stage, "h"))
+        os.makedirs(os.path.join(stage, "desklib", "o"))
         with open(os.path.join(stage, ".robuild.yaml"), "w") as f:
             f.write(yaml_text)
         for fn in os.listdir(APP_C):
@@ -93,6 +107,27 @@ def build_zip():
         for fn in os.listdir(APP_H):
             shutil.copyfile(os.path.join(APP_H, fn),
                              os.path.join(stage, "h", _riscos_leaf(fn)))
+        if os.path.isdir(VIEW_C):
+            for fn in os.listdir(VIEW_C):
+                shutil.copyfile(os.path.join(VIEW_C, fn),
+                                 os.path.join(stage, "c", _riscos_leaf(fn)))
+        if os.path.isdir(VIEW_H):
+            for fn in os.listdir(VIEW_H):
+                shutil.copyfile(os.path.join(VIEW_H, fn),
+                                 os.path.join(stage, "h", _riscos_leaf(fn)))
+
+        # DeskLib headers are referenced by DeskLib:Xyz.h -- a full
+        # filing-system-prefixed pathname resolved via the DeskLib$Path
+        # system variable (set in plan.json's setup), NOT the -I,C:
+        # search path that strips extensions -- so these keep their
+        # literal dotted names, matching riscos-rdpclient's proven-
+        # working desklib/ layout for this same build service.
+        for fn in os.listdir(DESKLIB_HEADERS):
+            if fn.endswith(".h"):
+                shutil.copyfile(os.path.join(DESKLIB_HEADERS, fn),
+                                 os.path.join(stage, "desklib", fn))
+        shutil.copyfile(DESKLIB32_LIB,
+                         os.path.join(stage, "desklib", "o", "DeskLib"))
 
         fd, zip_path = tempfile.mkstemp(suffix=".zip")
         os.close(fd)
@@ -205,30 +240,36 @@ def run_build(src_bytes):
 def save_artifact(art_bytes):
     """The service may return the artifact as a raw file or a zip wrapping
     it (possibly with a RISC OS ',xxx' filetype suffix on the member name).
-    Handle both."""
+    Handle both. Now two binaries (RTLSDR, RTLSDRView) can come back in
+    the same zip -- extract whichever of ARTIFACT_NAMES are present."""
     try:
         with zipfile.ZipFile(io.BytesIO(art_bytes)) as z:
             names = [n for n in z.namelist() if not n.endswith("/")]
             print("artifact zip members:", names)
+            found = []
             for n in names:
                 leaf = os.path.basename(n.rstrip("/")).split(",")[0]
-                if leaf == ARTIFACT_NAME:
+                if leaf in ARTIFACT_NAMES:
                     data = z.read(n)
-                    outp = os.path.join(HERE, ARTIFACT_NAME)
+                    outp = os.path.join(HERE, leaf)
                     open(outp, "wb").write(data)
                     print("Wrote %s (%d bytes)" % (outp, len(data)))
-                    return True
-            print("%s member not found in artifact zip" % ARTIFACT_NAME)
-            return False
+                    found.append(leaf)
+            missing = [a for a in ARTIFACT_NAMES if a not in found]
+            if missing:
+                print("Not found in artifact zip: %s" % missing)
+            return len(found) > 0
     except zipfile.BadZipFile:
-        outp = os.path.join(HERE, ARTIFACT_NAME)
+        # Raw single-file response -- only meaningful when there's just
+        # one artifact name to expect.
+        outp = os.path.join(HERE, ARTIFACT_NAMES[0])
         open(outp, "wb").write(art_bytes)
         print("Wrote %s (%d bytes, raw)" % (outp, len(art_bytes)))
         return True
 
 
 def main():
-    print("Building %s via %s" % (ARTIFACT_NAME, SERVER))
+    print("Building %s via %s" % (", ".join(ARTIFACT_NAMES), SERVER))
     src = build_zip()
     print("Source zip: %d bytes" % len(src))
     res = run_build(src)

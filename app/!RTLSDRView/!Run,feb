@@ -1,0 +1,4 @@
+| !Run file for !RTLSDRView
+Set RTLSDRView$Dir <Obey$Dir>
+WimpSlot -min 640K -max 640K
+Run <RTLSDRView$Dir>.RTLSDRView
