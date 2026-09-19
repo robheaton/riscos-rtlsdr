@@ -3,7 +3,7 @@
    proves the architecture (continuous USB reads inside a Wimp idle
    handler without freezing the desktop, an FFT, and a redraw loop) that
    everything after this builds on. No demodulation, no audio, no tuning
-   UI yet -- fixed at 100.0MHz (FM broadcast band), 2.4 MSPS.
+   UI yet -- fixed at 97.4MHz (FM broadcast band), 2.4 MSPS.
 
    Device bringup (find_device, baseband/tuner init, sample rate, raw
    OS_Find/OS_GBPB stream I/O) reuses c/Driver.c -- the same code proven
@@ -464,11 +464,11 @@ int main(void)
         rc = r82xx_init(&tuner, device_name_g);
     }
     if (rc == 0) {
-        rc = r82xx_set_freq(&tuner, 100000000UL); /* 100MHz, FM broadcast */
+        rc = r82xx_set_freq(&tuner, 97400000UL); /* 97.4MHz, local FM broadcast */
     }
     rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x10, 1); /* disable I2C repeater */
     if (rc != 0 || !tuner.has_lock) {
-        report_and_die("Tuner init/tune to 100MHz failed -- see "
+        report_and_die("Tuner init/tune to 97.4MHz failed -- see "
                         "!RTLSDR's diagnostic output for details.");
     }
 
