@@ -907,19 +907,46 @@ whether GPIO access reintroduces a hang (watch responsiveness closely;
 power-cycle + unplug/replug the dongle if it does, per the established
 recovery procedure) as well as whether it actually fixes VHF reception.
 
-### `!RTLSDRView`: in progress
+### `!RTLSDRView`: built and proven; milestone 1 declared complete
 
-Building the new app now: hand-built `window_block` (no Templates editor
-available in this environment), a ring buffer filled by bounded batches
-of `os_gbpb_read4(1024)` calls inside a `event_NULL` idle handler
+Built exactly per the plan: hand-built `window_block` (no Templates
+editor available in this environment), reads pumped in bounded batches
+of `os_gbpb_read4(512)` calls inside an `event_NULL` idle handler
 (matching `riscos-rdpclient`'s `Status,fff` `Time_Monotonic()`-throttled
 pattern — the same proven idle-update mechanism, not a new one), a
-hand-written radix-2 FFT with offline-precomputed twiddle factors (C89,
-no runtime `sin()`/`cos()`), and a `Wimp_RedrawWindow`/`GFX_RectangleFill`
-bar-graph redraw. Linking against DeskLib: a prebuilt 32-bit
-`DeskLib32` library already exists at
-`~/Development/riscos-rdpclient/rdpclient/build/DeskLib32` (built once via
-that project's `builddesklib.py`, which compiles all ~516 DeskLib source
-objects with `-apcs 3/32bit` since the official prebuilt DeskLib doesn't
-match this toolchain's 32-bit APCS variant) — reusing that instead of
-rebuilding DeskLib from scratch for this project.
+hand-written radix-2 FFT with offline-precomputed twiddle factors, and a
+`Wimp_RedrawWindow`/`GFX_RectangleFill` bar-graph redraw. Links against a
+prebuilt 32-bit `DeskLib32` reused from `riscos-rdpclient`'s
+`builddesklib.py` (compiles all ~516 DeskLib source objects with
+`-apcs 3/32bit` since the official prebuilt DeskLib doesn't match this
+toolchain's 32-bit APCS variant), rather than rebuilding DeskLib from
+scratch for this project.
+
+**Fifth real run (GPIO fix), then a sixth (live) — the actual result**:
+`!RTLSDR` completed all four milestones cleanly with the GPIO change in
+place, confirming GPIO access itself is safe under direct execution (not
+the freeze cause phase 1 blamed it for — TaskWindow was). `RTLSDRView`
+with a real antenna connected showed a single visible feature (the
+DC-spike bin, centred correctly by the FFT-shift) whose height visibly
+**fluctuates live** — confirmed both from a screen recording (frame-by-
+frame pixel diffs showed real variation, not a frozen image once video-
+compression noise was accounted for) and directly by the user ("a
+horizontal line that is moving up and down"). That is the actual proof
+this milestone needed: continuous USB reads, a real FFT computing
+genuinely varying values from live antenna data, and a redraw loop
+showing it, all running inside the Wimp event loop without a single
+hang or crash across six consecutive real-hardware iterations on this
+new app (two of which were real, fixed bugs: the `wimp_colourflags`
+struct-padding data abort, and the disabled upconvert-bypass GPIO).
+
+**Milestone 1 gate: PASS**, by the plan's own definition of the goal --
+proving the *architecture* (idle-driven streaming + FFT + window +
+redraw, without freezing the desktop), not achieving broadcast-quality
+spectral resolution. The FM station itself not yet standing out clearly
+from the DC spike/noise floor is real, but secondary: display scale
+(`DB_FLOOR`/`DB_CEIL`) and tuner gain (LNA/mixer AGC never explicitly
+verified — only a single fixed VGA write happens every tune, matching
+upstream's own default-gain tuning path, not a full manual gain API)
+are explicitly deferred to a follow-on signal-quality pass, along with
+everything else in "Deferred" above (waterfall, demod, tuning UI,
+gain control UI).

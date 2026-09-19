@@ -8,30 +8,40 @@ and milestones — start there.
 
 ## Status
 
-**All four core milestones are done, confirmed on real hardware.**
+**Phase 1 (milestones 1-4) is done, confirmed on real hardware.**
 RTL-SDR works end-to-end on RISC OS: an **RTL-SDR Blog V4** dongle
 (R828D tuner + upconverter), VID `0BDA` / PID `2838`, found via
 `*USBDevices` → `DeviceFS_CallDevice` control transfers → baseband init
-→ tuner identified and locked at 100MHz → sample rate configured →
-**sustained bulk streaming measured at 25.6 MB/s — over 5x the ~4.8 MB/s
-a real SDR needs.** No libusb, no existing driver to build on; this talks
-to the dongle entirely through RISC OS's own native USB interface.
+→ tuner identified and locked → sample rate configured →
+**sustained bulk streaming measured at 25.6-25.8 MB/s — over 5x the
+~4.8 MB/s a real SDR needs.** No libusb, no existing driver to build on;
+this talks to the dongle entirely through RISC OS's own native USB
+interface.
+
+**Phase 2, milestone 1 (`!RTLSDRView`, a live spectrum display) is also
+done, confirmed on real hardware.** A real Wimp GUI app: continuous
+idle-driven USB reads, a hand-written FFT, and a live-updating bar-graph
+redraw, all running inside the Wimp event loop without freezing the
+desktop. Confirmed on real hardware with a real antenna: the display
+genuinely updates live from real received RF power. Signal-quality
+polish (making a station stand out clearly from the DC-spike/noise
+floor, tuner gain, demodulation, a tuning UI) is explicitly deferred —
+see `docs/PLAN.md`'s "Phase 2" section.
 
 Getting here was a real diagnostic journey — full blow-by-blow in
 `docs/PLAN.md`, including several real bugs only found by actually
 running this on hardware: an I2C-write chunking limit, a hardware
 bit-reversal quirk on I2C reads, TaskWindow execution implicated in
 repeated full-machine freezes (fixed by running directly instead — now
-the operational rule), and `fread()` never working against this
-DeviceFS stream at any size for reasons never fully root-caused (worked
-around with raw `OS_Find`/`OS_GBPB` instead, which itself turned out to
-have its own reliable-size ceiling — 1024 bytes good, 2048 blocks for
-~110s — found by an empirical sweep, not documentation).
-
-**What exists now is a command-line diagnostic tool, not a usable SDR
-application.** Milestone 5 (FFT/waterfall display, demodulation, a real
-Wimp app) is unstarted — a substantial new phase, not a continuation of
-the current diagnostic loop.
+the operational rule), `fread()` never working against this DeviceFS
+stream at any size for reasons never fully root-caused (worked around
+with raw `OS_Find`/`OS_GBPB` instead, which itself turned out to have
+its own reliable-size ceiling), a hand-built Wimp window definition
+block crashing `Wimp_CreateWindow` with a data abort because Norcroft
+can pad a mixed char/bitfield struct past its intended size, and a
+disabled GPIO call (the V4's antenna-vs-upconverter RF switch) that
+turned out safe to re-enable once TaskWindow was ruled out as the real
+freeze cause.
 
 ## Layout
 
@@ -39,11 +49,14 @@ the current diagnostic loop.
 - `tools/probe.bas` — no-compiler-needed BASIC script for confirming
   hardware facts (device enumeration, VID/PID, endpoint layout) before
   writing C against them. Already run once; see `docs/PLAN.md`.
-- `app/!RTLSDR/c/RTLSDR.c`, `h/RTLSDR.h` — device enumeration, baseband
-  init, and the shared USB-control-transfer/register-I/O primitives
-  (`usb_ctrl_transfer`, `rtlsdr_read_reg`/`write_reg`) that `R82XX.c` uses.
+- `app/!RTLSDR/c/RTLSDR.c`, `h/RTLSDR.h` — the command-line diagnostic
+  tool: milestone-specific tests plus `main()`.
+- `app/!RTLSDR/c/Driver.c`, `h/Driver.h` — shared device bringup (device
+  discovery, baseband/tuner init, sample rate, raw `OS_Find`/`OS_GBPB`
+  stream I/O), used by both `!RTLSDR` and `!RTLSDRView`.
 - `app/!RTLSDR/c/R82XX.c`, `h/R82XX.h` — the R820T/R828D tuner driver
-  (PLL, filter calibration, V4-specific band-switching).
+  (PLL, filter calibration, V4-specific band-switching), also shared.
+- `app/!RTLSDRView/c/SpecView.c` — the live spectrum display Wimp app.
 - `build/plan.json` — compile/link plan for `build.riscos.online`.
 
 ## Building
@@ -59,14 +72,20 @@ package; `riscos-rdpclient`'s existing venv already has it:
 ~/Development/riscos-rdpclient/rdpclient/build/.venv/bin/python3 build/build_one_shot.py
 ```
 
-Output lands at `build/RTLSDR,ff8` (RISC OS AIF/Absolute format, tagged
-with the `,ff8` filetype suffix for transfer). Two gotchas hit and fixed
-while getting this working, in case the build script needs touching again:
-RISC OS leafnames carry no extension (source must be staged as `c/RTLSDR`,
-not `c/RTLSDR.c`, inside the uploaded zip — see `_riscos_leaf()`), and the
-service collects artifacts by zipping a *directory* you name in
-`.robuild.yaml`'s `artifacts: path:`, not a single file — hence `plan.json`
-copies the linked binary into `./out/` as its last step.
+Output lands at `build/RTLSDR,ff8` and `build/RTLSDRView,ff8` (RISC OS
+AIF/Absolute format, tagged with the `,ff8` filetype suffix for
+transfer). Gotchas hit and fixed while getting this working, in case the
+build script needs touching again: RISC OS leafnames carry no extension
+(source must be staged as `c/RTLSDR`, not `c/RTLSDR.c`, inside the
+uploaded zip — see `_riscos_leaf()`); the service collects artifacts by
+zipping a *directory* you name in `.robuild.yaml`'s `artifacts: path:`,
+not a single file — hence `plan.json` copies each linked binary into
+`./out/` as a last step; and `!RTLSDRView` links against a prebuilt
+32-bit DeskLib reused from `~/Development/riscos-rdpclient`'s
+`builddesklib.py` (staged as `desklib/*.h` + `desklib/o/DeskLib` with
+its headers keeping their literal dotted names, since they're referenced
+via the full pathname `DeskLib:Xyz.h`, not the extension-stripped `-I,C:`
+search-path convention the app's own sources use).
 
 Alternative: this machine also has a working local GCCSDK toolchain
 (`arm-riscos-gnueabihf-gcc`, proven in `~/Development/hello`) if
@@ -78,13 +97,15 @@ Norcroft/DDE proves inconvenient for fast iteration — see that project's
 **Requires real RISC OS hardware with the dongle attached** — the
 `RISCOSQEMUA72` emulator has no USB passthrough, so it can't be used here.
 
-Copy `build/RTLSDR,ff8` to the Pi and run it **directly — double-click it
-in the Filer, or `*Run` it — not inside a TaskWindow** (see Status above:
-TaskWindow execution is implicated in repeated full-machine freezes;
-direct execution has not reproduced that). It's a `printf`-based
-diagnostic tool, not yet a Wimp app; running it directly opens a text
-output window and shows "Press SPACE or click mouse to continue" when
-done, rather than closing immediately. It runs every milestone in
-sequence and stops at the first failure — one full run now takes the
-dongle from "unidentified USB device" all the way through sustained bulk
-streaming at ~25 MB/s, with nothing currently expected to fail.
+Copy `build/RTLSDR,ff8` and/or `build/RTLSDRView,ff8` to the Pi and run
+them **directly — double-click in the Filer, or `*Run` — not inside a
+TaskWindow** (see Status above: TaskWindow execution is implicated in
+repeated full-machine freezes; direct execution has not reproduced that
+across many runs). `!RTLSDR` is a `printf`-based diagnostic tool, not a
+Wimp app; running it directly opens a text output window and shows
+"Press SPACE or click mouse to continue" when done, rather than closing
+immediately. It runs every milestone in sequence and stops at the first
+failure. `!RTLSDRView` is a real Wimp app — it opens a window showing a
+live spectrum trace (fixed at 97.4MHz for now, no tuning UI yet); watch
+desktop responsiveness while it's running (move another window, click
+elsewhere) as the main regression risk to check for.
