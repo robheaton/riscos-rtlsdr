@@ -1467,3 +1467,30 @@ Averaging must happen in the power domain, not by averaging dB values
 directly (log of an average is not the same as an average of logs).
 `AVG_ALPHA=0.05` (an exponential moving average, ~20-frame effective
 window) is a first-pass guess, not measured. Pending a real run.
+
+**Apparent real run: `min=0.00 max=0.00 pk@+0`** -- looked like a new
+regression (matching the debug globals' own static initializers
+exactly, as if `finalize_display()`/`accumulate_frame()` never ran at
+all). Turned out to be a mistakenly reposted screenshot from an earlier
+build in the sequence, not a result from this build -- user corrected
+this ("i posted the wrong picture, everything is stuck at 0"). No code
+issue; noted here only so this dead end isn't rediscovered.
+
+**Real run (correct screenshot): `ok=15000 bad=0`,
+`min=48.84 max=48.84`** -- identical to 2 decimal places across 251
+non-DC-excluded bins, after 15000 accumulated frames. This rules out
+"nothing is running" (reads and averaging are clearly executing at
+volume) but is itself suspicious: real noise-floor variance across 251
+independent bins essentially never lands on the exact same rounded
+value everywhere. Two live hypotheses: (a) `avg_power_g[]` genuinely IS
+this uniform (a deeper bug upstream of display -- e.g. FFT input,
+accumulation, or bin-index mapping), or (b) there IS a real linear
+difference between bins that log compression is hiding, since
+`log10(x)` barely moves for large, similar-magnitude `x` (e.g.
+`log10(1e10)` vs `log10(1.1e10)` differ by only ~0.04 dB). Added
+`debug_raw_min_g`/`debug_raw_max_g` (`avg_power_g[min_bin]`/
+`avg_power_g[max_bin]`, captured straight from the linear-domain
+average, bypassing `10*log10()` entirely) and a new display line
+showing them in scientific notation, to distinguish (a) from (b) before
+guessing at another change to the averaging/FFT code itself. Pending a
+real run.
