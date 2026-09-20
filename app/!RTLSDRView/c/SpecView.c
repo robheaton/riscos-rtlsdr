@@ -63,7 +63,11 @@
 
 #define BIN_WIDTH_OS  2
 #define WORK_WIDTH    (NUM_BINS * BIN_WIDTH_OS)  /* 512 OS units */
-#define WORK_HEIGHT   300                        /* OS units */
+#define WORK_HEIGHT   360                        /* OS units -- grown from
+                                                     300 to fit a 6th
+                                                     diagnostic text line
+                                                     without crowding the
+                                                     bars below it */
 
 /* Redraw throttle, separate from how aggressively Null_spectrum drains
    the USB stream (see MAX_READ_ATTEMPTS there) -- redraw only every
@@ -218,6 +222,18 @@ static double debug_raw_max_g = 0.0;
    ~125 (buffer middle) and sample 255 (buffer end). */
 static unsigned char debug_mid_i_g = 0, debug_mid_q_g = 0;
 static unsigned char debug_end_i_g = 0, debug_end_q_g = 0;
+
+/* Four different fixes to HOW reads are issued (fixed chunk size,
+   4-byte alignment, offset-0 scratch buffer) all failed to move
+   s125/s255 off permanent zero while s0 kept varying -- time to look
+   at the actual sequence of `got` values across individual SWI calls,
+   not guess at another mechanism. A rolling window of the last 3 `got`
+   values (shifted in on every read, regardless of frame boundaries)
+   shows the real call pattern directly: e.g. "big,0,0" would mean one
+   real read then silence; "small,small,small" would mean genuinely
+   incremental honest reads that just aren't summing to a full varied
+   frame for some other reason. */
+static int debug_last_gots_g[3] = { -1, -1, -1 };
 
 /* ---- in-place iterative radix-2 DIT FFT, fixed N=FFT_SIZE ---- */
 static void fft256(double *re, double *im)
@@ -551,6 +567,9 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
         static unsigned char read_tmp_g[FIXED_CHUNK_SIZE];
         want = FIXED_CHUNK_SIZE;
         got = os_gbpb_read4(stream_handle_g, read_tmp_g, want);
+        debug_last_gots_g[0] = debug_last_gots_g[1];
+        debug_last_gots_g[1] = debug_last_gots_g[2];
+        debug_last_gots_g[2] = got;
         if (got < 0) {
             debug_reads_bad_g++;
             break;
@@ -799,6 +818,21 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                 GFX_VDU(5);
                 GFX_Move(ox + 4, oy - 244);
                 GFX_Write0(line5);
+                GFX_VDU(4);
+            }
+            /* Last 3 raw `got` values from individual SWI calls, in
+               order, regardless of frame boundaries -- shows the actual
+               call/response pattern directly instead of guessing at
+               another read-mechanism fix. See the debug_last_gots_g
+               comment above. */
+            {
+                char line6[40];
+                sprintf(line6, "gots %d,%d,%d",
+                        debug_last_gots_g[0], debug_last_gots_g[1],
+                        debug_last_gots_g[2]);
+                GFX_VDU(5);
+                GFX_Move(ox + 4, oy - 300);
+                GFX_Write0(line6);
                 GFX_VDU(4);
             }
             GFX_VDU(5);
