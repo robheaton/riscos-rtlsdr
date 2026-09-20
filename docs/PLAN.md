@@ -1494,3 +1494,128 @@ average, bypassing `10*log10()` entirely) and a new display line
 showing them in scientific notation, to distinguish (a) from (b) before
 guessing at another change to the averaging/FFT code itself. Pending a
 real run.
+
+## Phase 2, follow-on: the read-accumulation bug, and where things stand
+
+**Real run: raw power identical too (4.828e+04 == 4.828e+04)** --
+ruling out (b) (log compression hiding a real difference) definitively.
+`avg_power_g[]` genuinely is near-uniform across bins in the linear
+domain, not just after `log10()`. Points at (a): something upstream of
+the display, most likely the FFT's actual input data.
+
+**Unrelated but urgent: the user reported the Pi becoming unresponsive
+while running recent builds.** Root-caused to `Null_spectrum()`'s
+non-blocking read loop: it kept accumulating and FFTing completed
+frames all the way up to `MAX_READ_ATTEMPTS` (5000 at the time) instead
+of returning to `Wimp_Poll` after a handful, and with real sustained
+USB throughput the "stream is empty" exit condition is rare -- so a
+single idle-tick call was burning through nearly the whole attempt
+budget in one tight, non-yielding loop, every tick. Fixed with a
+`MAX_FRAMES_PER_TICK` cap (8) and a much smaller `MAX_READ_ATTEMPTS`
+(200), restoring frequent returns to `Wimp_Poll`. Confirmed by the user
+("the machine is responsive again now"). This was a real, independent
+regression from switching to non-blocking reads with an unbounded
+per-tick batch -- exactly the risk the original phase-2 plan flagged
+for an over-large per-tick batch.
+
+**Byte-level diagnostics finally pinned down the flat-spectrum root
+cause.** Added, one at a time, live on real hardware: raw byte range
+across the frame, time-domain per-sample power range (pre-FFT), which
+sample index carries the frame's peak power, how many samples clear 1%
+of that peak, and finally the actual raw byte values at specific
+offsets. Findings, in order:
+
+- Per-sample power ranged from ~1 to ~64,000 (5 orders of magnitude) in
+  a single frame, with only 1-2 of 256 samples ever "elevated" -- the
+  signature of a near-impulse time-domain frame (mostly one dominant
+  sample, the rest near the frame's own mean). The DFT of a near-delta
+  function is flat by definition, which is exactly what was being
+  measured: the FFT math was behaving correctly for degenerate input,
+  the input itself was the problem.
+- The dominant sample's buffer INDEX was rock-solid at exactly 0, every
+  frame, and bytes at the frame's middle/end read as exactly 0 -- their
+  never-touched zero-init value -- every frame. Manual max gain
+  (thought at the time to be a plausible overload cause) was removed
+  and made no difference, ruling out ADC saturation.
+- Root cause: `Null_spectrum()`'s read loop requested
+  `IQ_BYTES - accum_fill_g` on each successive call -- a SHRINKING,
+  ARBITRARY size once any data had already accumulated. Milestone 5's
+  non-blocking-mode fix was only ever validated against round
+  power-of-two sizes (64/128/256/512); non-round sizes apparently still
+  hit the original short-read padding behaviour, so `accum_fill_g` was
+  reaching `IQ_BYTES` almost entirely from fake reported byte counts.
+  Fixed by always requesting the SAME fixed, validated chunk size
+  regardless of how much of the frame is already filled, carrying any
+  overshoot past the frame boundary into the next frame instead of
+  discarding it.
+
+**Real run: min/max finally separated** (e.g. `min=36.58 max=55.90`,
+raw power differing by ~76x, matching the dB gap). The core "why is
+this flat" mystery, chased since early in phase 2, was this bug.
+
+**But the display then showed a dense, static "barcode" pattern that
+didn't change.** Chased through several more rounds:
+
+- 4-byte destination-offset alignment -- no effect.
+- Reading into a fixed offset-0 scratch buffer instead of a growing
+  destination pointer (sidestepping any DeviceFS quirk tied to
+  non-zero addresses) -- no effect.
+- A sentinel-fill test (pre-fill 0xAA, count touched bytes vs. `got`,
+  the exact technique that caught the original padding bug) proved
+  reads ARE honest at the 256-byte chunk size -- `got` always equalled
+  `touched`. So the remaining zero bytes are genuinely-written zeros,
+  not padding.
+- Sampling the EXACT 256-byte chunk boundaries showed a suspicious
+  pattern: bytes right at/near a chunk boundary kept landing on exactly
+  0 while other positions varied normally.
+- The user then clarified the RTLSDRView window has no scrollbar or
+  resize -- what looked like a static barcode WAS the entire visible
+  window. Six accumulated diagnostic text lines were stripped back to
+  one, restoring the window height to the bars -- but the barcode
+  pattern was still there underneath, just previously hidden behind
+  dense text (a real, independent bug -- reintroducing the exact
+  "diagnostic text fills the whole window" mistake already documented
+  and fixed once earlier in phase 2 -- but not the cause of the
+  barcode itself).
+- 10x heavier averaging (`AVG_ALPHA` 0.05 -> 0.005, ~200-frame window
+  instead of ~20) made NO visible difference to the pattern -- a real
+  tell, since genuine per-bin noise averages down with more frames,
+  while a pattern that survives 10x more averaging unchanged must be
+  deterministic, repeating identically every frame.
+- The math lines up: two 256-byte chunk reads per 512-byte frame, each
+  apparently carrying the same "boundary" artifact, sit exactly 128
+  samples (N/2) apart -- and two fixed impulses spaced at exactly N/2
+  in an N-point DFT alias to a perfect every-other-bin alternating
+  pattern. That's mathematically consistent with the observed barcode,
+  and with why averaging couldn't remove it.
+- Tested switching `FIXED_CHUNK_SIZE` to 512 (the bulk endpoint's
+  actual native USB max packet size), making each frame a single
+  atomic chunk read with zero software-level splicing. The sentinel
+  test confirmed this was ALSO honestly reported (`g512/t512` always).
+  But the result **regressed to completely flat** (`min==max` exactly,
+  no bars drawn at all) -- worse than the spliced 256-byte version, not
+  better.
+
+**Where this leaves things:** the 256-byte chunk version's apparent dB
+contrast may be partly (or wholly) a splicing artifact rather than
+fully real captured signal -- the clean, unspliced 512-byte read
+showing nothing suggests the true, artifact-free capture may not
+actually contain the strong signal SDR# shows on Windows with the same
+hardware/antenna. That points the remaining mystery upstream of the
+read/accumulation mechanism entirely (tuning, IF configuration, gain
+staging) rather than at anything in how bytes move from the SWI into
+memory -- a genuinely different category of investigation than
+anything tried so far in phase 2. Per the user's explicit choice, the
+app has been reverted to the 256-byte chunk size (the more usable
+result of the two, even if not fully understood) as this milestone's
+working baseline, and this specific investigation is paused here
+rather than continued blind.
+
+**Real, confirmed fixes from this investigation, independent of the
+open mystery above:** the DeviceFS short-read padding bug (both its
+original blocking-mode form, and its resurfacing for non-round-sized
+non-blocking requests), the `Wimp_CreateWindow` struct-padding crash,
+the degenerate zero-height `GFX_RectangleFill` rendering bug, the
+resource-hogging unbounded read-attempt loop, and the "too much
+diagnostic text fills the whole window" mistake (now fixed twice). All
+confirmed via real hardware testing, all still in place.

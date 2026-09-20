@@ -182,22 +182,21 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    remainder. accum_buf_g needs FIXED_CHUNK_SIZE bytes of headroom past
    IQ_BYTES to safely hold that overshoot.
 
-   256 (this frame's HALF) turned out to have its own artifact: the
-   sentinel test proved every requested byte genuinely gets written
-   (g==t==256 always), yet the exact tail/head bytes around EACH
-   256-byte chunk boundary stayed suspiciously fixed. With two chunks
-   per 512-byte frame, a per-chunk artifact repeating at that fixed
-   128-sample (256-byte) spacing is mathematically exactly what
-   produces a persistent, unaverageable every-other-bin alternating
-   pattern (two fixed impulses N/2 apart in an N-point DFT alias to
-   +-1 per bin) -- matching the dense "barcode" display that heavy
-   10x-longer averaging didn't change AT ALL (a real tell: genuine
-   noise averages down, a deterministic per-frame artifact doesn't).
-   512 -- the endpoint's actual native USB max packet size -- makes
-   each frame a SINGLE chunk read instead of two boundary-prone ones,
-   testing whether the artifact is specifically tied to splitting a
-   512-byte USB transfer into two 256-byte software-level requests. */
-#define FIXED_CHUNK_SIZE 512
+   256 has its own suspicious artifact (the exact tail/head bytes
+   around each 256-byte chunk boundary stay fixed even though the
+   sentinel test proves every byte is genuinely written), and 512
+   (matching the endpoint's native USB max packet size, one atomic
+   chunk read per frame, zero software-level splicing) was tried as a
+   test -- but that regressed to completely flat with no bars at all,
+   worse than 256, even though g==t==512 confirmed honest reads there
+   too. So 256's apparent dB contrast may partly be a splicing
+   artifact rather than fully real signal, but it's the significantly
+   more usable result of the two, and the flat-spectrum root cause
+   revealed by the clean 512-byte test now points upstream of the read
+   mechanism entirely (tuning/IF/gain), not at chunk size. Back to 256
+   as this milestone's baseline; see docs/PLAN.md for the full
+   investigation and what's still open. */
+#define FIXED_CHUNK_SIZE 256
 
 /* ---- global state ---- */
 static char device_name_g[16];
@@ -829,24 +828,6 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
             GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
             GFX_VDU(4);
-            /* Temporarily re-enabled: switching FIXED_CHUNK_SIZE from
-               256 to 512 regressed to completely flat (min==max
-               exactly) with NO bars drawn at all -- worse than the
-               256-byte version, not better. Checking whether 512-byte
-               reads are still honestly reported (g==t) the way 256-byte
-               ones were, since that's the most likely thing a size
-               change could break. */
-            {
-                char line2[40];
-                sprintf(line2, "g%d/t%d g%d/t%d g%d/t%d",
-                        debug_last_gots_g[0], debug_last_touched_g[0],
-                        debug_last_gots_g[1], debug_last_touched_g[1],
-                        debug_last_gots_g[2], debug_last_touched_g[2]);
-                GFX_VDU(5);
-                GFX_Move(ox + 4, oy - 76);
-                GFX_Write0(line2);
-                GFX_VDU(4);
-            }
         }
 
         Wimp_GetRectangle(&r, &more);

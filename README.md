@@ -33,20 +33,29 @@ and wired into both `!RTLSDR` (a new milestone 5) and `!RTLSDRView`.
 Milestone 4's actual throughput number has not yet been re-measured
 with this fix; treat the old number as void until it is.
 
-**Phase 2, milestone 1 (`!RTLSDRView`, a live spectrum display) is
-done, confirmed on real hardware.** A real Wimp GUI app: continuous
-idle-driven honest USB reads, a hand-written FFT, and a live-updating
-bar-graph redraw, all running inside the Wimp event loop without
-freezing the desktop. Two real bugs were found and fixed getting here
-(the DeviceFS read-padding above, and a rendering bug -- calling
-`GFX_RectangleFill` 256 times in a loop where most calls are
-zero-height turned out to corrupt state badly enough that nothing drew
-at all; fixed by skipping zero-height bars). With both fixed, the
-display is confirmed showing genuine data: the DC-spike artifact
-renders correctly, and the non-DC spectrum is real but close to flat,
-which is now known to be an actual signal-conditions/gain question, not
-a bug hiding behind it. See `docs/PLAN.md`'s "Phase 2" section for the
-full history.
+**Phase 2, milestone 1 (`!RTLSDRView`, a live spectrum display)
+architecture is proven on real hardware; genuine signal detection is
+still an open question.** A real Wimp GUI app: continuous idle-driven
+honest USB reads, a hand-written FFT, power-domain frame averaging, and
+a live-updating bar-graph redraw, all running inside the Wimp event
+loop without freezing the desktop. A long list of real bugs was found
+and fixed getting here (see `docs/PLAN.md`'s "Phase 2" section for the
+full history) — most recently a second, subtler form of the DeviceFS
+short-read padding bug (it resurfaces for non-round read sizes even
+with non-blocking mode enabled) and a resource-hogging unbounded read
+loop that was making the Pi unresponsive. Fixing that padding bug
+finally produced real dB contrast for the first time (previously
+`min`/`max` were identical to several decimal places, always). But a
+clean, unspliced read (matching the bulk endpoint's native USB packet
+size) showed no contrast at all, which suggests the contrast seen with
+smaller, spliced reads may itself be a splicing artifact rather than
+fully real captured signal — the true root cause of "no signal
+visible" now looks like it sits upstream of the read mechanism
+entirely (tuning, IF configuration, or gain staging), not in how bytes
+move from the SWI into memory. This is where the investigation is
+paused for now; the app runs, doesn't crash or freeze, and renders
+*something*, but whether that something is a real station peak remains
+unconfirmed.
 
 Getting here was a real diagnostic journey — full blow-by-blow in
 `docs/PLAN.md`, including several real bugs only found by actually
