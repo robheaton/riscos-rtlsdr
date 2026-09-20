@@ -859,18 +859,20 @@ int main(void)
     if (rc == 0) {
         rc = r82xx_set_freq(&tuner, 97400000UL); /* 97.4MHz, local FM broadcast */
     }
-    if (rc == 0 && tuner.has_lock) {
-        /* AGC (upstream's own default -- see R82XX.h) hasn't made the
-           station stand out from the noise floor in several real runs
-           now that the read/render pipeline is confirmed correct.
-           Testing manual maximum gain as a direct, well-grounded next
-           step (ported from real upstream source, not guessed -- see
-           docs/PLAN.md) rather than continuing to assume AGC alone is
-           sufficient. Needs the I2C repeater still enabled, same as
-           r82xx_set_freq() above -- must run before it's disabled
-           below. */
-        rc = r82xx_set_gain_max(&tuner);
-    }
+    /* Manual max gain (r82xx_set_gain_max) was tested here and judged
+       "no measurable difference" -- but that was measured with a coarse
+       1-decimal dB min/max, before the byte/sample-level diagnostics
+       (see docs/PLAN.md) existed. Those now show every frame is
+       dominated by exactly ONE sample (idx@0, nElev=1, rock-solid
+       across many separate runs) with the other 255 essentially pinned
+       to the frame's own mean -- the signature of a clipped/saturated
+       ADC (most samples slammed against a rail, occasional sample
+       catching a brief unclipped transition), not of a healthy
+       noise+signal capture. Forcing gain to ABSOLUTE MAXIMUM on top of
+       an already-strong local FM signal (confirmed ~40dB in SDR#) is a
+       very plausible way to cause exactly that overload. Testing with
+       AGC left alone (upstream's own default -- see R82XX.h) instead
+       of forcing max gain, to see if this pattern goes away. */
     rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x10, 1); /* disable I2C repeater */
     if (rc != 0 || !tuner.has_lock) {
         report_and_die("Tuner init/tune to 97.4MHz failed -- see "
