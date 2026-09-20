@@ -160,11 +160,30 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
     -0.0980171403, -0.0735645636, -0.0490676743, -0.0245412285
 };
 
+/* Every read request must be one of the round power-of-two sizes
+   milestone 4's sweep + milestone 5's sentinel test actually validated
+   as getting HONEST non-blocking short-read counts (64/128/256/512
+   bytes) -- see docs/PLAN.md. Requesting the shrinking, arbitrary-sized
+   REMAINDER (IQ_BYTES - accum_fill_g) on each successive call, as this
+   used to do, turned out to resurface the exact padding bug that fix
+   was meant to kill for any non-round size: live diagnostics showed
+   only the FIRST ~2 bytes of every 512-byte frame were ever genuinely
+   written (idx@0/nElev=1 rock-solid, and bytes at the frame's middle
+   and end sitting at exactly 0 -- their untouched zero-init value --
+   forever), meaning accum_fill_g was reaching IQ_BYTES almost entirely
+   from fake reported counts, not real data. Fixed by always requesting
+   this SAME fixed, validated chunk size regardless of how much of the
+   frame is already filled, carrying any overshoot past the frame
+   boundary into the next frame instead of trying to request an exact
+   remainder. accum_buf_g needs FIXED_CHUNK_SIZE bytes of headroom past
+   IQ_BYTES to safely hold that overshoot. */
+#define FIXED_CHUNK_SIZE 256
+
 /* ---- global state ---- */
 static char device_name_g[16];
 static int stream_handle_g = 0;
 static unsigned char iq_frame_g[IQ_BYTES];
-static unsigned char accum_buf_g[IQ_BYTES];
+static unsigned char accum_buf_g[IQ_BYTES + FIXED_CHUNK_SIZE];
 static int accum_fill_g = 0;
 static int bin_height_g[NUM_BINS];
 static unsigned int next_update_time_g;
@@ -513,7 +532,7 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
     any_ok = 0;
     n_frames = 0;
     for (i = 0; i < MAX_READ_ATTEMPTS; i++) {
-        want = IQ_BYTES - accum_fill_g;
+        want = FIXED_CHUNK_SIZE;
         got = os_gbpb_read4(stream_handle_g, accum_buf_g + accum_fill_g, want);
         if (got < 0) {
             debug_reads_bad_g++;
@@ -544,8 +563,21 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
 
         {
             int j;
+            int carry;
             memcpy(iq_frame_g, accum_buf_g, IQ_BYTES);
-            accum_fill_g = 0;
+            /* A fixed-size read can overshoot the frame boundary (e.g.
+               accum_fill_g was 400, a 256-byte chunk arrives, landing at
+               656 -- 144 bytes past IQ_BYTES). Those extra bytes are
+               genuine, already-read samples for the START of the NEXT
+               frame, not garbage -- carry them down to the front of
+               accum_buf_g instead of discarding them (which would have
+               reintroduced a real data gap, the same category of bug as
+               the frame-contiguity issue documented in docs/PLAN.md). */
+            carry = accum_fill_g - IQ_BYTES;
+            if (carry > 0) {
+                memmove(accum_buf_g, accum_buf_g + IQ_BYTES, (size_t)carry);
+            }
+            accum_fill_g = carry;
             any_ok = 1;
             debug_reads_ok_g++;
             memcpy(debug_first_bytes_g, iq_frame_g, sizeof(debug_first_bytes_g));
