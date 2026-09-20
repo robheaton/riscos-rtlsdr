@@ -555,8 +555,24 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
            have shown: real signal present, DC always the same, every
            other bin flat. Dropping a lone trailing byte here (left in
            the buffer to be overwritten next read) costs one sample out
-           of many thousands and keeps pairing intact throughout. */
-        accum_fill_g += got & ~1;
+           of many thousands and keeps pairing intact throughout.
+
+           Masking to ~3 (4-byte/2-sample alignment), not just ~1 (2-byte/
+           1-sample), after switching to fixed-size chunked reads: the
+           fixed-chunk fix got min/max to finally separate, but left an
+           extremely regular alternating pattern (a tight vertical-stripe
+           "barcode" across the whole display) with s125/s255 -- both
+           ODD sample indices -- permanently stuck at exactly 0 while s0
+           (even) genuinely varies. That's the signature of every ODD-
+           indexed sample staying corrupted while even ones are fine: a
+           real USB/DMA destination-address alignment requirement (4-byte
+           is a common minimum for bulk transfer DMA) would explain it
+           exactly, since carry-over from an overshot chunk could leave
+           accum_fill_g 2-byte-aligned but not 4-byte-aligned, and every
+           read after that would target a misaligned offset. Keeping every
+           read's destination offset a multiple of 4 (dropping up to 3
+           trailing bytes instead of 1 when needed) tests that directly. */
+        accum_fill_g += got & ~3;
         if (accum_fill_g < IQ_BYTES) {
             continue;
         }
