@@ -266,12 +266,26 @@ static void fft256(double *re, double *im)
 
 static double avg_power_g[NUM_BINS]; /* zero-initialized; power domain */
 
+/* min=max=identical raw power at every bin, even after the resource
+   fix, rules out both log compression AND noise-averaging statistics
+   (independent per-bin noise averaged over even a short window should
+   still differ by double-digit percentages, not match to 4 sig figs) --
+   this is the signature of a near-impulse (mostly-constant, one or two
+   real values) TIME-domain frame: the DFT of a delta function is a flat
+   constant-magnitude spectrum by definition. Tracking the time-domain
+   per-sample power (post-DC-removal, pre-FFT) for the latest frame
+   checks that directly, before assuming the bug is in fft256() itself
+   (already re-verified as textbook-correct radix-2 DIT). */
+static double debug_sample_pow_min_g = 0.0;
+static double debug_sample_pow_max_g = 0.0;
+
 static void accumulate_frame(void)
 {
     static double re[FFT_SIZE];
     static double im[FFT_SIZE];
     int i, src;
     double sum_re, sum_im, mean_re, mean_im, power;
+    double sample_pow;
 
     /* DC removal: subtract this FRAME'S OWN measured mean, not just the
        fixed assumed centre (127.5) -- see docs/PLAN.md for why a real
@@ -286,9 +300,17 @@ static void accumulate_frame(void)
     }
     mean_re = sum_re / (double)FFT_SIZE;
     mean_im = sum_im / (double)FFT_SIZE;
+    debug_sample_pow_min_g = -1.0; /* sentinel: recomputed below, -1 means "not set yet" */
     for (i = 0; i < FFT_SIZE; i++) {
         re[i] = ((double)iq_frame_g[2 * i] - 127.5) - mean_re;
         im[i] = ((double)iq_frame_g[2 * i + 1] - 127.5) - mean_im;
+        sample_pow = re[i] * re[i] + im[i] * im[i];
+        if (debug_sample_pow_min_g < 0.0 || sample_pow < debug_sample_pow_min_g) {
+            debug_sample_pow_min_g = sample_pow;
+        }
+        if (i == 0 || sample_pow > debug_sample_pow_max_g) {
+            debug_sample_pow_max_g = sample_pow;
+        }
     }
 
     fft256(re, im);
@@ -632,6 +654,29 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                 GFX_VDU(5);
                 GFX_Move(ox + 4, oy - 76);
                 GFX_Write0(line2);
+                GFX_VDU(4);
+            }
+            /* min==max even in raw linear power rules out log
+               compression AND rules out this just being ordinary
+               averaged-noise variance (independent per-bin noise
+               shouldn't converge to 4-sig-fig equality) -- points at a
+               degenerate (near-impulse) TIME-domain frame instead, since
+               the DFT of a near-delta function is flat by definition.
+               byte=lo..hi is the raw ADC byte range across the WHOLE
+               512-byte frame (already computed, previously only used
+               internally); smp=lo..hi is the DC-removed time-domain
+               PER-SAMPLE power range going into the FFT. A narrow byte
+               range or a huge smp max next to a near-zero smp min is
+               the smoking gun for "mostly-constant buffer, one or two
+               real samples", not a healthy noisy signal. */
+            {
+                char line3[40];
+                sprintf(line3, "byte %d..%d smp %.1e..%.1e",
+                        (int)debug_byte_min_g, (int)debug_byte_max_g,
+                        debug_sample_pow_min_g, debug_sample_pow_max_g);
+                GFX_VDU(5);
+                GFX_Move(ox + 4, oy - 132);
+                GFX_Write0(line3);
                 GFX_VDU(4);
             }
             GFX_VDU(5);
