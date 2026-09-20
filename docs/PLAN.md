@@ -1399,4 +1399,40 @@ FFT's own bin values in the first place. `compute_spectrum()` now
 computes the frame's actual mean I and mean Q and subtracts them before
 centering-by-127.5 and calling `fft256()`, instead of only ever
 centering by the fixed assumed 127.5. This is standard, correct
-signal-processing practice, not a guess. Pending a real run.
+signal-processing practice, not a guess.
+
+**Real run: `dc=0` and `h=0`, exactly, every time -- expected, but a
+diagnosis mistake, not new information.** Subtracting the mean from a
+set of values and then summing the result is EXACTLY zero by
+definition of "mean" -- `db[centre]` (the FFT's bin-0/DC output) was
+therefore mathematically guaranteed to read 0 after this fix,
+regardless of whether any real signal was present. Pointing the user at
+it cost a wasted round-trip. What actually matters is whether bins
+*near* centre (where a real station's energy should spread, not the
+exact centre point) show any elevation -- added tracking for `max_bin`
+(which bin holds the frame's strongest non-DC value) and its offset
+from centre, replacing the now-meaningless `dc=`/`h=` display with
+`pk@%+d`.
+
+**Real run: `pk@+3`, ROCK-SOLID across several seconds of live
+observation.** This is the actual breakthrough. Random noise would
+shuffle which bin happens to be "highest" unpredictably frame to frame;
+a perfectly consistent winner at the same bin, every single frame,
+means a real, stable signal IS being detected -- at roughly +3 bins
+from the tuned frequency (~+28kHz at this project's ~9.4kHz/bin
+resolution), plausible as a PPM/crystal calibration offset. So
+detection is working. But `min`/`max` both rounding to the same integer
+means the MEASURED difference between that peak and the noise floor is
+far smaller than SDR#'s independently-confirmed ~40dB for the same
+station.
+
+**Likely cause found**: `db[i] = 10*log10(power + 1.0)` -- that `+1.0`
+epsilon was only ever meant to avoid `log10(0)`, and was harmless back
+when a huge, un-removed DC bias (power ~10^9) made it negligible by
+comparison. Now that DC removal correctly reduces typical per-bin power
+to much smaller values, that same `+1.0` can dominate for any bin with
+power well under 1 -- crushing real dB differences down to a fraction
+of a dB, exactly matching the observed "peak position is rock-solid
+but barely measurable" result. Changed the epsilon to `1e-6` (small
+enough to avoid `log10(0)` without swamping realistic power values).
+Pending a real run.

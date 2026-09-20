@@ -287,7 +287,20 @@ static void compute_spectrum(void)
     for (i = 0; i < NUM_BINS; i++) {
         src = (i + NUM_BINS / 2) % NUM_BINS;
         power = re[src] * re[src] + im[src] * im[src];
-        db[i] = 10.0 * log10(power + 1.0); /* +1 avoids log10(0) */
+        /* Epsilon just needs to avoid log10(0) -- it must NOT be large
+           enough to compete with real power values. It used to be +1.0,
+           chosen back when a huge, un-removed DC bias (power ~10^9)
+           made the epsilon irrelevant by comparison. Now that DC
+           removal (see above) correctly reduces typical per-bin power
+           to much smaller values, that same +1.0 can dominate for any
+           bin with power well under 1 -- crushing real dB differences
+           down to a fraction of a dB, which is exactly what a live run
+           showed: a real, ROCK-SOLID-CONSISTENT peak position (proving
+           a genuine, stable signal, not noise -- random noise would
+           shuffle which bin "wins" frame to frame) that still only
+           barely edged out min/max in the rounded display. 1e-6 avoids
+           the log10(0) case without swamping realistic power values. */
+        db[i] = 10.0 * log10(power + 1e-6);
     }
 
     /* Auto-scale to this frame's own dynamic range (see the
