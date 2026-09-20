@@ -791,3 +791,30 @@ int r82xx_set_freq(r82xx_t *t, unsigned long freq_hz)
     TRACE("set_freq: returning success");
     return 0;
 }
+
+/* Verbatim register-write shape from upstream r82xx_set_gain()'s
+   set_manual_gain branch (real source, fetched and read directly --
+   see docs/PLAN.md): LNA auto-off is reg 0x05 bit4=1, Mixer auto-off is
+   reg 0x07 bit4=0 (note the OPPOSITE polarity from LNA -- confirmed
+   from source, not assumed), then gain index goes in the low 4 bits of
+   each register (mask 0x0f). Upstream's r82xx_set_vga_gain() (the fixed
+   0x08/16.3dB write, already ported as part of every retune) is called
+   as part of the same manual-mode path upstream, so no separate VGA
+   write is needed here. Index 15 (0x0f) is the maximum step in both
+   r82xx_lna_gain_steps[] and r82xx_mixer_gain_steps[] -- going straight
+   there instead of porting upstream's incremental target-gain search
+   loop, since there's no specific target here, just maximum
+   sensitivity. */
+int r82xx_set_gain_max(r82xx_t *t)
+{
+    int rc;
+
+    rc = r82xx_write_reg_mask(t, 0x05, 0x10, 0x10); /* LNA auto off */
+    if (rc < 0) return rc;
+    rc = r82xx_write_reg_mask(t, 0x07, 0x00, 0x10); /* Mixer auto off */
+    if (rc < 0) return rc;
+    rc = r82xx_write_reg_mask(t, 0x05, 0x0f, 0x0f); /* LNA gain = max */
+    if (rc < 0) return rc;
+    rc = r82xx_write_reg_mask(t, 0x07, 0x0f, 0x0f); /* Mixer gain = max */
+    return rc;
+}

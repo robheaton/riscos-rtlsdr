@@ -620,6 +620,18 @@ int main(void)
     if (rc == 0) {
         rc = r82xx_set_freq(&tuner, 97400000UL); /* 97.4MHz, local FM broadcast */
     }
+    if (rc == 0 && tuner.has_lock) {
+        /* AGC (upstream's own default -- see R82XX.h) hasn't made the
+           station stand out from the noise floor in several real runs
+           now that the read/render pipeline is confirmed correct.
+           Testing manual maximum gain as a direct, well-grounded next
+           step (ported from real upstream source, not guessed -- see
+           docs/PLAN.md) rather than continuing to assume AGC alone is
+           sufficient. Needs the I2C repeater still enabled, same as
+           r82xx_set_freq() above -- must run before it's disabled
+           below. */
+        rc = r82xx_set_gain_max(&tuner);
+    }
     rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x10, 1); /* disable I2C repeater */
     if (rc != 0 || !tuner.has_lock) {
         report_and_die("Tuner init/tune to 97.4MHz failed -- see "

@@ -1286,3 +1286,28 @@ close to flat (`min`/`max` a couple of dB apart, at most), so the
 97.4MHz station isn't visually standing out from the noise floor. That
 is now known to be a real signal-conditions/gain question, not a
 software bug hiding behind it.
+
+## Phase 2, follow-on: testing manual maximum gain
+
+With the read/render pipeline confirmed correct, picked back up the
+gain question. Earlier research (this doc, upstream `tuner_r82xx.c`)
+found AGC already enabled via the untouched init array, matching
+upstream's own default bring-up (real apps don't call
+`rtlsdr_set_tuner_gain_mode()` as part of opening a device either) --
+so AGC not being the bottleneck was already reasonably well-established.
+But every real run since has shown the non-DC spectrum close to flat,
+so it's worth directly testing whether MORE gain than AGC settles on
+changes anything, rather than assuming AGC alone is sufficient.
+
+Ported `r82xx_set_gain_max()` from upstream's real `r82xx_set_gain()`
+manual-mode branch (same fetched source as the earlier gain research,
+not re-guessed): LNA auto-off (reg 0x05 bit4=1), Mixer auto-off (reg
+0x07 bit4=0 -- confirmed OPPOSITE polarity from LNA, straight from
+source), then gain index in the low 4 bits of each register. Skipped
+upstream's incremental target-gain search loop (which finds the
+smallest gain combination meeting a specific dB target) since there's
+no partial target here -- went straight to index 15 (0x0f), the
+maximum step in both `r82xx_lna_gain_steps[]` and
+`r82xx_mixer_gain_steps[]`. Wired into `RTLSDRView`'s startup, called
+right after `r82xx_set_freq()` locks (needs the I2C repeater still
+enabled, same as the tune call itself). Pending a real run.
