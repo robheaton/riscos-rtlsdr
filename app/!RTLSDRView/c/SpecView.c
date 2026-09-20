@@ -278,6 +278,14 @@ static double avg_power_g[NUM_BINS]; /* zero-initialized; power domain */
    (already re-verified as textbook-correct radix-2 DIT). */
 static double debug_sample_pow_min_g = 0.0;
 static double debug_sample_pow_max_g = 0.0;
+/* Where the dominant sample sits in the 256-sample frame, and how many
+   samples carry non-negligible energy relative to it. A fixed idx
+   (same every frame) would point at a specific copy/offset bug; an idx
+   that moves around but n_elevated stays ~1 would point at the frame
+   genuinely being "mostly dead air, one big blip" rather than a
+   healthy captured RF signal. */
+static int debug_max_sample_idx_g = 0;
+static int debug_n_elevated_g = 0;
 
 static void accumulate_frame(void)
 {
@@ -286,6 +294,7 @@ static void accumulate_frame(void)
     int i, src;
     double sum_re, sum_im, mean_re, mean_im, power;
     double sample_pow;
+    static double sample_pow_arr[FFT_SIZE];
 
     /* DC removal: subtract this FRAME'S OWN measured mean, not just the
        fixed assumed centre (127.5) -- see docs/PLAN.md for why a real
@@ -301,15 +310,27 @@ static void accumulate_frame(void)
     mean_re = sum_re / (double)FFT_SIZE;
     mean_im = sum_im / (double)FFT_SIZE;
     debug_sample_pow_min_g = -1.0; /* sentinel: recomputed below, -1 means "not set yet" */
+    debug_max_sample_idx_g = 0;
     for (i = 0; i < FFT_SIZE; i++) {
         re[i] = ((double)iq_frame_g[2 * i] - 127.5) - mean_re;
         im[i] = ((double)iq_frame_g[2 * i + 1] - 127.5) - mean_im;
         sample_pow = re[i] * re[i] + im[i] * im[i];
+        sample_pow_arr[i] = sample_pow;
         if (debug_sample_pow_min_g < 0.0 || sample_pow < debug_sample_pow_min_g) {
             debug_sample_pow_min_g = sample_pow;
         }
         if (i == 0 || sample_pow > debug_sample_pow_max_g) {
             debug_sample_pow_max_g = sample_pow;
+            debug_max_sample_idx_g = i;
+        }
+    }
+    /* "Elevated" = at least 1% of the frame's peak sample power -- a
+       loose bar, so a healthy multi-sample signal would still clear it
+       for far more than a couple of samples out of 256. */
+    debug_n_elevated_g = 0;
+    for (i = 0; i < FFT_SIZE; i++) {
+        if (sample_pow_arr[i] > 0.01 * debug_sample_pow_max_g) {
+            debug_n_elevated_g++;
         }
     }
 
@@ -677,6 +698,22 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                 GFX_VDU(5);
                 GFX_Move(ox + 4, oy - 132);
                 GFX_Write0(line3);
+                GFX_VDU(4);
+            }
+            /* idx@ is WHICH of the 256 samples holds the dominant power
+               -- a fixed value every frame would point at a specific
+               copy/offset bug; scattering around would not. nElev is
+               how many of the 256 samples clear 1% of that peak -- a
+               healthy captured RF signal should have far more than a
+               handful; "1" or "2" means one lone sample dominates a
+               near-silent buffer. */
+            {
+                char line4[40];
+                sprintf(line4, "idx@%d nElev=%d",
+                        debug_max_sample_idx_g, debug_n_elevated_g);
+                GFX_VDU(5);
+                GFX_Move(ox + 4, oy - 188);
+                GFX_Write0(line4);
                 GFX_VDU(4);
             }
             GFX_VDU(5);
