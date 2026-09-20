@@ -197,19 +197,25 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    remainder. accum_buf_g needs FIXED_CHUNK_SIZE bytes of headroom past
    IQ_BYTES to safely hold that overshoot.
 
-   256 has its own suspicious artifact: with DEM on, idx@ (the frame's
-   dominant sample) was found alternating between EXACTLY 0 and EXACTLY
-   128 -- not scattered, but flipping between the two fixed positions
-   exactly 128 samples (256 bytes) apart that mark the boundary between
-   this frame's two 256-byte software-level read chunks. 512 (matching
-   the endpoint's native USB max packet size, one atomic chunk read per
-   frame, zero software-level splicing) was tried once already and
-   regressed to completely flat -- but that test ran BEFORE the
-   analog/digital IF mismatch fix above was found and applied, so it
-   was confounded by two separate bugs at once rather than cleanly
-   testing chunk splicing on its own. Retrying 512 now that the IF
-   fix is confirmed in place. */
-#define FIXED_CHUNK_SIZE 512
+   256 showed idx@ (the frame's dominant sample) alternating between
+   EXACTLY 0 and EXACTLY 128 -- the boundary between that size's two
+   256-byte read chunks. Retesting at 512 (one atomic read per frame,
+   after also fixing the analog/digital IF mismatch above, which
+   confounded an earlier 512-byte test) showed idx@ PERMANENTLY stuck
+   at 0 -- i.e. regardless of chunk size, only the very FIRST sample of
+   ANY INDIVIDUAL READ CALL is genuinely fresh; the rest of that same
+   call's data, despite passing the sentinel test (differs from a 0xAA
+   fill), isn't real advancing ADC content. That's consistent with the
+   read being padded by REPEATING an earlier byte rather than zero-
+   padding -- which "differs from 0xAA" doesn't catch, unlike the
+   original zero-padding bug this sentinel test was built to catch.
+   If only the first sample or two of any read is genuinely fresh, a
+   MUCH SMALLER request size should capture a much higher fraction of
+   real data (at the cost of many more individual SWI calls per frame
+   -- non-blocking mode means none of them can hang, so this is safe
+   to test even though it's a lot more calls). 8 bytes = 4 samples,
+   smaller than anything in milestone 4's original size sweep. */
+#define FIXED_CHUNK_SIZE 8
 
 /* ---- global state ---- */
 static char device_name_g[16];
@@ -726,8 +732,19 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
        Wimp_Poll -- matching the original phase-2 plan's explicit
        concern about an over-large per-tick batch reintroducing the kind
        of unresponsiveness phase 1 fought hard to diagnose -- while still
-       processing plenty of frames per second across many idle ticks. */
-#define MAX_READ_ATTEMPTS 200
+       processing plenty of frames per second across many idle ticks.
+
+       Raised from 200 now that FIXED_CHUNK_SIZE dropped to 8 (see its
+       comment) -- filling one 512-byte frame can now take well over
+       100 individual read calls if each only delivers ~half of what's
+       requested (as observed at larger chunk sizes), so 200 barely
+       covered one frame, let alone MAX_FRAMES_PER_TICK's worth. Each
+       individual read is still cheap (a single small SWI call, not
+       nested work), and MAX_FRAMES_PER_TICK still bounds how much
+       actual FRAME processing (FFT/averaging) happens before
+       returning to Wimp_Poll -- the two caps serve different purposes
+       and both still apply. */
+#define MAX_READ_ATTEMPTS 1200
 #define MAX_FRAMES_PER_TICK 8
     any_ok = 0;
     n_frames = 0;
