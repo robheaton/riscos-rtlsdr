@@ -191,6 +191,14 @@ static unsigned char debug_byte_max_g = 0;
 static int debug_max_offset_g = 0;
 static double debug_raw_min_g = 0.0;
 static double debug_raw_max_g = 0.0;
+/* idx@0/nElev=1 has been rock-solid across gain settings, ruling out
+   ADC overload -- next check is the ACTUAL raw bytes at a few spread-
+   out positions in the frame, not derived statistics, to see directly
+   whether the buffer's tail is genuinely varying or frozen. Sample 0
+   is bytes[0]/[1] (already in debug_first_bytes_g); these add sample
+   ~125 (buffer middle) and sample 255 (buffer end). */
+static unsigned char debug_mid_i_g = 0, debug_mid_q_g = 0;
+static unsigned char debug_end_i_g = 0, debug_end_q_g = 0;
 
 /* ---- in-place iterative radix-2 DIT FFT, fixed N=FFT_SIZE ---- */
 static void fft256(double *re, double *im)
@@ -541,6 +549,10 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
             any_ok = 1;
             debug_reads_ok_g++;
             memcpy(debug_first_bytes_g, iq_frame_g, sizeof(debug_first_bytes_g));
+            debug_mid_i_g = iq_frame_g[250];
+            debug_mid_q_g = iq_frame_g[251];
+            debug_end_i_g = iq_frame_g[IQ_BYTES - 2];
+            debug_end_q_g = iq_frame_g[IQ_BYTES - 1];
             /* raw byte range across the WHOLE frame, not just the first
                4 bytes -- distinguishes "the ADC genuinely sees almost no
                swing" from "the FFT/scaling math is flattening real
@@ -714,6 +726,22 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                 GFX_VDU(5);
                 GFX_Move(ox + 4, oy - 188);
                 GFX_Write0(line4);
+                GFX_VDU(4);
+            }
+            /* The actual raw bytes (not derived stats) at frame start
+               (already have debug_first_bytes_g[0]/[1]), middle
+               (sample ~125), and end (sample 255) -- direct proof of
+               whether the buffer's tail is genuinely fresh data or
+               frozen at a fixed value every frame. */
+            {
+                char line5[40];
+                sprintf(line5, "s0=%d,%d s125=%d,%d s255=%d,%d",
+                        debug_first_bytes_g[0], debug_first_bytes_g[1],
+                        debug_mid_i_g, debug_mid_q_g,
+                        debug_end_i_g, debug_end_q_g);
+                GFX_VDU(5);
+                GFX_Move(ox + 4, oy - 244);
+                GFX_Write0(line5);
                 GFX_VDU(4);
             }
             GFX_VDU(5);
