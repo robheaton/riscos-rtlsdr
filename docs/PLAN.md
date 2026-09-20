@@ -1165,3 +1165,60 @@ been tried (size sweep in milestone 4, `BATCH_READS` 8 vs 1, sentinel
 verification across 10 sizes) without effect.
 
 Source: [DeviceFS USB technical (riscos.info)](https://www.riscos.info/index.php/DeviceFS_USB_technical)
+
+## Phase 2, follow-on: a real (non-UpCall) fix candidate found
+
+The user asked to pursue the UpCall 10 workaround despite its scope.
+Before writing any of it, researched the exact register/entry
+conventions needed -- and the picture that emerged was significantly
+worse than initially estimated: per the official PRM, an *application*
+(not a module) claiming any vector must wrap **every single
+`Wimp_Poll` call** with `OS_DelinkApplication`/`OS_RelinkApplication`
+(classic RISC OS swaps an app's entire 32K code space in and out during
+multitasking; a vector firing while swapped out jumps into whatever
+other application happens to be loaded there), the handler itself needs
+hand-written ARM assembler (vector handlers can't safely call normal C
+library functions), and the failure mode is categorically worse than
+anything else in this project -- not an app-level hang, but potential
+vector-chain corruption affecting the whole desktop. Went back to the
+user with this concretely worse picture before proceeding; they chose
+to still attempt it.
+
+**Before writing any assembler, did one more round of real-source
+research (not guesswork) -- and it paid off.** Fetched DeviceFS's
+actual source from `gitlab.riscosopen.org` (`RiscOS/Sources/HWSupport/
+DeviceFS`), not just the informal 2006 wiki page. Two findings:
+
+1. `Doc/UpCalls` shows DeviceFS's own UpCalls are just
+   `UpCall_StreamCreated`/`UpCall_StreamClosed` -- nothing about
+   transfer sizes at all. The wiki's "11th word from the DeviceFS
+   driver's handle, obtained via UpCall 10" trick refers to something
+   murkier (likely BufferManager internals, module-specific), not a
+   clean, well-defined DeviceFS mechanism. This on its own was reason
+   enough to be very cautious about that path.
+2. `Doc/NonBlock` documents an entirely different, MUCH simpler,
+   PUBLIC mechanism: DeviceFS streams support a non-blocking mode via a
+   standard `OS_Args` IOCtl. States plainly: *"When in non-blocking
+   mode, if gbpb_get cannot get the complete number of requested bytes
+   it returns with number of bytes not done in R3"* -- i.e. an honest
+   short-read count, unlike the padding-to-full-size behaviour in
+   blocking mode (the stream's default state). Confirmed the exact
+   calling convention against the real assembler (`s/FSystem`'s
+   `args_ioctl`/`ioctl_miscop_nonblock`) and cross-checked against
+   ROOL's own public SWI reference: `OS_Args` (SWI `&09`) reason 9 =
+   IOCtl; IOCtl group `0xFF` (DeviceFS-specific) reason 1 = "Set/Read
+   Non-blocking I/O", data word 1=set/0=unset.
+
+**This needs no UpCalls, no vector claiming, no assembler** -- just a
+second, ordinary SWI call (`OS_Args`) before reading, using primitives
+already proven safe throughout this project (`_kernel_swi`, the same
+pattern `os_gbpb_read4` itself uses). Added a test to milestone 5
+(`os_args_set_nonblocking()` + a repeat of the sentinel test with
+non-blocking mode enabled) to validate this actually produces honest
+short-read counts before touching `RTLSDRView`'s real read loop.
+Pending a real run.
+
+Sources:
+- [DeviceFS source (gitlab.riscosopen.org)](https://gitlab.riscosopen.org/RiscOS/Sources/HWSupport/DeviceFS)
+- [OS_Args (riscosopen.org wiki)](https://www.riscosopen.org/wiki/documentation/show/OS_Args)
+- [IOCtl Reason Codes (riscosopen.org wiki)](https://www.riscosopen.org/wiki/documentation/show/IOCtl%20Reason%20Codes)
