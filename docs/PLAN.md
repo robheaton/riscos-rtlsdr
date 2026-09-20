@@ -1657,3 +1657,38 @@ Current frequency shows in the same diagnostic line as gain state.
 **Real run: confirmed working** ("looks to work") -- stepping away
 from and back to 97.4MHz kept the tuner locked and the display
 running.
+
+## Phase 2, follow-on: FM demod DSP (numeric readout, no audio yet)
+
+Real streaming PCM audio output needs RISC OS's interrupt-driven
+"linear handler" sound mechanism or the SharedSound module's streaming
+API, neither grounded in real, fetched documentation the way the
+DeviceFS/tuner work was -- deliberately sequenced as DSP-first,
+audio-later rather than guessing at undocumented SWIs (the same
+category of risk this project already backed away from once, with the
+GPIO/UpCall approach). Added `demodulate_frame()`: a standard complex-
+baseband phase discriminator (atan2 of consecutive samples' product,
+scaled from radians/sample to Hz via the real 2.4MHz sample rate),
+called on the DC-removed re[]/im[] arrays before `fft256()` overwrites
+them in place, tracking EMA-smoothed RMS/peak deviation. Gated behind
+a new "DEM" toggle icon (off by default -- real added CPU cost, one
+atan2() per sample). Readout shown as a second text line when enabled.
+
+**Real run: `dev pk=1167.6k rms=126.0k Hz`, tuned to 97.4MHz.** This is
+a genuinely informative result, not just a number to note: 1167.6kHz
+is essentially the discriminator's theoretical maximum possible output
+(±half the 2.4MHz sample rate, ~1.2MHz -- where atan2's phase
+calculation wraps around ±pi). Hitting that ceiling means consecutive
+samples' phase relationship is essentially random frame-to-frame, not
+smoothly, coherently progressing the way real FM modulation would
+(genuine wideband FM tops out around 75kHz deviation, more than an
+order of magnitude below this reading, and shouldn't make a massively-
+oversampled 2.4MHz-rate discriminator saturate at all). This is the
+same category of finding as the still-unresolved flat-spectrum mystery
+(see the earlier "Phase 2, follow-on: the read-accumulation bug, and
+where things stand" section) approached from a completely different
+angle (time-domain phase coherence, not frequency-domain averaged
+power) -- and it points the same direction: the captured samples don't
+look like they carry real, coherent broadcast content, independent of
+gain/AGC state. Worth revisiting the paused flat-spectrum
+investigation with this as a second, independent data point.
