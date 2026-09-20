@@ -1310,4 +1310,55 @@ no partial target here -- went straight to index 15 (0x0f), the
 maximum step in both `r82xx_lna_gain_steps[]` and
 `r82xx_mixer_gain_steps[]`. Wired into `RTLSDRView`'s startup, called
 right after `r82xx_set_freq()` locks (needs the I2C repeater still
-enabled, same as the tune call itself). Pending a real run.
+enabled, same as the tune call itself).
+
+**Real run: manual max gain made no difference at all** -- `min=47
+max=47 dc=93`, indistinguishable from every prior AGC run (49/49,
+50/50, 46/46) and `dc` identical to the digit across every single run
+regardless of antenna, gain, or any of this session's fixes. Gain
+conclusively ruled out as the limiting factor.
+
+## Phase 2, follow-on: independent hardware verification, and the real remaining bug
+
+Asked the user to test the exact same dongle and antenna with SDR# on
+Windows, at the same 97.4MHz, to isolate hardware/RF-conditions from
+this project's software entirely. **Result: a strong, clean ~40dB peak
+at 97.4MHz**, plus several other visible FM stations across the band,
+confirmed via both the spectrum display and a persistent, strong
+waterfall trace. This conclusively rules out antenna, dongle, and local
+RF conditions as an explanation -- there IS a strong, real, ~40dB-above-
+noise-floor signal reaching this exact hardware right now. The bug is
+definitely still in this project's own software.
+
+Given raw ADC bytes have shown wide variation in every run (0..127,
+0..247, etc. -- genuinely swinging), but the computed FFT spectrum
+stays essentially flat (~1-3dB spread) regardless of gain, the FFT/
+accumulation pipeline itself must be destroying real dynamic range that
+demonstrably exists in the raw samples. Re-read `fft256()` fresh (the
+bit-reversal permutation and Cooley-Tukey butterfly both check out
+against the standard DIT algorithm -- no bug found there) and
+`compute_spectrum()` (also checks out on inspection).
+
+**Suspect found in the accumulation logic instead**: milestone 5's
+sentinel test showed each honest, non-blocking read returns roughly
+HALF of what's requested. Filling a 512-byte frame from that pattern
+converges quickly for the first ~511 bytes (256+128+64+...+1 = 511
+after just 9 reads) but the LAST byte can need many more attempts,
+each potentially returning 0. With the previous fixed cap
+(`BATCH_READS=16`), a frame could easily need its final byte from the
+NEXT idle tick -- tens of milliseconds later -- meaning the "frame"
+handed to the FFT could be a concatenation of samples from genuinely
+DIFFERENT moments in time. That would corrupt frequency resolution
+(smearing real signal energy across every bin, since the FFT assumes a
+temporally contiguous sample sequence) while leaving the DC bin
+untouched (it's just a sum of all samples, order-independent) --
+exactly the observed pattern: real signal present, DC consistently
+large, everything else flat.
+
+**Fix**: since non-blocking reads can never hang, it's safe to loop
+until a frame is genuinely complete (or the stream truly has nothing
+more available right now, `got==0`) instead of capping at a small fixed
+attempt count. Replaced `BATCH_READS=16` with an unbounded loop (a
+generous `MAX_READ_ATTEMPTS=5000` safety bound against a pathological
+runaway, not a normal-operation limit) in `Null_spectrum()`. Pending a
+real run.

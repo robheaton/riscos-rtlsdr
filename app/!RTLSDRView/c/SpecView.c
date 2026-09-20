@@ -65,25 +65,10 @@
 #define WORK_WIDTH    (NUM_BINS * BIN_WIDTH_OS)  /* 512 OS units */
 #define WORK_HEIGHT   300                        /* OS units */
 
-/* Reads pumped per Null event, regardless of the display refresh
-   throttle below -- draining the USB stream and updating the display
-   are separate concerns: drain every idle tick (so the RTL2832U's
-   internal buffering never backs up), redraw only every UPDATE_INTERVAL_CS
-   centiseconds (so a plain full-window repaint at native Wimp_Poll rate
-   doesn't waste CPU/flicker).
-
-   Went 8 -> 1 -> back up to a generous 16 over the course of chasing a
-   real bug (see docs/PLAN.md milestone 5): blocking-mode os_gbpb_read4
-   silently padded short reads to the full requested size regardless of
-   read pacing (confirmed BATCH_READS=1 didn't fix it either) -- the
-   real fix was enabling DeviceFS's non-blocking mode
-   (os_args_set_nonblocking), after which os_gbpb_read4 finally reports
-   HONEST short-read counts. With honest counts, doing MORE reads per
-   tick is safe again (each one just reports however much genuinely
-   arrived, accumulated into accum_buf_g -- see Null_spectrum), so this
-   is back to draining aggressively to keep up with the 4.8 MB/s stream
-   rather than falling behind. */
-#define BATCH_READS       16
+/* Redraw throttle, separate from how aggressively Null_spectrum drains
+   the USB stream (see MAX_READ_ATTEMPTS there) -- redraw only every
+   UPDATE_INTERVAL_CS centiseconds so a plain full-window repaint at
+   native Wimp_Poll rate doesn't waste CPU/flicker. */
 #define UPDATE_INTERVAL_CS 20   /* ~5Hz redraw */
 
 /* compute_spectrum() auto-scales EACH FRAME's own min/max dB range to
@@ -353,10 +338,30 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
        Accumulate across multiple calls into accum_buf_g until a full
        IQ_BYTES frame is ready, rather than requiring got==IQ_BYTES from
        a single call, which blocking mode never honestly gave anyway.
-       got==0 just means nothing new is available right now, not an
-       error -- stop draining for this tick rather than spin on it. */
+
+       Each honest read tends to return only about HALF of what's
+       requested (confirmed in milestone 5's sentinel test), so filling
+       the last few bytes of a frame can take many more attempts than
+       filling the first half -- with a small fixed attempt cap
+       (previously BATCH_READS=16), a frame could easily need 1-2 extra
+       bytes that don't arrive until the NEXT idle tick, tens of
+       milliseconds later. That means the "frame" handed to the FFT
+       could be a concatenation of samples from genuinely different
+       moments in time -- which would corrupt frequency resolution
+       (smearing real signal energy across every bin) while leaving the
+       DC bin untouched (it's just a sum, order-independent) -- exactly
+       the pattern seen on real hardware: a real ~40dB FM station
+       (confirmed working with this same dongle+antenna in SDR# on
+       Windows) produced an essentially flat computed spectrum here.
+       Non-blocking reads can't hang, so it's safe to loop until a frame
+       is genuinely complete OR the stream truly has nothing more
+       available right now (got==0), rather than capping at a small
+       fixed attempt count. MAX_READ_ATTEMPTS is a generous safety
+       bound against a pathological runaway, not a normal-operation
+       limit. */
+#define MAX_READ_ATTEMPTS 5000
     any_ok = 0;
-    for (i = 0; i < BATCH_READS; i++) {
+    for (i = 0; i < MAX_READ_ATTEMPTS; i++) {
         want = IQ_BYTES - accum_fill_g;
         got = os_gbpb_read4(stream_handle_g, accum_buf_g + accum_fill_g, want);
         if (got < 0) {
