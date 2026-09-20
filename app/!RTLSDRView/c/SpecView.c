@@ -829,6 +829,24 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
             GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
             GFX_VDU(4);
+            /* Temporarily re-enabled: switching FIXED_CHUNK_SIZE from
+               256 to 512 regressed to completely flat (min==max
+               exactly) with NO bars drawn at all -- worse than the
+               256-byte version, not better. Checking whether 512-byte
+               reads are still honestly reported (g==t) the way 256-byte
+               ones were, since that's the most likely thing a size
+               change could break. */
+            {
+                char line2[40];
+                sprintf(line2, "g%d/t%d g%d/t%d g%d/t%d",
+                        debug_last_gots_g[0], debug_last_touched_g[0],
+                        debug_last_gots_g[1], debug_last_touched_g[1],
+                        debug_last_gots_g[2], debug_last_touched_g[2]);
+                GFX_VDU(5);
+                GFX_Move(ox + 4, oy - 76);
+                GFX_Write0(line2);
+                GFX_VDU(4);
+            }
         }
 
         Wimp_GetRectangle(&r, &more);
