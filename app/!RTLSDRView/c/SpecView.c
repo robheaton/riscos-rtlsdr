@@ -457,8 +457,9 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                runs, ok climbing steadily, bad always 0) -- dropped
                ok=/bad= to guarantee "dc=" isn't clipped again like the
                last run, where the window cut it off mid-value. */
-            sprintf(line1, "min=%.0f max=%.0f dc=%.0f",
-                    debug_db_min_g, debug_db_max_g, debug_db_dc_g);
+            sprintf(line1, "min=%.0f max=%.0f dc=%.0f h=%d",
+                    debug_db_min_g, debug_db_max_g, debug_db_dc_g,
+                    bin_height_g[NUM_BINS / 2]);
             GFX_VDU(5);
             GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
