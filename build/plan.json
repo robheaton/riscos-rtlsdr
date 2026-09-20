@@ -23,11 +23,16 @@
    "cmd": "cc -c -za1 -Otime -apcs 3/32bit -throwback -I,C: c.SpecView -o o.SpecView",
    "out": "o.SpecView",
    "src": "c.SpecView"
+  },
+  {
+   "cmd": "cc -c -za1 -Otime -apcs 3/32bit -throwback -I,C: c.Audio -o o.Audio",
+   "out": "o.Audio",
+   "src": "c.Audio"
   }
  ],
  "finals": [
   "link -o RTLSDR o.RTLSDR o.R82XX o.Driver C:o.stubs-32",
-  "link -o RTLSDRView o.SpecView o.Driver o.R82XX DeskLib:o.DeskLib C:o.stubs-32",
+  "link -o RTLSDRView o.SpecView o.Driver o.R82XX o.Audio DeskLib:o.DeskLib C:o.stubs-32",
   "CDir out",
   "Copy RTLSDR out.RTLSDR ~C~V",
   "Copy RTLSDRView out.RTLSDRView ~C~V"

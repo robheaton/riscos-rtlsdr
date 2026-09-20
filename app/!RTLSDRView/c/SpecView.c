@@ -47,6 +47,7 @@
 #include "RTLSDR.h"
 #include "R82XX.h"
 #include "Driver.h"
+#include "Audio.h"
 
 /* ---- FFT / spectrum geometry ----
    256-point complex FFT. Reading exactly one frame (256 complex I,Q byte
@@ -77,12 +78,15 @@
    nothing stops them overlapping icons except keeping their own max
    height below where the icons start. finalize_display() scales into
    BAR_MAX_HEIGHT, not the full WORK_HEIGHT. Grown from 100 to 140 to
-   fit a second text line (demod readout, y -118) below the icon row.
+   fit a second text line (demod readout) below the icon row.
    (Briefly grown further to 176 for a temporary 3rd line -- idx@/
    nElev -- while re-checking a byte-level finding post-IF-fix; that
    line found and confirmed the actual flat-spectrum root cause, see
-   docs/PLAN.md, and has been removed now that it's done its job.) */
-#define RESERVED_TOP    140
+   docs/PLAN.md, and has been removed now that it's done its job.)
+   Grown again to 180 to fit a second icon row (create_tone_icon) plus
+   the demod readout text below it, now that row 1 (AGC through DEM)
+   is full. */
+#define RESERVED_TOP    180
 #define BAR_MAX_HEIGHT  (WORK_HEIGHT - RESERVED_TOP)
 
 /* Redraw throttle, separate from how aggressively Null_spectrum drains
@@ -302,6 +306,18 @@ static int demod_enabled_g = 0;
 static icon_handle icon_demod_g = 0;
 static double demod_dev_rms_g = 0.0;  /* Hz, EMA-smoothed */
 static double demod_dev_peak_g = 0.0; /* Hz, EMA-smoothed */
+
+/* ---- audio test tone (see Audio.h) ----
+   First-pass proof that RISC OS audio output works at all from this
+   app (TimPlayer module load, RMA buffer, looped sample playback) --
+   a generated 440Hz tone, NOT the real FM-demodulated audio yet.
+   audio_ok_g tracks whether audio_test_tone_init() actually succeeded
+   (TimPlayer might not be present/loadable on a given machine) --
+   toggling icon_tone_g does nothing if it didn't, rather than trying
+   to play into an uninitialised buffer. */
+static int audio_ok_g = 0;
+static int tone_playing_g = 0;
+static icon_handle icon_tone_g = 0;
 
 /* Diagnostic-only globals, drawn as a text line during redraw (see
    Redraw_spectrum). Originally added to chase down a real bug: DeviceFS
@@ -660,6 +676,7 @@ static void finalize_display(void)
 
 static void cleanup_and_exit(void)
 {
+    audio_test_tone_close();
     if (stream_handle_g != 0) {
         os_find_close(stream_handle_g);
         stream_handle_g = 0;
@@ -676,6 +693,19 @@ static void report_and_die(const char *msg)
     err.errmess[sizeof(err.errmess) - 1] = '\0';
     Wimp_ReportError(&err, 0, "RTLSDRView");
     exit(1);
+}
+
+/* Same, but doesn't exit -- used for the audio subsystem (brand new,
+   experimental), which shouldn't take down the whole proven spectrum
+   display if TimPlayer setup fails on a given machine. */
+static void report_warning(const char *msg)
+{
+    os_error err;
+
+    err.errnum = 1;
+    strncpy(err.errmess, msg, sizeof(err.errmess) - 1);
+    err.errmess[sizeof(err.errmess) - 1] = '\0';
+    Wimp_ReportError(&err, 0, "RTLSDRView");
 }
 
 static BOOL Null_spectrum(event_pollblock *event, void *reference)
@@ -1020,7 +1050,7 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                         demod_dev_peak_g / 1000.0,
                         demod_dev_rms_g / 1000.0);
                 GFX_VDU(5);
-                GFX_Move(ox + 4, oy - 118);
+                GFX_Move(ox + 4, oy - 158); /* below icon row 2 now */
                 GFX_Write0(line2);
                 GFX_VDU(4);
             }
@@ -1070,6 +1100,11 @@ static void update_demod_icon(void)
     set_icon_selected(icon_demod_g, demod_enabled_g);
 }
 
+static void update_tone_icon(void)
+{
+    set_icon_selected(icon_tone_g, tone_playing_g);
+}
+
 /* All three gain buttons need the I2C repeater enabled around the
    register write, same as main()'s own init/tune bracket -- the
    repeater is disabled the rest of the time, and this handler runs
@@ -1092,6 +1127,19 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
            unlike every gain/freq control below. */
         demod_enabled_g = !demod_enabled_g;
         update_demod_icon();
+        return TRUE;
+    }
+
+    if (icon == icon_tone_g) {
+        /* Also pure software (TimPlayer, not the tuner) -- no I2C
+           repeater bracket. Does nothing if audio_test_tone_init()
+           never succeeded (audio_ok_g), rather than toggling a button
+           that plays nothing. */
+        if (audio_ok_g) {
+            tone_playing_g = !tone_playing_g;
+            audio_test_tone_play(tone_playing_g);
+            update_tone_icon();
+        }
         return TRUE;
     }
 
@@ -1257,16 +1305,18 @@ static window_handle create_spectrum_window(void)
     return win;
 }
 
-/* One shared helper for the three gain-control buttons -- same look
+/* One shared helper for all the control-panel buttons -- same look
    (bordered, filled, centred text, buttontype 3 "Click": Select
    generates a single Mouse_Click event, the standard RISC OS push-
-   button behaviour), just different position/label. Icons are
-   positioned in a row below the diagnostic text line (which sits at
-   the top, see Redraw_spectrum's line1), clear of both it and the bars
-   below (WORK_HEIGHT is 360; this row uses y -60..-92, well inside
-   that with room to spare on both sides). */
+   button behaviour), just different position/label. Icons sit in one
+   or more 32-unit-tall rows below the diagnostic text line (which
+   sits at the top, see Redraw_spectrum's line1), clear of the bars
+   below (WORK_HEIGHT is 360; RESERVED_TOP keeps every row and both
+   text lines out of the bars' reach). y1 is the row's top edge; the
+   row is always 32 units tall (y0 = y1 - 32), matching every existing
+   row's spacing. */
 static icon_handle create_button_icon(window_handle win, int x0, int x1,
-                                       const char *label)
+                                       int y1, const char *label)
 {
     icon_createblock cb;
     icon_handle icon;
@@ -1275,9 +1325,9 @@ static icon_handle create_button_icon(window_handle win, int x0, int x1,
     memset(&cb, 0, sizeof(cb));
     cb.window = win;
     cb.icondata.workarearect.min.x = x0;
-    cb.icondata.workarearect.min.y = -92;
+    cb.icondata.workarearect.min.y = y1 - 32;
     cb.icondata.workarearect.max.x = x1;
-    cb.icondata.workarearect.max.y = -60;
+    cb.icondata.workarearect.max.y = y1;
 
     cb.icondata.flags.data.text = 1;
     cb.icondata.flags.data.border = 1;
@@ -1298,29 +1348,47 @@ static icon_handle create_button_icon(window_handle win, int x0, int x1,
     return icon;
 }
 
+/* Row 1 of the control panel, y=-60 (icons span -92..-60). */
+#define ICON_ROW1_Y -60
+/* Row 2, directly below row 1 -- used once row 1 fills up (see
+   create_tone_icon). */
+#define ICON_ROW2_Y -100
+
 static void create_gain_icons(window_handle win)
 {
-    icon_agc_g = create_button_icon(win, 8, 88, "AGC");
-    icon_gaindown_g = create_button_icon(win, 96, 136, "-");
-    icon_gainup_g = create_button_icon(win, 144, 184, "+");
+    icon_agc_g = create_button_icon(win, 8, 88, ICON_ROW1_Y, "AGC");
+    icon_gaindown_g = create_button_icon(win, 96, 136, ICON_ROW1_Y, "-");
+    icon_gainup_g = create_button_icon(win, 144, 184, ICON_ROW1_Y, "+");
 }
 
-/* Same row as the gain buttons (create_button_icon's fixed y -60..-92),
-   positioned to their right -- WORK_WIDTH is 512, this uses up to
-   x=348, leaving clear margin. */
+/* Same row as the gain buttons, positioned to their right --
+   WORK_WIDTH is 512, this uses up to x=348, leaving clear margin. */
 static void create_freq_icons(window_handle win)
 {
-    icon_freqdown_g = create_button_icon(win, 220, 280, "F-");
-    icon_frequp_g = create_button_icon(win, 288, 348, "F+");
+    icon_freqdown_g = create_button_icon(win, 220, 280, ICON_ROW1_Y, "F-");
+    icon_frequp_g = create_button_icon(win, 288, 348, ICON_ROW1_Y, "F+");
 }
 
 /* Same row again, further right. 80 wide (matching icon_agc_g, not
    the 60-wide gain/freq +/- buttons) -- "DEM" is a 3-character label
    same as "AGC", and 60 units clipped it to "EM" on real hardware. Up
-   to x=436, still clear of WORK_WIDTH=512. */
+   to x=436, still clear of WORK_WIDTH=512 -- but that's the last
+   button row 1 has room for (see create_tone_icon). */
 static void create_demod_icon(window_handle win)
 {
-    icon_demod_g = create_button_icon(win, 356, 436, "DEM");
+    icon_demod_g = create_button_icon(win, 356, 436, ICON_ROW1_Y, "DEM");
+}
+
+/* Row 1 is full (AGC/-/+/F-/F+/DEM already span 8..436 of the 512-unit
+   width). "TONE" is 4 characters -- one longer than any existing
+   label -- so rather than cram it into row 1's remaining ~70 units
+   (already learned the hard way with DEM that a tight fit clips the
+   label), it gets its own row directly below. RESERVED_TOP/
+   BAR_MAX_HEIGHT and the demod text line's y both account for this
+   row's extra 40 units. */
+static void create_tone_icon(window_handle win)
+{
+    icon_tone_g = create_button_icon(win, 8, 88, ICON_ROW2_Y, "TONE");
 }
 
 int main(void)
@@ -1425,8 +1493,22 @@ int main(void)
     create_gain_icons(spectrum_window_g);
     create_freq_icons(spectrum_window_g);
     create_demod_icon(spectrum_window_g);
+    create_tone_icon(spectrum_window_g);
     update_agc_icon();   /* reflect gain_mode_g's initial AGC state */
     update_demod_icon(); /* reflect demod_enabled_g's initial OFF state */
+    update_tone_icon();  /* reflect tone_playing_g's initial OFF state */
+
+    /* Non-fatal: a brand new, experimental subsystem (see Audio.h)
+       shouldn't take down the whole proven spectrum display if
+       TimPlayer isn't present/loadable on this machine. The TONE
+       button simply does nothing if this fails (see Click_spectrum). */
+    audio_ok_g = (audio_test_tone_init() == 0);
+    if (!audio_ok_g) {
+        report_warning("Audio test tone setup failed (TimPlayer module "
+                        "not available?) -- the TONE button will do "
+                        "nothing. Everything else is unaffected.");
+    }
+
     Window_Show(spectrum_window_g, open_CENTERED);
 
     Event_Claim(event_REDRAW, spectrum_window_g, event_ANY, Redraw_spectrum, NULL);
