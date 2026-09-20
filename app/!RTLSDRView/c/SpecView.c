@@ -1295,11 +1295,13 @@ static void create_freq_icons(window_handle win)
     icon_frequp_g = create_button_icon(win, 288, 348, "F+");
 }
 
-/* Same row again, further right -- up to x=416, still clear of
-   WORK_WIDTH=512. */
+/* Same row again, further right. 80 wide (matching icon_agc_g, not
+   the 60-wide gain/freq +/- buttons) -- "DEM" is a 3-character label
+   same as "AGC", and 60 units clipped it to "EM" on real hardware. Up
+   to x=436, still clear of WORK_WIDTH=512. */
 static void create_demod_icon(window_handle win)
 {
-    icon_demod_g = create_button_icon(win, 356, 416, "DEM");
+    icon_demod_g = create_button_icon(win, 356, 436, "DEM");
 }
 
 int main(void)
