@@ -197,21 +197,19 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    remainder. accum_buf_g needs FIXED_CHUNK_SIZE bytes of headroom past
    IQ_BYTES to safely hold that overshoot.
 
-   256 has its own suspicious artifact (the exact tail/head bytes
-   around each 256-byte chunk boundary stay fixed even though the
-   sentinel test proves every byte is genuinely written), and 512
-   (matching the endpoint's native USB max packet size, one atomic
-   chunk read per frame, zero software-level splicing) was tried as a
-   test -- but that regressed to completely flat with no bars at all,
-   worse than 256, even though g==t==512 confirmed honest reads there
-   too. So 256's apparent dB contrast may partly be a splicing
-   artifact rather than fully real signal, but it's the significantly
-   more usable result of the two, and the flat-spectrum root cause
-   revealed by the clean 512-byte test now points upstream of the read
-   mechanism entirely (tuning/IF/gain), not at chunk size. Back to 256
-   as this milestone's baseline; see docs/PLAN.md for the full
-   investigation and what's still open. */
-#define FIXED_CHUNK_SIZE 256
+   256 has its own suspicious artifact: with DEM on, idx@ (the frame's
+   dominant sample) was found alternating between EXACTLY 0 and EXACTLY
+   128 -- not scattered, but flipping between the two fixed positions
+   exactly 128 samples (256 bytes) apart that mark the boundary between
+   this frame's two 256-byte software-level read chunks. 512 (matching
+   the endpoint's native USB max packet size, one atomic chunk read per
+   frame, zero software-level splicing) was tried once already and
+   regressed to completely flat -- but that test ran BEFORE the
+   analog/digital IF mismatch fix above was found and applied, so it
+   was confounded by two separate bugs at once rather than cleanly
+   testing chunk splicing on its own. Retrying 512 now that the IF
+   fix is confirmed in place. */
+#define FIXED_CHUNK_SIZE 512
 
 /* ---- global state ---- */
 static char device_name_g[16];
