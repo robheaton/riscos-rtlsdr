@@ -407,6 +407,7 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
     int got;
     int want;
     int any_ok;
+    int n_frames;
 
     UNUSED_ARG(event);
     UNUSED_ARG(reference);
@@ -439,9 +440,27 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
        available right now (got==0), rather than capping at a small
        fixed attempt count. MAX_READ_ATTEMPTS is a generous safety
        bound against a pathological runaway, not a normal-operation
-       limit. */
-#define MAX_READ_ATTEMPTS 5000
+       limit.
+
+       BUT: this loop used to also keep going past each completed frame,
+       all the way up to MAX_READ_ATTEMPTS (previously 5000), rather than
+       returning to Wimp_Poll once a handful of frames were done. With
+       real sustained USB throughput, got==0 is rare, so in practice a
+       single Null_spectrum() call was burning through most/all of that
+       5000-attempt budget in one tight, non-yielding loop, every idle
+       tick -- a real regression (confirmed by the user seeing high
+       resource usage on the Pi) from back when small BATCH_READS-style
+       caps and blocking reads naturally throttled how much a single
+       call could do. Capping the number of FRAMES completed per call
+       (not just raw read attempts) restores frequent, cheap returns to
+       Wimp_Poll -- matching the original phase-2 plan's explicit
+       concern about an over-large per-tick batch reintroducing the kind
+       of unresponsiveness phase 1 fought hard to diagnose -- while still
+       processing plenty of frames per second across many idle ticks. */
+#define MAX_READ_ATTEMPTS 200
+#define MAX_FRAMES_PER_TICK 8
     any_ok = 0;
+    n_frames = 0;
     for (i = 0; i < MAX_READ_ATTEMPTS; i++) {
         want = IQ_BYTES - accum_fill_g;
         got = os_gbpb_read4(stream_handle_g, accum_buf_g + accum_fill_g, want);
@@ -504,6 +523,10 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
                snapshot's high per-bin variance. See the comment above
                accumulate_frame(). */
             accumulate_frame();
+            n_frames++;
+            if (n_frames >= MAX_FRAMES_PER_TICK) {
+                break;
+            }
         }
     }
 
