@@ -1692,3 +1692,93 @@ power) -- and it points the same direction: the captured samples don't
 look like they carry real, coherent broadcast content, independent of
 gain/AGC state. Worth revisiting the paused flat-spectrum
 investigation with this as a second, independent data point.
+
+## Phase 2, follow-on: the flat-spectrum mystery, RESOLVED
+
+Picked back up with two leads in hand: the demod saturation finding
+above, and the idx@/nElev byte-level diagnostics from much earlier
+(one dominant sample out of 256, rest near-silent) that the various
+read-mechanism fixes never actually resolved -- they'd just moved
+where in the accumulation pipeline the symptom showed up.
+
+**Step 1: re-fetched real upstream source fresh** (librtlsdr.c,
+tuner_r82xx.c, rtlsdr-blog fork) rather than trusting research notes
+from much earlier in this very long session. Found a genuine,
+previously-missed gap: real `rtlsdr_set_sample_rate()` calls
+`dev->tuner->set_bw()`, which for R820T/R828D chains
+`r82xx_set_bandwidth()` (computes the tuner's actual analog IF for the
+requested capture bandwidth, writes its filter registers) ->
+`rtlsdr_set_if_freq()` (resyncs the demod's digital downconversion to
+match) -> re-tune. This project's port never called any of that --
+`r82xx_set_freq()` used a fixed `R82XX_IF_FREQ` constant (3.57MHz)
+forever, matching only `r82xx_init()`'s own generic default. Hand-
+computing upstream's real formula for this project's 2.4MHz capture
+gives ~1.815MHz -- a ~1.75MHz mismatch against a capture whose own
+Nyquist limit is only 1.2MHz, easily enough to explain looking like
+noise. Ported `r82xx_set_bandwidth()` verbatim (R82XX.c/h), added
+`t->int_freq` (replacing the fixed constant), exposed
+`rtlsdr_set_if_freq()` (was static), and wired the full resync sequence
+into `main()` after `rtlsdr_set_sample_rate()`.
+
+**Real run: demod stats barely moved** (`dev pk=1198.4k`, was
+`1167.6k`) despite the fix being genuinely correct and confirmed
+applied. This was a real, independent bug worth fixing regardless, but
+not (on its own) the explanation for the flat spectrum / demod
+saturation.
+
+**Step 2: re-checked idx@/nElev post-fix.** Re-enabled the (still-
+computed, no-longer-displayed) diagnostic. With the CURRENT chunk size
+(256 bytes) at the time: `idx@` alternated between EXACTLY 0 and
+EXACTLY 128 -- not scattered, but flipping between the two fixed
+positions exactly 128 samples (256 bytes) apart marking the boundary
+between each frame's two 256-byte software-level read chunks.
+
+**Step 3: retried atomic 512-byte reads** (one read per frame, zero
+software-level splicing) now that the IF fix removed a confound from
+the FIRST time this was tried. Result: `idx@` became PERMANENTLY stuck
+at 0 -- i.e. regardless of chunk size, only the very FIRST sample of
+ANY INDIVIDUAL READ CALL is genuinely fresh; the rest of that same
+call's data, despite passing the sentinel test (differs from a 0xAA
+fill), isn't real advancing ADC content. This reframed the sentinel
+test's own limitation: "differs from 0xAA" only catches zero/fixed-
+value padding, not padding by REPEATING an earlier real byte, which
+would still register as "touched."
+
+**Step 4: shrank the read size to 8 bytes (4 samples)** -- far smaller
+than anything in milestone 4's original round-size sweep -- on the
+theory that if only the first sample of any read is genuinely fresh,
+a much smaller request maximizes what fraction of each read is real.
+Raised `MAX_READ_ATTEMPTS` 200->1200 to compensate (filling one
+512-byte frame now needs many more individual, still-cheap,
+still-non-blocking-so-can't-hang calls).
+
+**Real run: this was it.** `nElev` jumped from 1-2 to **256** -- every
+single sample in the frame now carries real, meaningful energy, not
+just one or two. `idx@` scatters normally instead of sticking to a
+fixed position. `min=48.0 max=82.1` (34dB spread). And for the first
+time all session, the actual rendered bar graph shows a real,
+multi-peak spectrum shape -- distinct stations visible across the
+tuned band, not noise. User's reaction: "yes!!!! look at that."
+
+**Root cause, in one sentence:** DeviceFS's non-blocking short-read
+mechanism, for large request sizes, was returning a "genuine" (passes
+sentinel testing) but stale buffer where only the first sample was
+real and the rest were padding-by-repetition of an earlier byte --
+invisible to the zero-padding-only sentinel test used to validate the
+original milestone-5 fix, and worse the larger the request, which is
+exactly backwards from what the earlier round-size sweep assumed
+("bigger validated sizes are safe"). Small requests (8 bytes) work
+because the "stale tail" shrinks to almost nothing.
+
+**Still open / not yet re-tuned:** `MAX_READ_ATTEMPTS=1200` and
+`FIXED_CHUNK_SIZE=8` were the first values tried that worked, not
+necessarily the best -- worth experimenting with sizes between 8 and
+256 to find a sweet spot with fewer SWI calls per frame while keeping
+nElev healthy, if per-frame overhead ever becomes a concern. The FM
+demod deviation reading is still not obviously "sane" (large peak/rms)
+even with clean spectrum data now -- but this is expected, not a bug:
+`demodulate_frame()` runs on the FULL 2.4MHz-wide raw baseband, not a
+single filtered 200kHz channel, so it's currently demodulating the
+combined energy of everything in view (multiple stations at once,
+per the new multi-peak spectrum), not one station -- a real per-channel
+filter/decimate stage is future work, not part of this fix.

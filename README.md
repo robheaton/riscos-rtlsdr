@@ -33,29 +33,29 @@ and wired into both `!RTLSDR` (a new milestone 5) and `!RTLSDRView`.
 Milestone 4's actual throughput number has not yet been re-measured
 with this fix; treat the old number as void until it is.
 
-**Phase 2, milestone 1 (`!RTLSDRView`, a live spectrum display)
-architecture is proven on real hardware; genuine signal detection is
-still an open question.** A real Wimp GUI app: continuous idle-driven
-honest USB reads, a hand-written FFT, power-domain frame averaging, and
-a live-updating bar-graph redraw, all running inside the Wimp event
-loop without freezing the desktop. A long list of real bugs was found
-and fixed getting here (see `docs/PLAN.md`'s "Phase 2" section for the
-full history) — most recently a second, subtler form of the DeviceFS
-short-read padding bug (it resurfaces for non-round read sizes even
-with non-blocking mode enabled) and a resource-hogging unbounded read
-loop that was making the Pi unresponsive. Fixing that padding bug
-finally produced real dB contrast for the first time (previously
-`min`/`max` were identical to several decimal places, always). But a
-clean, unspliced read (matching the bulk endpoint's native USB packet
-size) showed no contrast at all, which suggests the contrast seen with
-smaller, spliced reads may itself be a splicing artifact rather than
-fully real captured signal — the true root cause of "no signal
-visible" now looks like it sits upstream of the read mechanism
-entirely (tuning, IF configuration, or gain staging), not in how bytes
-move from the SWI into memory. This is where the investigation is
-paused for now; the app runs, doesn't crash or freeze, and renders
-*something*, but whether that something is a real station peak remains
-unconfirmed.
+**Phase 2, milestone 1 (`!RTLSDRView`, a live spectrum display) is
+done, confirmed on real hardware: a real, multi-peak spectrum showing
+genuine broadcast stations, live gain control (AGC/manual), live
+frequency tuning, and an FM demodulator (numeric readout only — no
+audio output yet).** A real Wimp GUI app: continuous idle-driven honest
+USB reads, a hand-written FFT, power-domain frame averaging, and a
+live-updating bar-graph redraw, all running inside the Wimp event loop
+without freezing the desktop. A long list of real bugs was found and
+fixed getting here (see `docs/PLAN.md`'s "Phase 2" section for the full
+history) — most recently a genuine analog/digital IF mismatch (this
+port never called the real upstream bandwidth-configuration step,
+leaving the tuner's actual analog IF and the demod's digital
+downconversion offset by ~1.75MHz, comparable to the capture's own
+Nyquist limit) and, the actual root cause of the long-standing flat/
+noisy spectrum: DeviceFS's non-blocking short-read mechanism, for
+larger request sizes, returns a buffer where only the very first
+sample is genuinely fresh and the rest is padding-by-repetition of an
+earlier byte — invisible to the zero-padding-only sentinel test used
+to validate the original milestone-5 fix, and worse the larger the
+request. Shrinking the read size down to 8 bytes (4 samples) fixed it:
+`nElev` (samples per frame carrying real energy, out of 256) jumped
+from 1-2 to 256, and the rendered spectrum finally shows real,
+distinct station peaks instead of noise.
 
 Getting here was a real diagnostic journey — full blow-by-blow in
 `docs/PLAN.md`, including several real bugs only found by actually
