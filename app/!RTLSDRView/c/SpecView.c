@@ -235,6 +235,19 @@ static unsigned char debug_end_i_g = 0, debug_end_q_g = 0;
    frame for some other reason. */
 static int debug_last_gots_g[3] = { -1, -1, -1 };
 
+/* gots 256,256,256 -- ALWAYS exactly matching `want`, never anything
+   else -- flatly contradicts milestone 5's own finding that honest
+   non-blocking reads typically return only about HALF of what's
+   requested. That's the original short-read-padding bug's exact
+   signature (len - r3 always equals len, i.e. r3 always reported as 0
+   regardless of true transfer size). Milestone 5's sentinel-fill test
+   (RTLSDR.c) proved non-blocking mode WAS honest -- but only for that
+   test's specific call pattern (a handful of isolated calls). Applying
+   the identical sentinel technique HERE, under SpecView's actual
+   sustained rapid-polling pattern, checks whether honesty holds up in
+   practice or silently reverts. */
+static int debug_last_touched_g[3] = { -1, -1, -1 };
+
 /* ---- in-place iterative radix-2 DIT FFT, fixed N=FFT_SIZE ---- */
 static void fft256(double *re, double *im)
 {
@@ -565,11 +578,23 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
            entirely by never passing the SWI anything but a small, fixed,
            offset-0 buffer. */
         static unsigned char read_tmp_g[FIXED_CHUNK_SIZE];
+        int touched;
+        int k;
+        memset(read_tmp_g, 0xAA, FIXED_CHUNK_SIZE);
         want = FIXED_CHUNK_SIZE;
         got = os_gbpb_read4(stream_handle_g, read_tmp_g, want);
+        touched = 0;
+        for (k = 0; k < FIXED_CHUNK_SIZE; k++) {
+            if (read_tmp_g[k] != 0xAA) {
+                touched++;
+            }
+        }
         debug_last_gots_g[0] = debug_last_gots_g[1];
         debug_last_gots_g[1] = debug_last_gots_g[2];
         debug_last_gots_g[2] = got;
+        debug_last_touched_g[0] = debug_last_touched_g[1];
+        debug_last_touched_g[1] = debug_last_touched_g[2];
+        debug_last_touched_g[2] = touched;
         if (got < 0) {
             debug_reads_bad_g++;
             break;
@@ -820,16 +845,21 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                 GFX_Write0(line5);
                 GFX_VDU(4);
             }
-            /* Last 3 raw `got` values from individual SWI calls, in
-               order, regardless of frame boundaries -- shows the actual
-               call/response pattern directly instead of guessing at
-               another read-mechanism fix. See the debug_last_gots_g
-               comment above. */
+            /* Last 3 (got,touched) pairs from individual SWI calls --
+               `got` is what the SWI CLAIMS was transferred, `touched`
+               is how many bytes actually differ from a 0xAA sentinel
+               pre-fill (the exact technique milestone 5 used to prove
+               the original padding bug). If got==touched every time,
+               non-blocking mode really is honest here and the bug is
+               elsewhere; if touched is consistently far below got,
+               that's the padding bug again, just not caught by
+               milestone 5's narrower original test. */
             {
                 char line6[40];
-                sprintf(line6, "gots %d,%d,%d",
-                        debug_last_gots_g[0], debug_last_gots_g[1],
-                        debug_last_gots_g[2]);
+                sprintf(line6, "g%d/t%d g%d/t%d g%d/t%d",
+                        debug_last_gots_g[0], debug_last_touched_g[0],
+                        debug_last_gots_g[1], debug_last_touched_g[1],
+                        debug_last_gots_g[2], debug_last_touched_g[2]);
                 GFX_VDU(5);
                 GFX_Move(ox + 4, oy - 300);
                 GFX_Write0(line6);
