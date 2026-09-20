@@ -573,8 +573,32 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                being captured; scattering randomly across all 251
                non-DC bins would mean noise-floor-driven behaviour with
                no real peak found yet. */
-            sprintf(line1, "min=%.0f max=%.0f pk@%+d",
-                    debug_db_min_g, debug_db_max_g, debug_max_offset_g);
+            /* pk@ dropped (already confirmed solid at +3 across many
+               runs) to make room for real decimal precision -- %.0f
+               rounds to the nearest whole dB, which could easily be
+               hiding a real but modest gap (e.g. 44.6 vs 45.4) behind
+               two identical-looking rounded integers. Getting the true
+               numbers beats guessing at another architectural change
+               blind. */
+            sprintf(line1, "min=%.2f max=%.2f",
+                    debug_db_min_g, debug_db_max_g);
+            /* Latest real run showed min/max/pk stuck at exactly their
+               own startup defaults (0.0/0.0/0) -- consistent with
+               finalize_display() (and possibly accumulate_frame())
+               never actually running at all, not a math/averaging bug.
+               Re-adding ok=/bad= (dropped a few commits back to make
+               room) to directly check whether reads are even
+               completing frames in this build, before guessing at the
+               averaging code again. */
+            {
+                char line2[32];
+                sprintf(line2, "ok=%lu bad=%lu",
+                        debug_reads_ok_g, debug_reads_bad_g);
+                GFX_VDU(5);
+                GFX_Move(ox + 4, oy - 76);
+                GFX_Write0(line2);
+                GFX_VDU(4);
+            }
             GFX_VDU(5);
             GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
