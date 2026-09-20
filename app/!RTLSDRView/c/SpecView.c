@@ -78,7 +78,10 @@
    height below where the icons start. finalize_display() scales into
    BAR_MAX_HEIGHT, not the full WORK_HEIGHT. Grown from 100 to 140 to
    fit a second text line (demod readout, y -118) below the icon row. */
-#define RESERVED_TOP    140
+#define RESERVED_TOP    176 /* grown from 140 to fit a temporary 3rd
+                                text line (idx@/nElev, shown only while
+                                DEM is on) re-checking an earlier
+                                byte-level finding post-IF-fix */
 #define BAR_MAX_HEIGHT  (WORK_HEIGHT - RESERVED_TOP)
 
 /* Redraw throttle, separate from how aggressively Null_spectrum drains
@@ -1004,6 +1007,32 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                 GFX_Move(ox + 4, oy - 118);
                 GFX_Write0(line2);
                 GFX_VDU(4);
+
+                /* Re-checking, post-IF-fix, whether the ORIGINAL
+                   byte-level finding from earlier this session (one
+                   dominant sample out of 256, the rest near-silent --
+                   see docs/PLAN.md) still holds. If it does, that
+                   pattern -- not the IF mismatch just fixed -- is the
+                   more likely explanation for the demod saturation
+                   above: a naive per-sample phase discriminator
+                   applied to a mostly-near-zero-magnitude time-domain
+                   signal is dominated by noise-driven atan2() results
+                   for all the near-zero samples, regardless of
+                   whether real content exists in the one/two elevated
+                   ones. A real FM signal should have a roughly
+                   CONSTANT envelope (that's the point of FM -- no
+                   information in the amplitude), so nElev staying at
+                   1-2 would mean this still isn't healthy captured RF,
+                   IF-mismatch or not. */
+                {
+                    char line3[32];
+                    sprintf(line3, "idx@%d nElev=%d",
+                            debug_max_sample_idx_g, debug_n_elevated_g);
+                    GFX_VDU(5);
+                    GFX_Move(ox + 4, oy - 146);
+                    GFX_Write0(line3);
+                    GFX_VDU(4);
+                }
             }
         }
 
