@@ -189,6 +189,8 @@ static unsigned char debug_first_bytes_g[12];
 static unsigned char debug_byte_min_g = 255;
 static unsigned char debug_byte_max_g = 0;
 static int debug_max_offset_g = 0;
+static double debug_raw_min_g = 0.0;
+static double debug_raw_max_g = 0.0;
 
 /* ---- in-place iterative radix-2 DIT FFT, fixed N=FFT_SIZE ---- */
 static void fft256(double *re, double *im)
@@ -304,6 +306,7 @@ static void finalize_display(void)
     int i;
     int centre;
     int max_bin;
+    int min_bin;
     double scaled;
     double db_min, db_max, range;
 
@@ -325,18 +328,29 @@ static void finalize_display(void)
     db_min = db[(centre + DC_EXCLUDE_BINS + 1) % NUM_BINS];
     db_max = db_min;
     max_bin = (centre + DC_EXCLUDE_BINS + 1) % NUM_BINS;
+    min_bin = max_bin;
     for (i = 0; i < NUM_BINS; i++) {
         if (i >= centre - DC_EXCLUDE_BINS && i <= centre + DC_EXCLUDE_BINS) {
             continue;
         }
         if (db[i] < db_min) {
             db_min = db[i];
+            min_bin = i;
         }
         if (db[i] > db_max) {
             db_max = db[i];
             max_bin = i;
         }
     }
+    /* Raw linear power (not dB) at the min/max bins -- min=max=48.84dB
+       to 2 decimal places across 251 bins is too perfectly uniform to
+       be "weak signal"; comparing two very large, similar magnitudes on
+       a log scale can make a real linear difference look like nothing
+       (log10(1e10) vs log10(1.1e10) differ by only 0.04). Checking the
+       actual linear numbers directly, bypassing log compression
+       entirely, before guessing at yet another averaging-code change. */
+    debug_raw_min_g = avg_power_g[min_bin];
+    debug_raw_max_g = avg_power_g[max_bin];
     range = db_max - db_min;
     if (range < 1.0) {
         range = 1.0;
@@ -582,18 +596,16 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                blind. */
             sprintf(line1, "min=%.2f max=%.2f",
                     debug_db_min_g, debug_db_max_g);
-            /* Latest real run showed min/max/pk stuck at exactly their
-               own startup defaults (0.0/0.0/0) -- consistent with
-               finalize_display() (and possibly accumulate_frame())
-               never actually running at all, not a math/averaging bug.
-               Re-adding ok=/bad= (dropped a few commits back to make
-               room) to directly check whether reads are even
-               completing frames in this build, before guessing at the
-               averaging code again. */
+            /* ok=/bad= confirmed reads healthy (ok=15000, bad=0) --
+               replaced with the raw linear power at the min/max bins
+               (see the comment above debug_raw_min_g/max_g) now that
+               the open question is whether a real linear difference is
+               being hidden by log compression, not whether reads are
+               happening at all. */
             {
                 char line2[32];
-                sprintf(line2, "ok=%lu bad=%lu",
-                        debug_reads_ok_g, debug_reads_bad_g);
+                sprintf(line2, "raw %.3e %.3e",
+                        debug_raw_min_g, debug_raw_max_g);
                 GFX_VDU(5);
                 GFX_Move(ox + 4, oy - 76);
                 GFX_Write0(line2);
