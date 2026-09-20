@@ -16,31 +16,37 @@ transfers → baseband init → tuner identified and locked → sample rate
 configured. No libusb, no existing driver to build on; this talks to
 the dongle entirely through RISC OS's own native USB interface.
 
-⚠️ **Milestone 4's bulk-streaming result is now known to be wrong and
-should NOT be treated as settled.** It originally reported "25.6 MB/s
-sustained throughput", but that number only ever verified byte
-*counts* returned by `OS_GBPB`, never actual byte *content*. A phase 2
-diagnostic (see `docs/PLAN.md`'s milestone 5) proved via a sentinel-fill
-test that `OS_GBPB` reason 4 against this bulk endpoint reports a full
-transfer while genuinely writing only ~2 real bytes per call,
-zero-padding the rest — meaning the real sustained data rate was
-actually closer to ~50KB/s (about 1% of the ~4.8MB/s target), not 5x
-over it. **Root cause found**: this is a documented, ~20-year-old
-RISC OS DeviceFS USB characteristic (short reads get silently padded
-to the requested size, with no reliable way to learn the true transfer
-size from the public API) — not a bug introduced by this project. See
-`docs/PLAN.md` for the primary source and full evidence.
+⚠️ **Milestone 4's original "25.6 MB/s sustained throughput" result was
+wrong and should not be treated as settled** — it only ever verified
+byte *counts* returned by `OS_GBPB`, never actual byte *content*. A
+phase 2 diagnostic (see `docs/PLAN.md`'s milestone 5) proved via a
+sentinel-fill test that `OS_GBPB` reason 4 against this bulk endpoint,
+in its default blocking mode, reports a full transfer while genuinely
+writing only ~2 real bytes per call, zero-padding the rest — a
+documented, ~20-year-old RISC OS DeviceFS characteristic (short reads
+get silently padded, with no reliable way to learn the true transfer
+size from the public API), not a bug introduced by this project. **Now
+fixed**: a second, public SWI (`OS_Args` reason 9, IOCtl group `0xFF`
+reason 1) enables non-blocking mode on the stream, after which
+`OS_GBPB` reports honest short-read counts — confirmed on real hardware
+and wired into both `!RTLSDR` (a new milestone 5) and `!RTLSDRView`.
+Milestone 4's actual throughput number has not yet been re-measured
+with this fix; treat the old number as void until it is.
 
-**Phase 2, milestone 1 (`!RTLSDRView`, a live spectrum display): the
-architecture is confirmed on real hardware** — a real Wimp GUI app,
-continuous idle-driven USB reads, a hand-written FFT, and a
-live-updating bar-graph redraw, all running inside the Wimp event loop
-without freezing the desktop. Given the milestone 4 finding above, the
-displayed spectrum should currently be treated as showing whatever
-`OS_GBPB`'s zero-padded reads actually produce, not confirmed genuine
-RF content — signal-quality work is blocked on the bulk-read
-investigation, not just gain/display-scale polish as first thought. See
-`docs/PLAN.md`'s "Phase 2" section for the full history.
+**Phase 2, milestone 1 (`!RTLSDRView`, a live spectrum display) is
+done, confirmed on real hardware.** A real Wimp GUI app: continuous
+idle-driven honest USB reads, a hand-written FFT, and a live-updating
+bar-graph redraw, all running inside the Wimp event loop without
+freezing the desktop. Two real bugs were found and fixed getting here
+(the DeviceFS read-padding above, and a rendering bug -- calling
+`GFX_RectangleFill` 256 times in a loop where most calls are
+zero-height turned out to corrupt state badly enough that nothing drew
+at all; fixed by skipping zero-height bars). With both fixed, the
+display is confirmed showing genuine data: the DC-spike artifact
+renders correctly, and the non-DC spectrum is real but close to flat,
+which is now known to be an actual signal-conditions/gain question, not
+a bug hiding behind it. See `docs/PLAN.md`'s "Phase 2" section for the
+full history.
 
 Getting here was a real diagnostic journey — full blow-by-blow in
 `docs/PLAN.md`, including several real bugs only found by actually
@@ -49,13 +55,13 @@ bit-reversal quirk on I2C reads, TaskWindow execution implicated in
 repeated full-machine freezes (fixed by running directly instead — now
 the operational rule), `fread()` never working against this DeviceFS
 stream at any size for reasons never fully root-caused (worked around
-with raw `OS_Find`/`OS_GBPB` instead, which itself turned out to have
-its own reliable-size ceiling), a hand-built Wimp window definition
-block crashing `Wimp_CreateWindow` with a data abort because Norcroft
-can pad a mixed char/bitfield struct past its intended size, and a
+with raw `OS_Find`/`OS_GBPB` instead), a hand-built Wimp window
+definition block crashing `Wimp_CreateWindow` with a data abort because
+Norcroft can pad a mixed char/bitfield struct past its intended size, a
 disabled GPIO call (the V4's antenna-vs-upconverter RF switch) that
 turned out safe to re-enable once TaskWindow was ruled out as the real
-freeze cause.
+freeze cause, DeviceFS's read-padding described above, and the
+degenerate zero-height rendering bug.
 
 ## Layout
 
