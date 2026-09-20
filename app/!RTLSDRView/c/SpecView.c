@@ -532,8 +532,25 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
     any_ok = 0;
     n_frames = 0;
     for (i = 0; i < MAX_READ_ATTEMPTS; i++) {
+        /* Read into a FIXED buffer at offset 0 -- the exact pattern
+           milestone 4/5 actually validated as getting honest
+           non-blocking short-read counts -- then copy the genuinely-
+           received bytes into accum_buf_g ourselves. Two previous real-
+           hardware fixes (a fixed, validated CHUNK SIZE, then forcing
+           4-BYTE-ALIGNED destination offsets) both failed to move two
+           specific, fixed sample offsets (250-251, 510-511) off of
+           permanent zero while other positions genuinely varied -- the
+           one thing neither fix changed was reading into a GROWING,
+           NON-ZERO destination offset within accum_buf_g
+           (accum_buf_g+accum_fill_g). If DeviceFS's honest-short-read
+           mechanism has any quirk tied to non-zero/varying destination
+           addresses, that would explain a fixed-position failure size
+           and alignment couldn't touch. This sidesteps the question
+           entirely by never passing the SWI anything but a small, fixed,
+           offset-0 buffer. */
+        static unsigned char read_tmp_g[FIXED_CHUNK_SIZE];
         want = FIXED_CHUNK_SIZE;
-        got = os_gbpb_read4(stream_handle_g, accum_buf_g + accum_fill_g, want);
+        got = os_gbpb_read4(stream_handle_g, read_tmp_g, want);
         if (got < 0) {
             debug_reads_bad_g++;
             break;
@@ -541,6 +558,7 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
         if (got == 0) {
             break;
         }
+        memcpy(accum_buf_g + accum_fill_g, read_tmp_g, (size_t)got);
         /* Only count whole I/Q pairs. want is always even (IQ_BYTES and
            accum_fill_g are both kept even by this same rule), but the
            SWI decides how much to actually deliver -- if that "got"
@@ -557,22 +575,13 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
            the buffer to be overwritten next read) costs one sample out
            of many thousands and keeps pairing intact throughout.
 
-           Masking to ~3 (4-byte/2-sample alignment), not just ~1 (2-byte/
-           1-sample), after switching to fixed-size chunked reads: the
-           fixed-chunk fix got min/max to finally separate, but left an
-           extremely regular alternating pattern (a tight vertical-stripe
-           "barcode" across the whole display) with s125/s255 -- both
-           ODD sample indices -- permanently stuck at exactly 0 while s0
-           (even) genuinely varies. That's the signature of every ODD-
-           indexed sample staying corrupted while even ones are fine: a
-           real USB/DMA destination-address alignment requirement (4-byte
-           is a common minimum for bulk transfer DMA) would explain it
-           exactly, since carry-over from an overshot chunk could leave
-           accum_fill_g 2-byte-aligned but not 4-byte-aligned, and every
-           read after that would target a misaligned offset. Keeping every
-           read's destination offset a multiple of 4 (dropping up to 3
-           trailing bytes instead of 1 when needed) tests that directly. */
-        accum_fill_g += got & ~3;
+           A 4-byte-alignment variant of this mask was also tried (in
+           case the SWI needed a word-aligned destination) and made no
+           difference -- ruled out now that the SWI always targets
+           read_tmp_g[0] regardless of accum_fill_g, so only 2-byte/
+           I-Q-pairing alignment matters for the C-level memcpy
+           destination. */
+        accum_fill_g += got & ~1;
         if (accum_fill_g < IQ_BYTES) {
             continue;
         }
