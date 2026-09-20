@@ -1619,3 +1619,26 @@ the degenerate zero-height `GFX_RectangleFill` rendering bug, the
 resource-hogging unbounded read-attempt loop, and the "too much
 diagnostic text fills the whole window" mistake (now fixed twice). All
 confirmed via real hardware testing, all still in place.
+
+## Phase 2, follow-on: gain control UI
+
+Added a live gain control UI: three real Wimp icons (`Wimp_CreateIcon`,
+not custom-drawn graphics) below the diagnostic text -- "AGC" toggle
+button and "-"/"+" manual gain-step buttons (0-15) -- handled by a new
+`Click_spectrum` `event_CLICK` handler. New tuner driver functions
+`r82xx_set_gain_agc()`/`r82xx_set_gain_manual(t, index)` in
+`R82XX.c`/`.h` (the old hardcoded `r82xx_set_gain_max()` is retired,
+generalized into the parameterized manual function). Current gain
+state shows compactly in the existing diagnostic line (`G:AGC` /
+`G:M08`) rather than a separate live-updating icon. Also reserved a
+100-unit strip at the top of the window (`RESERVED_TOP`/
+`BAR_MAX_HEIGHT`) so a tall bar can never grow up into and cover the
+text or icon row.
+
+**Real run: confirmed working end-to-end.** User clicked through AGC/
+-/+ and confirmed the displayed `min` value visibly moves within a few
+seconds of a gain change (matching the ~200-frame `AVG_ALPHA=0.005`
+averaging window's settle time) -- proving the button clicks are
+genuinely reaching the tuner over I2C and changing real ADC gain, not
+just updating the display. First real, hands-on confirmation that a UI
+control changes something measurable in this app.
