@@ -72,19 +72,18 @@
    centiseconds (so a plain full-window repaint at native Wimp_Poll rate
    doesn't waste CPU/flicker).
 
-   BATCH_READS was 8 (tight back-to-back os_gbpb_read4 calls, no pacing)
-   until a real run showed WHY that's suspect: the raw bytes returned
-   were mostly zero after the first couple, despite each read claiming
-   "512 of 512 bytes transferred". Milestone 4's phase-1 throughput
-   result (25.6 MB/s) only ever verified BYTE COUNTS, never content, and
-   used the exact same kind of tight back-to-back loop -- so it's
-   plausible DeviceFS returns "success" with mostly stale/zero padding
-   when polled faster than the RTL2832U can actually fill a 512-byte
-   chunk at 4.8 MB/s (~107us needed), rather than genuinely blocking
-   until real data is ready. Dropped to 1 read per idle tick as a direct
-   test: if the zero-padding stops, that confirms over-polling was the
-   cause; if it doesn't, something else is going on. See docs/PLAN.md. */
-#define BATCH_READS       1
+   Went 8 -> 1 -> back up to a generous 16 over the course of chasing a
+   real bug (see docs/PLAN.md milestone 5): blocking-mode os_gbpb_read4
+   silently padded short reads to the full requested size regardless of
+   read pacing (confirmed BATCH_READS=1 didn't fix it either) -- the
+   real fix was enabling DeviceFS's non-blocking mode
+   (os_args_set_nonblocking), after which os_gbpb_read4 finally reports
+   HONEST short-read counts. With honest counts, doing MORE reads per
+   tick is safe again (each one just reports however much genuinely
+   arrived, accumulated into accum_buf_g -- see Null_spectrum), so this
+   is back to draining aggressively to keep up with the 4.8 MB/s stream
+   rather than falling behind. */
+#define BATCH_READS       16
 #define UPDATE_INTERVAL_CS 20   /* ~5Hz redraw */
 
 /* compute_spectrum() auto-scales EACH FRAME's own min/max dB range to
@@ -179,19 +178,22 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
 static char device_name_g[16];
 static int stream_handle_g = 0;
 static unsigned char iq_frame_g[IQ_BYTES];
+static unsigned char accum_buf_g[IQ_BYTES];
+static int accum_fill_g = 0;
 static int bin_height_g[NUM_BINS];
 static unsigned int next_update_time_g;
 static window_handle spectrum_window_g;
 
 /* Diagnostic-only globals, drawn as a text line during redraw (see
-   Redraw_spectrum). The single-line-only display has looked visually
-   IDENTICAL across four different scaling formulas -- that pattern (one
-   bin always maxed, every other bin always exactly zero, unaffected by
-   the scale) is what a perfectly constant input produces (all energy at
-   DC, exactly zero everywhere else), which is what iq_frame_g would
-   still contain if os_gbpb_read4() had never actually written real
-   samples into it. These counters/values make that visible on screen
-   instead of guessing from a photo. */
+   Redraw_spectrum). Originally added to chase down a real bug: DeviceFS
+   pads short reads to the requested size in its default blocking mode
+   (confirmed via real DeviceFS source, see docs/PLAN.md milestone 5),
+   so os_gbpb_read4() used to claim a full transfer while genuinely
+   writing only ~2 bytes. Fixed by enabling non-blocking mode
+   (os_args_set_nonblocking) and accumulating its now-honest short reads
+   into accum_buf_g instead of demanding a full IQ_BYTES every call.
+   Left these counters in place -- still useful to see the pipeline is
+   alive at a glance. */
 static unsigned long debug_reads_ok_g = 0;
 static unsigned long debug_reads_bad_g = 0;
 static double debug_db_min_g = 0.0;
@@ -335,20 +337,44 @@ static void report_and_die(const char *msg)
 
 static BOOL Null_spectrum(event_pollblock *event, void *reference)
 {
-    unsigned char scratch[IQ_BYTES];
     int i;
     int got;
+    int want;
     int any_ok;
 
     UNUSED_ARG(event);
     UNUSED_ARG(reference);
 
+    /* Non-blocking mode (enabled once in main() via
+       os_args_set_nonblocking) makes os_gbpb_read4() return HONEST
+       short-read counts instead of the default blocking mode's silent
+       zero-padding to the requested size (see docs/PLAN.md milestone
+       5 -- confirmed on real hardware via a sentinel-fill test).
+       Accumulate across multiple calls into accum_buf_g until a full
+       IQ_BYTES frame is ready, rather than requiring got==IQ_BYTES from
+       a single call, which blocking mode never honestly gave anyway.
+       got==0 just means nothing new is available right now, not an
+       error -- stop draining for this tick rather than spin on it. */
     any_ok = 0;
     for (i = 0; i < BATCH_READS; i++) {
-        got = os_gbpb_read4(stream_handle_g, scratch, IQ_BYTES);
-        if (got == IQ_BYTES) {
+        want = IQ_BYTES - accum_fill_g;
+        got = os_gbpb_read4(stream_handle_g, accum_buf_g + accum_fill_g, want);
+        if (got < 0) {
+            debug_reads_bad_g++;
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
+        accum_fill_g += got;
+        if (accum_fill_g < IQ_BYTES) {
+            continue;
+        }
+
+        {
             int j;
-            memcpy(iq_frame_g, scratch, IQ_BYTES);
+            memcpy(iq_frame_g, accum_buf_g, IQ_BYTES);
+            accum_fill_g = 0;
             any_ok = 1;
             debug_reads_ok_g++;
             memcpy(debug_first_bytes_g, iq_frame_g, sizeof(debug_first_bytes_g));
@@ -366,13 +392,7 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
                     debug_byte_max_g = iq_frame_g[j];
                 }
             }
-        } else {
-            debug_reads_bad_g++;
         }
-        /* short read or error: drop this attempt, keep the last good
-           frame, try again next idle tick -- see the file header for
-           why raw-stream oddities are treated cautiously rather than
-           as fatal here. */
     }
 
     if (any_ok && Time_Monotonic() >= next_update_time_g) {
@@ -612,6 +632,10 @@ int main(void)
     stream_handle_g = os_find_open(path);
     if (stream_handle_g == 0) {
         report_and_die("Could not open the bulk endpoint stream.");
+    }
+    if (os_args_set_nonblocking(stream_handle_g, 1) != 0) {
+        report_and_die("Could not enable non-blocking mode on the "
+                        "bulk stream -- see docs/PLAN.md milestone 5.");
     }
 
     spectrum_window_g = create_spectrum_window();

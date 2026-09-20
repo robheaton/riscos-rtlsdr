@@ -1216,7 +1216,31 @@ pattern `os_gbpb_read4` itself uses). Added a test to milestone 5
 (`os_args_set_nonblocking()` + a repeat of the sentinel test with
 non-blocking mode enabled) to validate this actually produces honest
 short-read counts before touching `RTLSDRView`'s real read loop.
-Pending a real run.
+
+**Confirmed on real hardware -- the fix works.** With non-blocking mode
+enabled, `touched == got` in every single sentinel-test case (2 through
+1024 bytes), where before `touched` was stuck at `size` regardless of
+how much data genuinely arrived. A clear pattern emerged too: `got` is
+consistently about half the requested size (4->2, 8->4, ... 1024->512),
+capping at exactly 512 bytes (one USB max-packet) for anything larger
+-- the underlying transfer genuinely can't deliver more than that per
+non-blocking poll, but now says so honestly instead of lying.
+
+**Wired into the real code.** Promoted `os_args_set_nonblocking()` from
+the milestone 5 diagnostic into `Driver.c`/`Driver.h` (shared with
+`!RTLSDRView`), with the padding-vs-honest-mode distinction documented
+directly on `os_gbpb_read4()`'s declaration so it can't be missed by a
+future caller. Restructured `RTLSDRView`'s `Null_spectrum()`: instead of
+requiring a single call to return a full `IQ_BYTES` frame (which
+blocking mode never honestly did anyway), it now accumulates
+honestly-reported partial reads into `accum_buf_g` across multiple
+calls until a full frame is ready; `got==0` means "nothing new yet", not
+an error. `main()` calls `os_args_set_nonblocking()` once right after
+opening the stream. `BATCH_READS` went back up from 1 to a generous 16
+now that doing more reads per tick is safe again (each one just reports
+however much genuinely arrived, rather than risking fabricated
+"successes"). Pending a real run to see actual FFT content instead of
+the DC-only display every previous run showed.
 
 Sources:
 - [DeviceFS source (gitlab.riscosopen.org)](https://gitlab.riscosopen.org/RiscOS/Sources/HWSupport/DeviceFS)

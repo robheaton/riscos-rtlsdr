@@ -518,6 +518,7 @@ void rtlsdr_reset_buffer(const char *dev)
 
 #define SWI_OS_GBPB 0x0C
 #define SWI_OS_FIND 0x0D
+#define SWI_OS_Args 0x09
 
 /* Raw OS_Find/OS_GBPB, bypassing stdio entirely. tools/probe_stream.bas
    proved fopen()/fread() blocks indefinitely against this DeviceFS
@@ -566,4 +567,40 @@ int os_gbpb_read4(int handle, unsigned char *buf, int len)
         return -1;
     }
     return len - regs.r[3];
+}
+
+/* Enables (or disables) non-blocking mode on an already-open stream, so
+   os_gbpb_read4() reports HONEST short-read counts instead of the
+   default blocking mode's silent zero-padding to the requested size --
+   see the long comment in Driver.h and docs/PLAN.md milestone 5 for how
+   this was found (real DeviceFS source, not guesswork) and confirmed
+   on real hardware (sentinel-fill test: touched-byte count matched
+   os_gbpb_read4()'s return value exactly once this was enabled, where
+   before it always claimed the full requested size regardless of how
+   much data genuinely arrived). OS_Args (SWI &09) reason 9 = IOCtl;
+   IOCtl group 0xFF (DeviceFS-specific) reason 1 = "Set/Read
+   Non-blocking I/O", data word 1=set/0=unset. */
+#define OSARGS_REASON_IOCTL    9
+#define IOCTL_GROUP_DEVICEFS   ((int)0xFFu << 16)
+#define IOCTL_REASON_NONBLOCK  1
+#define IOCTL_WRITE_FLAG       ((int)0x80000000u)
+
+int os_args_set_nonblocking(int handle, int enable)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *err;
+    int block[2];
+
+    block[0] = IOCTL_WRITE_FLAG | IOCTL_GROUP_DEVICEFS | IOCTL_REASON_NONBLOCK;
+    block[1] = enable ? 1 : 0;
+
+    regs.r[0] = OSARGS_REASON_IOCTL;
+    regs.r[1] = handle;
+    regs.r[2] = (int)block;
+    err = _kernel_swi(SWI_OS_Args, &regs, &regs);
+    if (err != NULL) {
+        fprintf(stderr, "os_args_set_nonblocking: %s\n", err->errmess);
+        return -1;
+    }
+    return 0;
 }

@@ -36,9 +36,26 @@ void rtlsdr_reset_buffer(const char *dev);
    worked against this DeviceFS stream at any size, for reasons never
    root-caused (see docs/PLAN.md). os_gbpb_read4 returns bytes actually
    read (0..len), or -1 on error. Reads above 1024 bytes are known to
-   block for ~110s before erroring -- callers must chunk accordingly. */
+   block for ~110s before erroring -- callers must chunk accordingly.
+
+   IMPORTANT (found in phase 2, see docs/PLAN.md milestone 5): in the
+   DEFAULT blocking mode, a stream opened this way pads short reads to
+   the requested size instead of returning an honest short count --
+   os_gbpb_read4() will claim "len bytes transferred" even when only a
+   couple of bytes of genuine USB data actually arrived, silently
+   zero-filling the rest. This is a real, confirmed RISC OS DeviceFS
+   USB characteristic (see the "DeviceFS USB technical" wiki page and
+   DeviceFS's own Doc/NonBlock), not a bug in this code. Call
+   os_args_set_nonblocking(handle, 1) once after opening the stream to
+   get HONEST short-read counts (confirmed on real hardware: with
+   non-blocking mode enabled, os_gbpb_read4's return value always
+   matches how many bytes were genuinely written, verified via a
+   sentinel-fill test) -- callers MUST then handle got < len as normal
+   (accumulate across multiple calls) and got == 0 as "nothing new yet",
+   not as an error. */
 int os_find_open(const char *path);
 void os_find_close(int handle);
 int os_gbpb_read4(int handle, unsigned char *buf, int len);
+int os_args_set_nonblocking(int handle, int enable);
 
 #endif /* DRIVER_H */

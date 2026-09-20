@@ -341,43 +341,9 @@ static int milestone2_register_probe(const char *dev)
 
 #define M5_SENTINEL 0xAAu
 
-/* Real fix candidate, found via actual DeviceFS source (not guesswork):
-   RiscOS/Sources/HWSupport/DeviceFS's s/FSystem shows OS_Args reason 9
-   (IOCtl) with IOCtl group 0xFF reason 1 sets/reads "non-blocking I/O"
-   on a stream, confirmed against ROOL's own SWI reference (OS_Args
-   reason 9 = IOCtl; IOCtl group &ff reason 1 = "Set/Read Non-blocking
-   I/O", data 1=set/0=unset). Doc/NonBlock (same repo) states plainly:
-   "When in non-blocking mode, if gbpb_get cannot get the complete
-   number of requested bytes it returns with number of bytes not done
-   in R3" -- i.e. an HONEST short-read count, unlike the padding-to-
-   full-size behaviour seen in blocking mode (the default). No UpCalls,
-   no vector claiming, no assembler -- a public, documented SWI. */
-#define SWI_OS_Args        0x09
-#define OSARGS_REASON_IOCTL 9
-#define IOCTL_GROUP_DEVICEFS ((int)0xFFu << 16)
-#define IOCTL_REASON_NONBLOCK 1
-#define IOCTL_WRITE_FLAG   ((int)0x80000000u)
-#define IOCTL_READ_FLAG    ((int)0x40000000u)
-
-static int os_args_set_nonblocking(int handle, int enable)
-{
-    _kernel_swi_regs regs;
-    _kernel_oserror *err;
-    int block[2];
-
-    block[0] = IOCTL_WRITE_FLAG | IOCTL_GROUP_DEVICEFS | IOCTL_REASON_NONBLOCK;
-    block[1] = enable ? 1 : 0;
-
-    regs.r[0] = OSARGS_REASON_IOCTL;
-    regs.r[1] = handle;
-    regs.r[2] = (int)block;
-    err = _kernel_swi(SWI_OS_Args, &regs, &regs);
-    if (err != NULL) {
-        printf("os_args_set_nonblocking: %s\n", err->errmess);
-        return -1;
-    }
-    return 0;
-}
+/* os_args_set_nonblocking() (the real fix, confirmed on real hardware
+   below) now lives in Driver.c/Driver.h, shared with !RTLSDRView --
+   see the comment there for how it was found and what it does. */
 
 static void m5_dump_hex(const unsigned char *buf, int n)
 {
