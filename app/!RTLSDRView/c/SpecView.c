@@ -187,6 +187,7 @@ static double debug_db_dc_g = 0.0;
 static unsigned char debug_first_bytes_g[12];
 static unsigned char debug_byte_min_g = 255;
 static unsigned char debug_byte_max_g = 0;
+static int debug_max_offset_g = 0;
 
 /* ---- in-place iterative radix-2 DIT FFT, fixed N=FFT_SIZE ---- */
 static void fft256(double *re, double *im)
@@ -244,6 +245,7 @@ static void compute_spectrum(void)
     int i;
     int src;
     int centre;
+    int max_bin;
     double power, scaled;
     double db_min, db_max, range;
 
@@ -296,6 +298,7 @@ static void compute_spectrum(void)
     centre = NUM_BINS / 2;
     db_min = db[(centre + DC_EXCLUDE_BINS + 1) % NUM_BINS];
     db_max = db_min;
+    max_bin = (centre + DC_EXCLUDE_BINS + 1) % NUM_BINS;
     for (i = 0; i < NUM_BINS; i++) {
         if (i >= centre - DC_EXCLUDE_BINS && i <= centre + DC_EXCLUDE_BINS) {
             continue;
@@ -305,6 +308,7 @@ static void compute_spectrum(void)
         }
         if (db[i] > db_max) {
             db_max = db[i];
+            max_bin = i;
         }
     }
     range = db_max - db_min;
@@ -315,6 +319,15 @@ static void compute_spectrum(void)
     debug_db_min_g = db_min;
     debug_db_max_g = db_max;
     debug_db_dc_g = db[centre];
+    /* How many bins the frame's strongest (non-DC) point sits from the
+       tuned frequency (dead centre after the FFT-shift). If this
+       consistently lands somewhere within the ~21-bin span a 200kHz-
+       wide FM signal should occupy (roughly +-10 of centre, at our
+       ~9.4kHz/bin resolution), that's consistent with a real station
+       peak; if it's scattered randomly across all 251 non-DC bins
+       frame to frame, that points to noise-floor-driven behaviour with
+       no real signal peak being captured. See docs/PLAN.md. */
+    debug_max_offset_g = max_bin - centre;
 
     for (i = 0; i < NUM_BINS; i++) {
         scaled = (db[i] - db_min) / range * (double)WORK_HEIGHT;
@@ -510,21 +523,21 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
            cursor; VDU 4 reverts. */
         {
             char line1[48];
-            /* Fourth real run showed NOTHING drawn at all -- not even
-               the DC spike every previous run showed. Plausible good
-               explanation: that DC spike was itself an artifact of the
-               old padding bug (a mostly-constant buffer concentrates
-               all its energy at DC by definition); with real varying
-               data now filling the whole frame, DC could be much
-               smaller. But that's a guess -- show the actual computed
-               scale (min/max/dc) instead of assuming. */
-            /* Read pipeline is now thoroughly confirmed healthy (many
-               runs, ok climbing steadily, bad always 0) -- dropped
-               ok=/bad= to guarantee "dc=" isn't clipped again like the
-               last run, where the window cut it off mid-value. */
-            sprintf(line1, "min=%.0f max=%.0f dc=%.0f h=%d",
-                    debug_db_min_g, debug_db_max_g, debug_db_dc_g,
-                    bin_height_g[NUM_BINS / 2]);
+            /* dc/h dropped: after DC removal, db[centre] is trivially
+               ALWAYS exactly 0 (subtracting the mean and then summing
+               the result is 0 by definition, regardless of any real
+               signal) -- it was never meaningful new information, a
+               diagnosis mistake caught after a wasted round-trip. What
+               actually matters: WHERE the frame's strongest (non-DC)
+               bin sits relative to the tuned frequency (dead centre).
+               Landing consistently within roughly +-10 of centre (the
+               ~21-bin span a 200kHz FM signal should occupy at our
+               ~9.4kHz/bin resolution) would mean a real station peak IS
+               being captured; scattering randomly across all 251
+               non-DC bins would mean noise-floor-driven behaviour with
+               no real peak found yet. */
+            sprintf(line1, "min=%.0f max=%.0f pk@%+d",
+                    debug_db_min_g, debug_db_max_g, debug_max_offset_g);
             GFX_VDU(5);
             GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
