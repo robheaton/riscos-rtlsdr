@@ -180,8 +180,24 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    frame is already filled, carrying any overshoot past the frame
    boundary into the next frame instead of trying to request an exact
    remainder. accum_buf_g needs FIXED_CHUNK_SIZE bytes of headroom past
-   IQ_BYTES to safely hold that overshoot. */
-#define FIXED_CHUNK_SIZE 256
+   IQ_BYTES to safely hold that overshoot.
+
+   256 (this frame's HALF) turned out to have its own artifact: the
+   sentinel test proved every requested byte genuinely gets written
+   (g==t==256 always), yet the exact tail/head bytes around EACH
+   256-byte chunk boundary stayed suspiciously fixed. With two chunks
+   per 512-byte frame, a per-chunk artifact repeating at that fixed
+   128-sample (256-byte) spacing is mathematically exactly what
+   produces a persistent, unaverageable every-other-bin alternating
+   pattern (two fixed impulses N/2 apart in an N-point DFT alias to
+   +-1 per bin) -- matching the dense "barcode" display that heavy
+   10x-longer averaging didn't change AT ALL (a real tell: genuine
+   noise averages down, a deterministic per-frame artifact doesn't).
+   512 -- the endpoint's actual native USB max packet size -- makes
+   each frame a SINGLE chunk read instead of two boundary-prone ones,
+   testing whether the artifact is specifically tied to splitting a
+   512-byte USB transfer into two 256-byte software-level requests. */
+#define FIXED_CHUNK_SIZE 512
 
 /* ---- global state ---- */
 static char device_name_g[16];
@@ -222,19 +238,6 @@ static double debug_raw_max_g = 0.0;
    ~125 (buffer middle) and sample 255 (buffer end). */
 static unsigned char debug_mid_i_g = 0, debug_mid_q_g = 0;
 static unsigned char debug_end_i_g = 0, debug_end_q_g = 0;
-/* g==t==256 every read (sentinel test) proves every byte genuinely
-   gets WRITTEN by the SWI -- ruling out padding. But debug_mid_*_g
-   (byte 250-251, near the end of the FIRST 256-byte chunk) and
-   debug_end_*_g (byte 510-511, the EXACT last 2 bytes of the SECOND
-   256-byte chunk) were both still always exactly 0 -- a real USB
-   short-packet/boundary artifact (many controllers/drivers zero-pad
-   or drop the tail of a transfer that doesn't land on the endpoint's
-   own packet-size granularity) would explain that, rather than "never
-   written" per se. Sampling the EXACT chunk boundaries -- the true
-   last 2 bytes of chunk 1 (254-255) and the first 2 bytes of chunk 2
-   (256-257) -- tests that precisely. */
-static unsigned char debug_c1end_i_g = 0, debug_c1end_q_g = 0;
-static unsigned char debug_c2start_i_g = 0, debug_c2start_q_g = 0;
 
 /* Four different fixes to HOW reads are issued (fixed chunk size,
    4-byte alignment, offset-0 scratch buffer) all failed to move
@@ -678,10 +681,12 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
             debug_mid_q_g = iq_frame_g[251];
             debug_end_i_g = iq_frame_g[IQ_BYTES - 2];
             debug_end_q_g = iq_frame_g[IQ_BYTES - 1];
-            debug_c1end_i_g = iq_frame_g[FIXED_CHUNK_SIZE - 2];
-            debug_c1end_q_g = iq_frame_g[FIXED_CHUNK_SIZE - 1];
-            debug_c2start_i_g = iq_frame_g[FIXED_CHUNK_SIZE];
-            debug_c2start_q_g = iq_frame_g[FIXED_CHUNK_SIZE + 1];
+            /* debug_c1end_*_g/debug_c2start_*_g (chunk-boundary bytes)
+               retired: with FIXED_CHUNK_SIZE now equal to IQ_BYTES,
+               each frame is a single chunk -- there's no second chunk
+               boundary left inside the frame to sample, and indexing
+               iq_frame_g[FIXED_CHUNK_SIZE] would now read one byte past
+               the end of the array. */
             /* raw byte range across the WHOLE frame, not just the first
                4 bytes -- distinguishes "the ADC genuinely sees almost no
                swing" from "the FFT/scaling math is flattening real
