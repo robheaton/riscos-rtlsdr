@@ -428,29 +428,25 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
 
         Wimp_SetColour((int)colour_BLACK);
 
-        /* Isolation test: bin_height_g[NUM_BINS/2] reads 300 (full
-           height) via the on-screen diagnostic, yet nothing visible
-           draws -- this fixed, unconditional, large rectangle (100x100
-           units at a known offset) checks whether GFX_RectangleFill
-           renders AT ALL right now in this exact code path, independent
-           of bin_height_g/ox/oy for the per-bar loop. If this doesn't
-           show either, the bug is in the drawing mechanism itself
-           (colour, coordinate system, VDU state) rather than per-bar
-           logic. Remove once the real cause is found. */
-        GFX_RectangleFill(ox + 50, oy - 150, 100, 100);
-
-        /* Second isolation test: the 100x100 square above proved
-           drawing/colour/coordinates all work. This tests the two
-           things that differ between it and a real (invisible) bar --
-           width 1 instead of 100, and height exactly WORK_HEIGHT
-           (touching the window's top boundary) instead of 100 well
-           inside it -- at a fixed, distinct x so it can't be confused
-           with the square or a real bar. */
-        GFX_RectangleFill(ox + 300, oy - WORK_HEIGHT, 1, WORK_HEIGHT);
-
+        /* Both a fixed 100x100 square AND a fixed 1-wide/WORK_HEIGHT-
+           tall rectangle rendered correctly as standalone calls,
+           proving drawing/colour/coordinates/thin-width/exact-boundary-
+           height are all individually fine. The one thing neither
+           isolation test covered: calling GFX_RectangleFill 256 times
+           in a tight loop where ~255 of those calls are DEGENERATE
+           (bin_height_g[i]==0, since min==max==47 gives near-zero
+           height to almost every non-DC bin) -- a zero-height
+           rectangle-fill may not be a well-behaved OS_Plot code path,
+           and could be corrupting state for later calls in the same
+           loop (which would explain why even the one real, non-zero
+           bar -- the DC bin -- never showed). Skipping zero-height
+           bars costs nothing visually (they're invisible either way)
+           and tests this directly. */
         for (i = 0; i < NUM_BINS; i++) {
-            GFX_RectangleFill(ox + i * BIN_WIDTH_OS, oy - WORK_HEIGHT,
-                               BIN_WIDTH_OS - 1, bin_height_g[i]);
+            if (bin_height_g[i] > 0) {
+                GFX_RectangleFill(ox + i * BIN_WIDTH_OS, oy - WORK_HEIGHT,
+                                   BIN_WIDTH_OS - 1, bin_height_g[i]);
+            }
         }
 
         /* Diagnostic text was 5 lines tall (added while chasing the
