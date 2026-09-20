@@ -427,6 +427,18 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
         oy = r.rect.max.y - r.scroll.y;
 
         Wimp_SetColour((int)colour_BLACK);
+
+        /* Isolation test: bin_height_g[NUM_BINS/2] reads 300 (full
+           height) via the on-screen diagnostic, yet nothing visible
+           draws -- this fixed, unconditional, large rectangle (100x100
+           units at a known offset) checks whether GFX_RectangleFill
+           renders AT ALL right now in this exact code path, independent
+           of bin_height_g/ox/oy for the per-bar loop. If this doesn't
+           show either, the bug is in the drawing mechanism itself
+           (colour, coordinate system, VDU state) rather than per-bar
+           logic. Remove once the real cause is found. */
+        GFX_RectangleFill(ox + 50, oy - 150, 100, 100);
+
         for (i = 0; i < NUM_BINS; i++) {
             GFX_RectangleFill(ox + i * BIN_WIDTH_OS, oy - WORK_HEIGHT,
                                BIN_WIDTH_OS - 1, bin_height_g[i]);
