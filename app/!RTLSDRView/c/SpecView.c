@@ -329,9 +329,20 @@ static void fft256(double *re, double *im)
 
 /* Smoothing factor for the exponential power average -- higher weights
    new frames more (faster response, less noise reduction), lower
-   weights history more (slower response, more noise reduction). 0.05
-   is a first-pass guess (~20-frame effective window), not measured. */
-#define AVG_ALPHA 0.05
+   weights history more (slower response, more noise reduction).
+
+   With real dB contrast finally showing (after fixing the read
+   accumulation bug), a live run showed a dense, "uniformly noisy" bar
+   pattern with no visible bump anywhere -- not the clean, localized
+   ~40dB peak SDR# shows for this same station. A single un-averaged
+   periodogram has high per-bin variance; 0.05's ~20-frame effective
+   window is short enough that this variance may still dominate over
+   the real, persistent signal. Dropping this by 10x (~200-frame
+   window) leans much harder into what averaging is FOR: suppressing
+   per-bin noise so a persistent real signal stands out. Frames
+   complete fast enough now (many per second) that 200 frames is still
+   only a couple of seconds of real time, not an unusably slow response. */
+#define AVG_ALPHA 0.005
 
 static double avg_power_g[NUM_BINS]; /* zero-initialized; power domain */
 
