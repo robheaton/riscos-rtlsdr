@@ -246,6 +246,27 @@ static icon_handle icon_agc_g = 0;
 static icon_handle icon_gaindown_g = 0;
 static icon_handle icon_gainup_g = 0;
 
+/* ---- frequency tuning UI ----
+   Step buttons rather than a writable text-entry icon: matches the
+   gain control's established, already-proven-on-hardware pattern
+   (Click_spectrum, create_button_icon) instead of adding keyboard/
+   caret handling for a first pass. 100kHz matches typical FM broadcast
+   channel spacing (100-200kHz depending on region) -- fine enough to
+   walk onto a station, coarse enough that reaching a distant one
+   doesn't take forever. Range is a broad, safe bound on what the
+   R820T/R828D + this port's freq_ranges table (R82XX.c) can tune to,
+   not a precise hardware limit -- r82xx_set_mux()'s range lookup
+   degrades gracefully (falls back to the table's last entry) above its
+   explicit 650MHz top rather than misbehaving, so this doesn't need to
+   match that table exactly. */
+#define FREQ_STEP_HZ        100000UL
+#define FREQ_MIN_HZ       24000000UL
+#define FREQ_MAX_HZ     1700000000UL
+#define FREQ_DEFAULT_HZ   97400000UL /* local FM broadcast -- see main() */
+static unsigned long tuned_freq_hz_g = FREQ_DEFAULT_HZ;
+static icon_handle icon_freqdown_g = 0;
+static icon_handle icon_frequp_g = 0;
+
 /* Diagnostic-only globals, drawn as a text line during redraw (see
    Redraw_spectrum). Originally added to chase down a real bug: DeviceFS
    pads short reads to the requested size in its default blocking mode
@@ -385,6 +406,23 @@ static void fft256(double *re, double *im)
 #define AVG_ALPHA 0.005
 
 static double avg_power_g[NUM_BINS]; /* zero-initialized; power domain */
+
+/* Retuning to a new frequency (see Click_spectrum's F-/F+ handling)
+   without this would leave avg_power_g[] full of the OLD frequency's
+   averaged spectrum, which the ~200-frame AVG_ALPHA=0.005 window would
+   then blend with the new frequency's real content for a couple of
+   seconds -- a confusing, misleading transition rather than a clean
+   jump. Zeroing it isn't perfectly clean either (finalize_display()'s
+   log10(0+1e-6) floor briefly shows as a very low, flat trace right
+   after a retune until real power accumulates again), but that's an
+   honest "no data yet" state, not a blend of two different stations. */
+static void reset_averaging(void)
+{
+    int i;
+    for (i = 0; i < NUM_BINS; i++) {
+        avg_power_g[i] = 0.0;
+    }
+}
 
 /* min=max=identical raw power at every bin, even after the resource
    fix, rules out both log compression AND noise-averaging statistics
@@ -847,13 +885,17 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                a separate live-updating indirected icon -- keeps the new
                gain control UI simple (three static-label button icons,
                no icon text buffer/validstring plumbing needed) while
-               still showing current state at a glance. */
+               still showing current state at a glance. Frequency
+               (F-/F+, see create_freq_icons/Click_spectrum) shown the
+               same way. */
             if (gain_mode_g == GAIN_MODE_AGC) {
-                sprintf(line1, "min=%.1f max=%.1f G:AGC",
-                        debug_db_min_g, debug_db_max_g);
+                sprintf(line1, "min=%.1f max=%.1f G:AGC %.1fMHz",
+                        debug_db_min_g, debug_db_max_g,
+                        (double)tuned_freq_hz_g / 1.0e6);
             } else {
-                sprintf(line1, "min=%.1f max=%.1f G:M%02d",
-                        debug_db_min_g, debug_db_max_g, gain_index_g);
+                sprintf(line1, "min=%.1f max=%.1f G:M%02d %.1fMHz",
+                        debug_db_min_g, debug_db_max_g, gain_index_g,
+                        (double)tuned_freq_hz_g / 1.0e6);
             }
             /* Stripped lines 2-6 (raw power, byte/sample range, idx/
                nElev, chunk-boundary bytes, got/touched pairs) back out
@@ -919,6 +961,7 @@ static void update_agc_icon(void)
 static BOOL Click_spectrum(event_pollblock *event, void *reference)
 {
     icon_handle icon;
+    int is_gain_icon, is_freq_icon;
 
     UNUSED_ARG(reference);
 
@@ -927,39 +970,72 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
     }
 
     icon = event->data.mouse.icon;
-    if (icon != icon_agc_g && icon != icon_gaindown_g &&
-        icon != icon_gainup_g) {
+    is_gain_icon = (icon == icon_agc_g || icon == icon_gaindown_g ||
+                     icon == icon_gainup_g);
+    is_freq_icon = (icon == icon_freqdown_g || icon == icon_frequp_g);
+    if (!is_gain_icon && !is_freq_icon) {
         return FALSE;
     }
 
     rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x18, 1); /* enable I2C repeater */
 
-    if (icon == icon_agc_g) {
-        if (gain_mode_g == GAIN_MODE_AGC) {
-            gain_mode_g = GAIN_MODE_MANUAL;
-            r82xx_set_gain_manual(&tuner_g, gain_index_g);
+    if (is_gain_icon) {
+        if (icon == icon_agc_g) {
+            if (gain_mode_g == GAIN_MODE_AGC) {
+                gain_mode_g = GAIN_MODE_MANUAL;
+                r82xx_set_gain_manual(&tuner_g, gain_index_g);
+            } else {
+                gain_mode_g = GAIN_MODE_AGC;
+                r82xx_set_gain_agc(&tuner_g);
+            }
         } else {
-            gain_mode_g = GAIN_MODE_AGC;
-            r82xx_set_gain_agc(&tuner_g);
+            /* +/- while in AGC mode switches to manual first, at the
+               default step, rather than doing nothing -- clicking a
+               gain button clearly means "I want manual control now". */
+            if (gain_mode_g == GAIN_MODE_AGC) {
+                gain_mode_g = GAIN_MODE_MANUAL;
+                gain_index_g = GAIN_INDEX_DEFAULT;
+            } else if (icon == icon_gaindown_g && gain_index_g > 0) {
+                gain_index_g--;
+            } else if (icon == icon_gainup_g &&
+                       gain_index_g < GAIN_INDEX_MAX) {
+                gain_index_g++;
+            }
+            r82xx_set_gain_manual(&tuner_g, gain_index_g);
         }
+        update_agc_icon();
     } else {
-        /* +/- while in AGC mode switches to manual first, at the
-           default step, rather than doing nothing -- clicking a gain
-           button clearly means "I want manual control now". */
-        if (gain_mode_g == GAIN_MODE_AGC) {
-            gain_mode_g = GAIN_MODE_MANUAL;
-            gain_index_g = GAIN_INDEX_DEFAULT;
-        } else if (icon == icon_gaindown_g && gain_index_g > 0) {
-            gain_index_g--;
-        } else if (icon == icon_gainup_g && gain_index_g < GAIN_INDEX_MAX) {
-            gain_index_g++;
+        unsigned long new_freq;
+
+        new_freq = tuned_freq_hz_g;
+        if (icon == icon_freqdown_g && new_freq > FREQ_MIN_HZ) {
+            new_freq -= FREQ_STEP_HZ;
+        } else if (icon == icon_frequp_g && new_freq < FREQ_MAX_HZ) {
+            new_freq += FREQ_STEP_HZ;
         }
-        r82xx_set_gain_manual(&tuner_g, gain_index_g);
+
+        if (new_freq != tuned_freq_hz_g) {
+            /* Only commit the new frequency if the tune actually
+               locked -- an attempted retune that failed shouldn't
+               leave the displayed/tracked frequency out of sync with
+               what the tuner is really doing. */
+            if (r82xx_set_freq(&tuner_g, new_freq) == 0 &&
+                tuner_g.has_lock) {
+                tuned_freq_hz_g = new_freq;
+                /* Flush stale, pre-retune samples still sitting in the
+                   device/host buffer (same call main() makes before
+                   the first-ever tune), and discard any partially-
+                   accumulated frame that might otherwise splice
+                   pre-retune bytes with post-retune ones. */
+                rtlsdr_reset_buffer(device_name_g);
+                accum_fill_g = 0;
+                reset_averaging();
+            }
+        }
     }
 
     rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x10, 1); /* disable I2C repeater */
 
-    update_agc_icon();
     return TRUE;
 }
 
@@ -1104,6 +1180,15 @@ static void create_gain_icons(window_handle win)
     icon_gainup_g = create_button_icon(win, 144, 184, "+");
 }
 
+/* Same row as the gain buttons (create_button_icon's fixed y -60..-92),
+   positioned to their right -- WORK_WIDTH is 512, this uses up to
+   x=348, leaving clear margin. */
+static void create_freq_icons(window_handle win)
+{
+    icon_freqdown_g = create_button_icon(win, 220, 280, "F-");
+    icon_frequp_g = create_button_icon(win, 288, 348, "F+");
+}
+
 int main(void)
 {
     int n;
@@ -1132,7 +1217,9 @@ int main(void)
         rc = r82xx_init(&tuner_g, device_name_g);
     }
     if (rc == 0) {
-        rc = r82xx_set_freq(&tuner_g, 97400000UL); /* 97.4MHz, local FM broadcast */
+        rc = r82xx_set_freq(&tuner_g, tuned_freq_hz_g); /* FREQ_DEFAULT_HZ:
+                                                             97.4MHz, local
+                                                             FM broadcast */
     }
     /* Manual max gain was tested unconditionally here earlier this
        session and judged first "no measurable difference", then (after
@@ -1174,6 +1261,7 @@ int main(void)
 
     spectrum_window_g = create_spectrum_window();
     create_gain_icons(spectrum_window_g);
+    create_freq_icons(spectrum_window_g);
     update_agc_icon(); /* reflect gain_mode_g's initial AGC state */
     Window_Show(spectrum_window_g, open_CENTERED);
 
