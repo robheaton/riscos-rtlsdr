@@ -1246,3 +1246,43 @@ Sources:
 - [DeviceFS source (gitlab.riscosopen.org)](https://gitlab.riscosopen.org/RiscOS/Sources/HWSupport/DeviceFS)
 - [OS_Args (riscosopen.org wiki)](https://www.riscosopen.org/wiki/documentation/show/OS_Args)
 - [IOCtl Reason Codes (riscosopen.org wiki)](https://www.riscosopen.org/wiki/documentation/show/IOCtl%20Reason%20Codes)
+
+## Phase 2, follow-on: a second real bug -- degenerate zero-height plots
+
+With the read fix wired in, a real run (no antenna) showed reads
+healthy (`ok` climbing, `bad=0`) but STILL nothing visible drawn -- not
+even the DC spike every earlier run had shown. Reconnecting the antenna
+and re-running gave the same result: `min=49 max=49 dc=93 h=300` (the
+diagnostic line now shows the actual computed `bin_height_g` for the DC
+bin) -- the SCALE MATH was correct (44dB separation should clip the DC
+bar to full height), but nothing rendered.
+
+**Isolated with two targeted tests** rather than more guessing: (1) a
+fixed, unconditional 100x100-unit black square, independent of
+`bin_height_g`/`ox`/`oy` -- rendered correctly, proving
+`GFX_RectangleFill`/`Wimp_SetColour`/coordinate math all work; (2) a
+fixed 1-unit-wide, `WORK_HEIGHT`-tall rectangle (matching a real bar's
+exact shape) at a distinct position -- ALSO rendered correctly, ruling
+out thin-width and exact-boundary-height as the cause individually.
+
+**Root cause**: calling `GFX_RectangleFill` 256 times in a tight loop,
+where ~255 of those calls are degenerate (`bin_height_g[i]==0`, since a
+near-flat spectrum gives almost every non-DC bin zero height after
+auto-scaling) -- a zero-height rectangle-fill is apparently not a
+well-behaved `OS_Plot` code path when called in volume, and was
+corrupting state badly enough that even the one genuinely tall bar (the
+DC bin) never rendered. **Fix**: skip the `GFX_RectangleFill` call
+entirely when `bin_height_g[i] == 0` (costs nothing visually -- a
+zero-height bar is invisible either way). **Confirmed on real
+hardware**: the DC bar is visible again, centred, exactly where
+expected.
+
+**Where this leaves phase 2**: the architecture is now proven with
+BOTH real bugs found this session fixed (DeviceFS's read-padding, and
+degenerate-plot rendering) -- reads are honest, the FFT/scale math is
+correct, and rendering is correct. What remains is the same open
+question from before this detour: the non-DC spectrum is genuinely
+close to flat (`min`/`max` a couple of dB apart, at most), so the
+97.4MHz station isn't visually standing out from the noise floor. That
+is now known to be a real signal-conditions/gain question, not a
+software bug hiding behind it.
