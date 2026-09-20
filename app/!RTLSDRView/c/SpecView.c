@@ -69,6 +69,16 @@
                                                      without crowding the
                                                      bars below it */
 
+/* Space reserved at the TOP of the window for the diagnostic text line
+   and the gain-control icons (create_gain_icons -- their row sits at
+   y -60..-92), so a tall bar can never grow up into and visually cover
+   them. Bars are Wimp-drawn graphics in the app's own redraw loop, not
+   icons, so nothing stops them overlapping icons except keeping their
+   own max height below where the icons start. finalize_display() scales
+   into BAR_MAX_HEIGHT, not the full WORK_HEIGHT. */
+#define RESERVED_TOP    100
+#define BAR_MAX_HEIGHT  (WORK_HEIGHT - RESERVED_TOP)
+
 /* Redraw throttle, separate from how aggressively Null_spectrum drains
    the USB stream (see MAX_READ_ATTEMPTS there) -- redraw only every
    UPDATE_INTERVAL_CS centiseconds so a plain full-window repaint at
@@ -207,6 +217,34 @@ static int accum_fill_g = 0;
 static int bin_height_g[NUM_BINS];
 static unsigned int next_update_time_g;
 static window_handle spectrum_window_g;
+
+/* r82xx_t used to be a local in main() -- the gain-control icon click
+   handler (Click_spectrum, below) needs to call r82xx_set_gain_agc()/
+   r82xx_set_gain_manual() on it too, so it's file-scope now. Safe: it's
+   still only ever initialised once in main() before the window/icons
+   are created (so no handler can run before it's valid), and main()
+   never returns. */
+static r82xx_t tuner_g;
+
+/* ---- gain control UI ---- */
+#define GAIN_MODE_AGC     0
+#define GAIN_MODE_MANUAL  1
+#define GAIN_INDEX_MAX    15   /* r82xx_set_gain_manual()'s step range */
+#define GAIN_INDEX_DEFAULT 8   /* first manual step, when switching away
+                                   from AGC via +/- rather than a direct
+                                   AGC-off click -- mid-range, not max
+                                   (max gain was the leading suspect for
+                                   the ADC-overload pattern chased
+                                   earlier this session -- see
+                                   docs/PLAN.md -- even though removing
+                                   it made no measurable difference,
+                                   starting manual mode at max again by
+                                   default isn't well-motivated). */
+static int gain_mode_g = GAIN_MODE_AGC;
+static int gain_index_g = GAIN_INDEX_DEFAULT;
+static icon_handle icon_agc_g = 0;
+static icon_handle icon_gaindown_g = 0;
+static icon_handle icon_gainup_g = 0;
 
 /* Diagnostic-only globals, drawn as a text line during redraw (see
    Redraw_spectrum). Originally added to chase down a real bug: DeviceFS
@@ -495,9 +533,9 @@ static void finalize_display(void)
     debug_max_offset_g = max_bin - centre;
 
     for (i = 0; i < NUM_BINS; i++) {
-        scaled = (db[i] - db_min) / range * (double)WORK_HEIGHT;
-        if (scaled > (double)WORK_HEIGHT) {
-            scaled = (double)WORK_HEIGHT;
+        scaled = (db[i] - db_min) / range * (double)BAR_MAX_HEIGHT;
+        if (scaled > (double)BAR_MAX_HEIGHT) {
+            scaled = (double)BAR_MAX_HEIGHT;
         }
         if (scaled < 0.0) {
             scaled = 0.0;
@@ -805,8 +843,18 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                two identical-looking rounded integers. Getting the true
                numbers beats guessing at another architectural change
                blind. */
-            sprintf(line1, "min=%.2f max=%.2f",
-                    debug_db_min_g, debug_db_max_g);
+            /* Gain state appended compactly (G:AGC / G:M08) rather than
+               a separate live-updating indirected icon -- keeps the new
+               gain control UI simple (three static-label button icons,
+               no icon text buffer/validstring plumbing needed) while
+               still showing current state at a glance. */
+            if (gain_mode_g == GAIN_MODE_AGC) {
+                sprintf(line1, "min=%.1f max=%.1f G:AGC",
+                        debug_db_min_g, debug_db_max_g);
+            } else {
+                sprintf(line1, "min=%.1f max=%.1f G:M%02d",
+                        debug_db_min_g, debug_db_max_g, gain_index_g);
+            }
             /* Stripped lines 2-6 (raw power, byte/sample range, idx/
                nElev, chunk-boundary bytes, got/touched pairs) back out
                of the DRAWN display -- this is the exact same mistake
@@ -841,6 +889,78 @@ static BOOL Close_spectrum(event_pollblock *event, void *reference)
     UNUSED_ARG(reference);
     cleanup_and_exit();
     return TRUE; /* unreached */
+}
+
+/* icon_agc_g's "pressed in" look tracks whether AGC is currently
+   active, matching the standard RISC OS toggle-button convention.
+   Wimp_SetIconState's (value, mask) pair: only bits set in mask are
+   touched, and within those, value's bits are the new state -- so
+   mask=value=just the `selected` bit sets it, mask=selected/value=0
+   clears it. Building both through the icon_flags union rather than a
+   hand-computed hex bitmask keeps this correct if the struct layout
+   ever changes. */
+static void update_agc_icon(void)
+{
+    icon_flags mask, value;
+
+    memset(&mask, 0, sizeof(mask));
+    memset(&value, 0, sizeof(value));
+    mask.data.selected = 1;
+    value.data.selected = (gain_mode_g == GAIN_MODE_AGC) ? 1 : 0;
+
+    Wimp_SetIconState(spectrum_window_g, icon_agc_g, value.value,
+                       mask.value);
+}
+
+/* All three gain buttons need the I2C repeater enabled around the
+   register write, same as main()'s own init/tune bracket -- the
+   repeater is disabled the rest of the time, and this handler runs
+   long after that initial bracket closed. */
+static BOOL Click_spectrum(event_pollblock *event, void *reference)
+{
+    icon_handle icon;
+
+    UNUSED_ARG(reference);
+
+    if (!event->data.mouse.button.data.select) {
+        return FALSE; /* only Select clicks drive these buttons */
+    }
+
+    icon = event->data.mouse.icon;
+    if (icon != icon_agc_g && icon != icon_gaindown_g &&
+        icon != icon_gainup_g) {
+        return FALSE;
+    }
+
+    rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x18, 1); /* enable I2C repeater */
+
+    if (icon == icon_agc_g) {
+        if (gain_mode_g == GAIN_MODE_AGC) {
+            gain_mode_g = GAIN_MODE_MANUAL;
+            r82xx_set_gain_manual(&tuner_g, gain_index_g);
+        } else {
+            gain_mode_g = GAIN_MODE_AGC;
+            r82xx_set_gain_agc(&tuner_g);
+        }
+    } else {
+        /* +/- while in AGC mode switches to manual first, at the
+           default step, rather than doing nothing -- clicking a gain
+           button clearly means "I want manual control now". */
+        if (gain_mode_g == GAIN_MODE_AGC) {
+            gain_mode_g = GAIN_MODE_MANUAL;
+            gain_index_g = GAIN_INDEX_DEFAULT;
+        } else if (icon == icon_gaindown_g && gain_index_g > 0) {
+            gain_index_g--;
+        } else if (icon == icon_gainup_g && gain_index_g < GAIN_INDEX_MAX) {
+            gain_index_g++;
+        }
+        r82xx_set_gain_manual(&tuner_g, gain_index_g);
+    }
+
+    rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x10, 1); /* disable I2C repeater */
+
+    update_agc_icon();
+    return TRUE;
 }
 
 static BOOL Quit_message(event_pollblock *event, void *reference)
@@ -936,11 +1056,58 @@ static window_handle create_spectrum_window(void)
     return win;
 }
 
+/* One shared helper for the three gain-control buttons -- same look
+   (bordered, filled, centred text, buttontype 3 "Click": Select
+   generates a single Mouse_Click event, the standard RISC OS push-
+   button behaviour), just different position/label. Icons are
+   positioned in a row below the diagnostic text line (which sits at
+   the top, see Redraw_spectrum's line1), clear of both it and the bars
+   below (WORK_HEIGHT is 360; this row uses y -60..-92, well inside
+   that with room to spare on both sides). */
+static icon_handle create_button_icon(window_handle win, int x0, int x1,
+                                       const char *label)
+{
+    icon_createblock cb;
+    icon_handle icon;
+    os_error *err;
+
+    memset(&cb, 0, sizeof(cb));
+    cb.window = win;
+    cb.icondata.workarearect.min.x = x0;
+    cb.icondata.workarearect.min.y = -92;
+    cb.icondata.workarearect.max.x = x1;
+    cb.icondata.workarearect.max.y = -60;
+
+    cb.icondata.flags.data.text = 1;
+    cb.icondata.flags.data.border = 1;
+    cb.icondata.flags.data.hcentre = 1;
+    cb.icondata.flags.data.vcentre = 1;
+    cb.icondata.flags.data.filled = 1;
+    cb.icondata.flags.data.buttontype = 3; /* Click -- Select = one click */
+    cb.icondata.flags.data.foreground = colour_BLACK;
+    cb.icondata.flags.data.background = colour_GREY1;
+
+    strncpy(cb.icondata.data.text, label, wimp_MAXNAME - 1);
+    cb.icondata.data.text[wimp_MAXNAME - 1] = '\0';
+
+    err = Wimp_CreateIcon(&cb, &icon);
+    if (err != NULL) {
+        report_and_die(err->errmess);
+    }
+    return icon;
+}
+
+static void create_gain_icons(window_handle win)
+{
+    icon_agc_g = create_button_icon(win, 8, 88, "AGC");
+    icon_gaindown_g = create_button_icon(win, 96, 136, "-");
+    icon_gainup_g = create_button_icon(win, 144, 184, "+");
+}
+
 int main(void)
 {
     int n;
     int rc;
-    r82xx_t tuner;
     char path[64];
 
     Event_Initialise("RTLSDRView");
@@ -962,27 +1129,28 @@ int main(void)
     rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x18, 1); /* enable I2C repeater */
     rc = rtlsdr_tuner_postinit(device_name_g);
     if (rc == 0) {
-        rc = r82xx_init(&tuner, device_name_g);
+        rc = r82xx_init(&tuner_g, device_name_g);
     }
     if (rc == 0) {
-        rc = r82xx_set_freq(&tuner, 97400000UL); /* 97.4MHz, local FM broadcast */
+        rc = r82xx_set_freq(&tuner_g, 97400000UL); /* 97.4MHz, local FM broadcast */
     }
-    /* Manual max gain (r82xx_set_gain_max) was tested here and judged
-       "no measurable difference" -- but that was measured with a coarse
-       1-decimal dB min/max, before the byte/sample-level diagnostics
-       (see docs/PLAN.md) existed. Those now show every frame is
-       dominated by exactly ONE sample (idx@0, nElev=1, rock-solid
-       across many separate runs) with the other 255 essentially pinned
-       to the frame's own mean -- the signature of a clipped/saturated
-       ADC (most samples slammed against a rail, occasional sample
-       catching a brief unclipped transition), not of a healthy
-       noise+signal capture. Forcing gain to ABSOLUTE MAXIMUM on top of
-       an already-strong local FM signal (confirmed ~40dB in SDR#) is a
-       very plausible way to cause exactly that overload. Testing with
-       AGC left alone (upstream's own default -- see R82XX.h) instead
-       of forcing max gain, to see if this pattern goes away. */
+    /* Manual max gain was tested unconditionally here earlier this
+       session and judged first "no measurable difference", then (after
+       byte-level diagnostics existed) a plausible ADC-overload cause,
+       then ruled back out again when removing it made no difference to
+       the deeper read-accumulation bug that turned out to be the real
+       issue (see docs/PLAN.md). Gain is now a live, user-driven choice
+       instead of a fixed startup decision either way -- AGC is only
+       the STARTING state (explicitly set here so software state
+       (gain_mode_g) is guaranteed to match hardware register state,
+       rather than relying on the init array's own default), and the
+       gain control icons (create_gain_icons, Click_spectrum) let the
+       user switch to manual and step through it live. */
+    if (rc == 0) {
+        rc = r82xx_set_gain_agc(&tuner_g);
+    }
     rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x10, 1); /* disable I2C repeater */
-    if (rc != 0 || !tuner.has_lock) {
+    if (rc != 0 || !tuner_g.has_lock) {
         report_and_die("Tuner init/tune to 97.4MHz failed -- see "
                         "!RTLSDR's diagnostic output for details.");
     }
@@ -1005,10 +1173,13 @@ int main(void)
     }
 
     spectrum_window_g = create_spectrum_window();
+    create_gain_icons(spectrum_window_g);
+    update_agc_icon(); /* reflect gain_mode_g's initial AGC state */
     Window_Show(spectrum_window_g, open_CENTERED);
 
     Event_Claim(event_REDRAW, spectrum_window_g, event_ANY, Redraw_spectrum, NULL);
     Event_Claim(event_CLOSE, spectrum_window_g, event_ANY, Close_spectrum, NULL);
+    Event_Claim(event_CLICK, spectrum_window_g, event_ANY, Click_spectrum, NULL);
     Event_Claim(event_USERMESSAGE, event_ANY, event_ANY, Quit_message, NULL);
     Event_Claim(event_NULL, event_ANY, event_ANY, Null_spectrum, NULL);
 

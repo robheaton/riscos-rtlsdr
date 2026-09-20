@@ -792,6 +792,17 @@ int r82xx_set_freq(r82xx_t *t, unsigned long freq_hz)
     return 0;
 }
 
+/* Reverses the manual-mode auto-off bits below, matching upstream's own
+   default (the untouched init array -- see R82XX.h/docs/PLAN.md). */
+int r82xx_set_gain_agc(r82xx_t *t)
+{
+    int rc;
+
+    rc = r82xx_write_reg_mask(t, 0x05, 0x00, 0x10); /* LNA auto on */
+    if (rc < 0) return rc;
+    return r82xx_write_reg_mask(t, 0x07, 0x10, 0x10); /* Mixer auto on */
+}
+
 /* Verbatim register-write shape from upstream r82xx_set_gain()'s
    set_manual_gain branch (real source, fetched and read directly --
    see docs/PLAN.md): LNA auto-off is reg 0x05 bit4=1, Mixer auto-off is
@@ -800,21 +811,27 @@ int r82xx_set_freq(r82xx_t *t, unsigned long freq_hz)
    each register (mask 0x0f). Upstream's r82xx_set_vga_gain() (the fixed
    0x08/16.3dB write, already ported as part of every retune) is called
    as part of the same manual-mode path upstream, so no separate VGA
-   write is needed here. Index 15 (0x0f) is the maximum step in both
-   r82xx_lna_gain_steps[] and r82xx_mixer_gain_steps[] -- going straight
-   there instead of porting upstream's incremental target-gain search
-   loop, since there's no specific target here, just maximum
-   sensitivity. */
-int r82xx_set_gain_max(r82xx_t *t)
+   write is needed here. index is clamped to 0-15 (the range of both
+   r82xx_lna_gain_steps[] and r82xx_mixer_gain_steps[] upstream, which
+   aren't themselves ported yet -- this driver doesn't convert an index
+   to a real dB value, it just exposes the raw step). */
+int r82xx_set_gain_manual(r82xx_t *t, int index)
 {
     int rc;
+
+    if (index < 0) {
+        index = 0;
+    }
+    if (index > 15) {
+        index = 15;
+    }
 
     rc = r82xx_write_reg_mask(t, 0x05, 0x10, 0x10); /* LNA auto off */
     if (rc < 0) return rc;
     rc = r82xx_write_reg_mask(t, 0x07, 0x00, 0x10); /* Mixer auto off */
     if (rc < 0) return rc;
-    rc = r82xx_write_reg_mask(t, 0x05, 0x0f, 0x0f); /* LNA gain = max */
+    rc = r82xx_write_reg_mask(t, 0x05, index, 0x0f); /* LNA gain index */
     if (rc < 0) return rc;
-    rc = r82xx_write_reg_mask(t, 0x07, 0x0f, 0x0f); /* Mixer gain = max */
+    rc = r82xx_write_reg_mask(t, 0x07, index, 0x0f); /* Mixer gain index */
     return rc;
 }

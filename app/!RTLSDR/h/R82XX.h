@@ -42,18 +42,25 @@ int r82xx_init(r82xx_t *t, const char *dev_name);
    Returns 0 on success (check t->has_lock), negative on I2C failure. */
 int r82xx_set_freq(r82xx_t *t, unsigned long freq_hz);
 
-/* Forces manual maximum LNA+Mixer gain (bypassing AGC), matching
-   upstream's r82xx_set_gain(priv, 1, <max>) manual-mode register
-   writes verbatim (LNA/Mixer auto-off bits, gain index bits) but
-   skipping upstream's incremental target-gain search loop and going
-   straight to the maximum index (15) for both -- there's no partial
-   target here, just "most sensitive". Call after r82xx_set_freq() has
-   locked. Not part of r82xx_set_freq()/r82xx_init() itself: AGC
-   (already enabled by the untouched init array, confirmed against
-   upstream's own auto-mode register bits -- see docs/PLAN.md) is
-   upstream's own default, so this is an explicit opt-in for testing
-   whether more gain helps, not a "fix" to the normal bring-up
-   sequence. Returns 0 on success, negative on I2C failure. */
-int r82xx_set_gain_max(r82xx_t *t);
+/* Re-enables AGC for both LNA and Mixer (reg 0x05 bit4=0, reg 0x07
+   bit4=1 -- opposite polarity between the two, confirmed from real
+   upstream source, see R82XX.c). This is the untouched init array's
+   own default (see docs/PLAN.md), so calling it is only needed to
+   return to AGC after a prior r82xx_set_gain_manual() call. The I2C
+   repeater must be enabled first (same as r82xx_set_freq()/
+   r82xx_set_gain_manual()). Returns 0 on success, negative on I2C
+   failure. */
+int r82xx_set_gain_agc(r82xx_t *t);
+
+/* Forces manual LNA+Mixer gain at a specific step, matching upstream's
+   r82xx_set_gain(priv, 1, <target>) manual-mode register writes
+   verbatim (LNA/Mixer auto-off bits, gain index in the low 4 bits of
+   each register) but taking a direct step index (0-15, clamped) rather
+   than porting upstream's incremental target-dB search loop -- this
+   driver doesn't yet have the real upstream gain-step-to-dB tables
+   ported, so a raw step index is what the gain control UI exposes.
+   Call after r82xx_set_freq() has locked, with the I2C repeater
+   enabled. Returns 0 on success, negative on I2C failure. */
+int r82xx_set_gain_manual(r82xx_t *t, int index);
 
 #endif /* R82XX_H */
