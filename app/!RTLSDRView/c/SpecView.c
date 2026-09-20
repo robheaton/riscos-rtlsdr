@@ -371,7 +371,22 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
         if (got == 0) {
             break;
         }
-        accum_fill_g += got;
+        /* Only count whole I/Q pairs. want is always even (IQ_BYTES and
+           accum_fill_g are both kept even by this same rule), but the
+           SWI decides how much to actually deliver -- if that "got"
+           happens to be odd (very plausible once want stops being a
+           round power of two, which milestone 5's sentinel test never
+           exercised), accepting it as-is would leave accum_fill_g odd,
+           permanently shifting every iq_frame_g[2*i]/[2*i+1] I/Q
+           pairing by one byte for the rest of the frame -- silently
+           swapping I and Q with the wrong neighbours. That would
+           scramble frequency content while leaving the DC sum (order-
+           independent) untouched, which matches exactly what real runs
+           have shown: real signal present, DC always the same, every
+           other bin flat. Dropping a lone trailing byte here (left in
+           the buffer to be overwritten next read) costs one sample out
+           of many thousands and keeps pairing intact throughout. */
+        accum_fill_g += got & ~1;
         if (accum_fill_g < IQ_BYTES) {
             continue;
         }
