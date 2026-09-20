@@ -71,7 +71,8 @@
    native Wimp_Poll rate doesn't waste CPU/flicker. */
 #define UPDATE_INTERVAL_CS 20   /* ~5Hz redraw */
 
-/* compute_spectrum() auto-scales EACH FRAME's own min/max dB range to
+/* finalize_display() auto-scales the (now power-averaged) min/max dB
+   range to
    the window height, rather than using a fixed DB_FLOOR/DB_CEIL -- three
    iterations of guessing a fixed range (see docs/PLAN.md) kept failing
    because the right constant depends on absolute signal strength, which
@@ -236,50 +237,56 @@ static void fft256(double *re, double *im)
 /* Converts the last-read I/Q frame to power-spectrum bar heights,
    FFT-shifted so the tuned frequency sits in the middle of the display
    (bin 0 of a complex FFT is 0Hz baseband; negative frequencies wrap to
-   the upper half, so swapping halves gives the usual centred view). */
-static void compute_spectrum(void)
+   the upper half, so swapping halves gives the usual centred view).
+
+   Split into two halves: accumulate_frame() FFTs one completed frame
+   and folds its power into a running average (called every time
+   Null_spectrum finishes a frame, which can happen many times a
+   second -- much faster than the ~5Hz display rate); finalize_display()
+   converts the current running average into bar heights (called only
+   at the throttled display rate). Averaging happens in the POWER
+   (linear) domain across many frames before ever taking a log, not by
+   averaging dB values -- log of an average is not the same as an
+   average of logs, and only power-domain averaging reduces a single
+   raw FFT snapshot's high per-bin variance the way real spectrum
+   analyzers' "trace averaging" does. A live run found the previous
+   single-snapshot-per-display-update approach was detecting a real,
+   rock-solid-consistent signal (proving genuine detection, not noise --
+   see docs/PLAN.md) but measuring almost no contrast between it and
+   the noise floor, which is consistent with exactly this kind of
+   un-averaged periodogram variance, not a wiring bug. */
+
+/* Smoothing factor for the exponential power average -- higher weights
+   new frames more (faster response, less noise reduction), lower
+   weights history more (slower response, more noise reduction). 0.05
+   is a first-pass guess (~20-frame effective window), not measured. */
+#define AVG_ALPHA 0.05
+
+static double avg_power_g[NUM_BINS]; /* zero-initialized; power domain */
+
+static void accumulate_frame(void)
 {
     static double re[FFT_SIZE];
     static double im[FFT_SIZE];
-    static double db[NUM_BINS];
-    int i;
-    int src;
-    int centre;
-    int max_bin;
-    double power, scaled;
-    double db_min, db_max, range;
+    int i, src;
+    double sum_re, sum_im, mean_re, mean_im, power;
 
-    {
-        /* DC removal: subtract this FRAME'S OWN measured mean, not just
-           the fixed assumed centre (127.5). dc has read ~93dB on every
-           single run regardless of antenna/gain/any fix so far, while
-           the user directly confirmed (watching the live display) that
-           min/max genuinely fluctuate 28-51dB over time -- so the
-           pipeline is live, but something is suppressing the ~40dB
-           station signal independently confirmed present with this
-           exact dongle+antenna in SDR# on Windows. Real spectrum
-           analyzers remove DC bias before the FFT specifically because
-           a real hardware DC offset can spectrally leak into and swamp
-           NEARBY bins too, not just the exact centre one -- excluding
-           only DC_EXCLUDE_BINS=2 bins from the *display scale*
-           calculation (below) does nothing to stop that leakage from
-           corrupting the FFT's own bins in the first place. Subtracting
-           the frame's actual mean (not the fixed 127.5) removes the
-           true DC component at its source, however large it is,
-           instead of just hiding it from the scale calculation. */
-        double sum_re, sum_im, mean_re, mean_im;
-        sum_re = 0.0;
-        sum_im = 0.0;
-        for (i = 0; i < FFT_SIZE; i++) {
-            sum_re += (double)iq_frame_g[2 * i] - 127.5;
-            sum_im += (double)iq_frame_g[2 * i + 1] - 127.5;
-        }
-        mean_re = sum_re / (double)FFT_SIZE;
-        mean_im = sum_im / (double)FFT_SIZE;
-        for (i = 0; i < FFT_SIZE; i++) {
-            re[i] = ((double)iq_frame_g[2 * i] - 127.5) - mean_re;
-            im[i] = ((double)iq_frame_g[2 * i + 1] - 127.5) - mean_im;
-        }
+    /* DC removal: subtract this FRAME'S OWN measured mean, not just the
+       fixed assumed centre (127.5) -- see docs/PLAN.md for why a real
+       hardware DC bias needs removing at the source (it spectrally
+       leaks into nearby bins too, not just the exact centre one), not
+       just excluded from the display-scale calculation. */
+    sum_re = 0.0;
+    sum_im = 0.0;
+    for (i = 0; i < FFT_SIZE; i++) {
+        sum_re += (double)iq_frame_g[2 * i] - 127.5;
+        sum_im += (double)iq_frame_g[2 * i + 1] - 127.5;
+    }
+    mean_re = sum_re / (double)FFT_SIZE;
+    mean_im = sum_im / (double)FFT_SIZE;
+    for (i = 0; i < FFT_SIZE; i++) {
+        re[i] = ((double)iq_frame_g[2 * i] - 127.5) - mean_re;
+        im[i] = ((double)iq_frame_g[2 * i + 1] - 127.5) - mean_im;
     }
 
     fft256(re, im);
@@ -287,20 +294,26 @@ static void compute_spectrum(void)
     for (i = 0; i < NUM_BINS; i++) {
         src = (i + NUM_BINS / 2) % NUM_BINS;
         power = re[src] * re[src] + im[src] * im[src];
-        /* Epsilon just needs to avoid log10(0) -- it must NOT be large
-           enough to compete with real power values. It used to be +1.0,
-           chosen back when a huge, un-removed DC bias (power ~10^9)
-           made the epsilon irrelevant by comparison. Now that DC
-           removal (see above) correctly reduces typical per-bin power
-           to much smaller values, that same +1.0 can dominate for any
-           bin with power well under 1 -- crushing real dB differences
-           down to a fraction of a dB, which is exactly what a live run
-           showed: a real, ROCK-SOLID-CONSISTENT peak position (proving
-           a genuine, stable signal, not noise -- random noise would
-           shuffle which bin "wins" frame to frame) that still only
-           barely edged out min/max in the rounded display. 1e-6 avoids
-           the log10(0) case without swamping realistic power values. */
-        db[i] = 10.0 * log10(power + 1e-6);
+        avg_power_g[i] = avg_power_g[i] * (1.0 - AVG_ALPHA) + power * AVG_ALPHA;
+    }
+}
+
+static void finalize_display(void)
+{
+    static double db[NUM_BINS];
+    int i;
+    int centre;
+    int max_bin;
+    double scaled;
+    double db_min, db_max, range;
+
+    for (i = 0; i < NUM_BINS; i++) {
+        /* Epsilon just needs to avoid log10(0) -- see docs/PLAN.md for
+           why this must stay small (1e-6) rather than the +1.0 it used
+           to be, which was harmless only while DC dominated everything
+           by a factor of ~10^9 and became a real dynamic-range-crushing
+           bug once that was fixed. */
+        db[i] = 10.0 * log10(avg_power_g[i] + 1e-6);
     }
 
     /* Auto-scale to this frame's own dynamic range (see the
@@ -466,11 +479,22 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
                     debug_byte_max_g = iq_frame_g[j];
                 }
             }
+
+            /* FFT this frame and fold it into the running power
+               average NOW, every time a frame completes -- which can
+               happen many times a second, far faster than the ~5Hz
+               display throttle below. Averaging as many frames as
+               actually arrive (rather than only the single one that
+               happens to be latest when the display updates) is the
+               whole point: it's what reduces a single raw FFT
+               snapshot's high per-bin variance. See the comment above
+               accumulate_frame(). */
+            accumulate_frame();
         }
     }
 
     if (any_ok && Time_Monotonic() >= next_update_time_g) {
-        compute_spectrum();
+        finalize_display();
         Window_ForceRedraw(spectrum_window_g, 0, -WORK_HEIGHT, WORK_WIDTH, 0);
         next_update_time_g = Time_Monotonic() + UPDATE_INTERVAL_CS;
     }

@@ -1435,4 +1435,35 @@ power well under 1 -- crushing real dB differences down to a fraction
 of a dB, exactly matching the observed "peak position is rock-solid
 but barely measurable" result. Changed the epsilon to `1e-6` (small
 enough to avoid `log10(0)` without swamping realistic power values).
-Pending a real run.
+
+**Real run: no change.** `min=45 max=45 pk@+3` -- identical to before
+the epsilon fix, `pk@` still rock-solid. Epsilon ruled out as the
+(sole) cause.
+
+## Phase 2, follow-on: power-domain frame averaging
+
+Reframed: the epsilon fix not mattering, combined with `pk@` staying
+perfectly consistent across many seconds of live observation, points
+at something more fundamental than a scaling constant -- a single, raw,
+un-averaged 256-point FFT snapshot ("periodogram") is well known in DSP
+to have high per-bin variance even for genuinely strong, real signals;
+only averaging many such snapshots together reveals the true
+signal-to-noise ratio clearly. This is exactly what SDR#'s clean ~40dB
+display relies on and this project had never done -- every previous
+run computed and displayed a single instantaneous snapshot, discarding
+every other frame that completed between display updates (which, given
+the fast honest-read throughput this project has, could be many per
+second).
+
+Split `compute_spectrum()` into two functions: `accumulate_frame()`
+(DC removal, FFT, power computation, folded into a running exponential
+average in the POWER/linear domain) now runs every time a frame
+completes in `Null_spectrum()` -- which can happen many times a second,
+not just at the ~5Hz display rate -- so many more real frames
+contribute to what gets shown. `finalize_display()` (auto-scale,
+peak-bin tracking, bar heights) runs only at the throttled display
+rate, converting the current running average to dB and pixels.
+Averaging must happen in the power domain, not by averaging dB values
+directly (log of an average is not the same as an average of logs).
+`AVG_ALPHA=0.05` (an exponential moving average, ~20-frame effective
+window) is a first-pass guess, not measured. Pending a real run.
