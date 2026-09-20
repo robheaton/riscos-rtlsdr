@@ -222,6 +222,19 @@ static double debug_raw_max_g = 0.0;
    ~125 (buffer middle) and sample 255 (buffer end). */
 static unsigned char debug_mid_i_g = 0, debug_mid_q_g = 0;
 static unsigned char debug_end_i_g = 0, debug_end_q_g = 0;
+/* g==t==256 every read (sentinel test) proves every byte genuinely
+   gets WRITTEN by the SWI -- ruling out padding. But debug_mid_*_g
+   (byte 250-251, near the end of the FIRST 256-byte chunk) and
+   debug_end_*_g (byte 510-511, the EXACT last 2 bytes of the SECOND
+   256-byte chunk) were both still always exactly 0 -- a real USB
+   short-packet/boundary artifact (many controllers/drivers zero-pad
+   or drop the tail of a transfer that doesn't land on the endpoint's
+   own packet-size granularity) would explain that, rather than "never
+   written" per se. Sampling the EXACT chunk boundaries -- the true
+   last 2 bytes of chunk 1 (254-255) and the first 2 bytes of chunk 2
+   (256-257) -- tests that precisely. */
+static unsigned char debug_c1end_i_g = 0, debug_c1end_q_g = 0;
+static unsigned char debug_c2start_i_g = 0, debug_c2start_q_g = 0;
 
 /* Four different fixes to HOW reads are issued (fixed chunk size,
    4-byte alignment, offset-0 scratch buffer) all failed to move
@@ -654,6 +667,10 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
             debug_mid_q_g = iq_frame_g[251];
             debug_end_i_g = iq_frame_g[IQ_BYTES - 2];
             debug_end_q_g = iq_frame_g[IQ_BYTES - 1];
+            debug_c1end_i_g = iq_frame_g[FIXED_CHUNK_SIZE - 2];
+            debug_c1end_q_g = iq_frame_g[FIXED_CHUNK_SIZE - 1];
+            debug_c2start_i_g = iq_frame_g[FIXED_CHUNK_SIZE];
+            debug_c2start_q_g = iq_frame_g[FIXED_CHUNK_SIZE + 1];
             /* raw byte range across the WHOLE frame, not just the first
                4 bytes -- distinguishes "the ADC genuinely sees almost no
                swing" from "the FFT/scaling math is flattening real
@@ -829,17 +846,19 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                 GFX_Write0(line4);
                 GFX_VDU(4);
             }
-            /* The actual raw bytes (not derived stats) at frame start
-               (already have debug_first_bytes_g[0]/[1]), middle
-               (sample ~125), and end (sample 255) -- direct proof of
-               whether the buffer's tail is genuinely fresh data or
-               frozen at a fixed value every frame. */
+            /* g==t==256 every read rules out padding (see
+               debug_c1end_*_g comment above) -- so these test whether
+               it's specifically a USB short-packet/boundary artifact:
+               c1e = the EXACT last 2 bytes of chunk 1 (byte 254-255),
+               c2s = the EXACT first 2 bytes of chunk 2 (byte 256-257).
+               If c1e is always 0 but c2s genuinely varies, that's a
+               transfer-tail artifact, not a general corruption. */
             {
                 char line5[40];
-                sprintf(line5, "s0=%d,%d s125=%d,%d s255=%d,%d",
+                sprintf(line5, "s0=%d,%d c1e=%d,%d c2s=%d,%d",
                         debug_first_bytes_g[0], debug_first_bytes_g[1],
-                        debug_mid_i_g, debug_mid_q_g,
-                        debug_end_i_g, debug_end_q_g);
+                        debug_c1end_i_g, debug_c1end_q_g,
+                        debug_c2start_i_g, debug_c2start_q_g);
                 GFX_VDU(5);
                 GFX_Move(ox + 4, oy - 244);
                 GFX_Write0(line5);
