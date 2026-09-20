@@ -69,14 +69,16 @@
                                                      without crowding the
                                                      bars below it */
 
-/* Space reserved at the TOP of the window for the diagnostic text line
-   and the gain-control icons (create_gain_icons -- their row sits at
-   y -60..-92), so a tall bar can never grow up into and visually cover
-   them. Bars are Wimp-drawn graphics in the app's own redraw loop, not
-   icons, so nothing stops them overlapping icons except keeping their
-   own max height below where the icons start. finalize_display() scales
-   into BAR_MAX_HEIGHT, not the full WORK_HEIGHT. */
-#define RESERVED_TOP    100
+/* Space reserved at the TOP of the window for the diagnostic text
+   lines and the gain/freq/demod control icons (create_gain_icons/
+   create_freq_icons/create_demod_icon -- their row sits at y -60..-92),
+   so a tall bar can never grow up into and visually cover them. Bars
+   are Wimp-drawn graphics in the app's own redraw loop, not icons, so
+   nothing stops them overlapping icons except keeping their own max
+   height below where the icons start. finalize_display() scales into
+   BAR_MAX_HEIGHT, not the full WORK_HEIGHT. Grown from 100 to 140 to
+   fit a second text line (demod readout, y -118) below the icon row. */
+#define RESERVED_TOP    140
 #define BAR_MAX_HEIGHT  (WORK_HEIGHT - RESERVED_TOP)
 
 /* Redraw throttle, separate from how aggressively Null_spectrum drains
@@ -267,6 +269,32 @@ static unsigned long tuned_freq_hz_g = FREQ_DEFAULT_HZ;
 static icon_handle icon_freqdown_g = 0;
 static icon_handle icon_frequp_g = 0;
 
+/* ---- FM demodulation (numeric readout only -- no audio output yet) ----
+   Real streaming PCM playback needs RISC OS's interrupt-driven "linear
+   handler" sound mechanism or the SharedSound module's streaming API,
+   neither of which is grounded in real, fetched documentation the way
+   the DeviceFS/tuner work was -- guessing at undocumented SWI numbers
+   for something interrupt-driven is a bad idea (see the GPIO/UpCall
+   risk this project already backed away from once). This computes and
+   displays the actual demodulated deviation instead, as a first,
+   lower-risk step: proves the DSP is right before any audio-subsystem
+   research/risk is taken on.
+
+   Gated behind a toggle (default OFF): a real phase discriminator is
+   one atan2() per sample, up to 255 per frame -- real added CPU cost
+   on top of everything already fixed for resource use this session,
+   not worth paying for users who don't care about it. */
+#define DEMOD_SAMPLE_RATE_HZ  2400000.0 /* matches rtlsdr_set_sample_rate()
+                                            in main() */
+#define DEMOD_PI              3.14159265358979323846
+#define DEMOD_ALPHA           0.1   /* faster than the spectrum's
+                                        AVG_ALPHA -- a responsive
+                                        VU-meter feel, not a slow trace */
+static int demod_enabled_g = 0;
+static icon_handle icon_demod_g = 0;
+static double demod_dev_rms_g = 0.0;  /* Hz, EMA-smoothed */
+static double demod_dev_peak_g = 0.0; /* Hz, EMA-smoothed */
+
 /* Diagnostic-only globals, drawn as a text line during redraw (see
    Redraw_spectrum). Originally added to chase down a real bug: DeviceFS
    pads short reads to the requested size in its default blocking mode
@@ -445,6 +473,42 @@ static double debug_sample_pow_max_g = 0.0;
 static int debug_max_sample_idx_g = 0;
 static int debug_n_elevated_g = 0;
 
+/* Standard complex-baseband FM phase discriminator: for each pair of
+   consecutive samples, the instantaneous frequency is proportional to
+   the phase of x[n]*conj(x[n-1]) -- atan2 of that product's
+   imaginary/real parts, scaled from radians-per-sample to Hz via the
+   real sample rate. Must run on re[]/im[] BEFORE fft256() overwrites
+   them in place (called from accumulate_frame(), right before that
+   call). Tracks RMS and peak deviation over the frame, folded into a
+   running EMA -- real FM broadcast should show these settle to
+   something on the order of the format's actual deviation (up to
+   ~75kHz for wideband FM), not near-zero (no real modulation) or wildly
+   erratic/clipped-looking (pure noise / no real signal). */
+static void demodulate_frame(const double *re, const double *im)
+{
+    int k;
+    double prod_re, prod_im, dev_hz, sum_sq, peak_abs, rms_hz;
+
+    sum_sq = 0.0;
+    peak_abs = 0.0;
+    for (k = 1; k < FFT_SIZE; k++) {
+        prod_re = re[k] * re[k - 1] + im[k] * im[k - 1];
+        prod_im = im[k] * re[k - 1] - re[k] * im[k - 1];
+        dev_hz = atan2(prod_im, prod_re) *
+                 (DEMOD_SAMPLE_RATE_HZ / (2.0 * DEMOD_PI));
+        sum_sq += dev_hz * dev_hz;
+        if (fabs(dev_hz) > peak_abs) {
+            peak_abs = fabs(dev_hz);
+        }
+    }
+    rms_hz = sqrt(sum_sq / (double)(FFT_SIZE - 1));
+
+    demod_dev_rms_g = demod_dev_rms_g * (1.0 - DEMOD_ALPHA) +
+                       rms_hz * DEMOD_ALPHA;
+    demod_dev_peak_g = demod_dev_peak_g * (1.0 - DEMOD_ALPHA) +
+                        peak_abs * DEMOD_ALPHA;
+}
+
 static void accumulate_frame(void)
 {
     static double re[FFT_SIZE];
@@ -490,6 +554,10 @@ static void accumulate_frame(void)
         if (sample_pow_arr[i] > 0.01 * debug_sample_pow_max_g) {
             debug_n_elevated_g++;
         }
+    }
+
+    if (demod_enabled_g) {
+        demodulate_frame(re, im);
     }
 
     fft256(re, im);
@@ -918,6 +986,25 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
             GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
             GFX_VDU(4);
+
+            /* Demod readout (see demodulate_frame/DEMOD_* above) --
+               only meaningful once DEM has been on for a moment (the
+               EMA needs a few frames to settle from its zero start).
+               Real FM broadcast should settle to deviation on the
+               order of the format's actual swing (up to ~75kHz for
+               wideband FM), not near-zero (no real modulation
+               detected) or wildly pegged near the Nyquist-limited max
+               (clipping/no real signal, just noise). */
+            if (demod_enabled_g) {
+                char line2[40];
+                sprintf(line2, "dev pk=%.1fk rms=%.1fk Hz",
+                        demod_dev_peak_g / 1000.0,
+                        demod_dev_rms_g / 1000.0);
+                GFX_VDU(5);
+                GFX_Move(ox + 4, oy - 118);
+                GFX_Write0(line2);
+                GFX_VDU(4);
+            }
         }
 
         Wimp_GetRectangle(&r, &more);
@@ -933,25 +1020,35 @@ static BOOL Close_spectrum(event_pollblock *event, void *reference)
     return TRUE; /* unreached */
 }
 
-/* icon_agc_g's "pressed in" look tracks whether AGC is currently
+/* A toggle icon's "pressed in" look tracks whether it's currently
    active, matching the standard RISC OS toggle-button convention.
    Wimp_SetIconState's (value, mask) pair: only bits set in mask are
    touched, and within those, value's bits are the new state -- so
    mask=value=just the `selected` bit sets it, mask=selected/value=0
    clears it. Building both through the icon_flags union rather than a
    hand-computed hex bitmask keeps this correct if the struct layout
-   ever changes. */
-static void update_agc_icon(void)
+   ever changes. Shared by icon_agc_g (AGC on/off) and icon_demod_g
+   (demod on/off). */
+static void set_icon_selected(icon_handle icon, int selected)
 {
     icon_flags mask, value;
 
     memset(&mask, 0, sizeof(mask));
     memset(&value, 0, sizeof(value));
     mask.data.selected = 1;
-    value.data.selected = (gain_mode_g == GAIN_MODE_AGC) ? 1 : 0;
+    value.data.selected = selected ? 1 : 0;
 
-    Wimp_SetIconState(spectrum_window_g, icon_agc_g, value.value,
-                       mask.value);
+    Wimp_SetIconState(spectrum_window_g, icon, value.value, mask.value);
+}
+
+static void update_agc_icon(void)
+{
+    set_icon_selected(icon_agc_g, gain_mode_g == GAIN_MODE_AGC);
+}
+
+static void update_demod_icon(void)
+{
+    set_icon_selected(icon_demod_g, demod_enabled_g);
 }
 
 /* All three gain buttons need the I2C repeater enabled around the
@@ -970,6 +1067,15 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
     }
 
     icon = event->data.mouse.icon;
+
+    if (icon == icon_demod_g) {
+        /* Pure software toggle -- no I2C repeater bracket needed,
+           unlike every gain/freq control below. */
+        demod_enabled_g = !demod_enabled_g;
+        update_demod_icon();
+        return TRUE;
+    }
+
     is_gain_icon = (icon == icon_agc_g || icon == icon_gaindown_g ||
                      icon == icon_gainup_g);
     is_freq_icon = (icon == icon_freqdown_g || icon == icon_frequp_g);
@@ -1189,6 +1295,13 @@ static void create_freq_icons(window_handle win)
     icon_frequp_g = create_button_icon(win, 288, 348, "F+");
 }
 
+/* Same row again, further right -- up to x=416, still clear of
+   WORK_WIDTH=512. */
+static void create_demod_icon(window_handle win)
+{
+    icon_demod_g = create_button_icon(win, 356, 416, "DEM");
+}
+
 int main(void)
 {
     int n;
@@ -1262,7 +1375,9 @@ int main(void)
     spectrum_window_g = create_spectrum_window();
     create_gain_icons(spectrum_window_g);
     create_freq_icons(spectrum_window_g);
-    update_agc_icon(); /* reflect gain_mode_g's initial AGC state */
+    create_demod_icon(spectrum_window_g);
+    update_agc_icon();   /* reflect gain_mode_g's initial AGC state */
+    update_demod_icon(); /* reflect demod_enabled_g's initial OFF state */
     Window_Show(spectrum_window_g, open_CENTERED);
 
     Event_Claim(event_REDRAW, spectrum_window_g, event_ANY, Redraw_spectrum, NULL);
