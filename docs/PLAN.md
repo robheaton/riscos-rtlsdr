@@ -1642,3 +1642,18 @@ averaging window's settle time) -- proving the button clicks are
 genuinely reaching the tuner over I2C and changing real ADC gain, not
 just updating the display. First real, hands-on confirmation that a UI
 control changes something measurable in this app.
+
+## Phase 2, follow-on: frequency tuning UI
+
+Added F-/F+ frequency step buttons (100kHz per click, 24MHz-1.7GHz
+range), mirroring the gain control's button pattern rather than a
+writable text-entry icon. `Click_spectrum` only commits the new
+`tuned_freq_hz_g` if `r82xx_set_freq()` actually locks, and on success
+flushes the stale pre-retune buffer, discards any in-flight partial
+frame, and resets the power average so the display doesn't blend two
+different stations' spectra together for the next couple of seconds.
+Current frequency shows in the same diagnostic line as gain state.
+
+**Real run: confirmed working** ("looks to work") -- stepping away
+from and back to 97.4MHz kept the tuner locked and the display
+running.
