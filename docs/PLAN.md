@@ -1360,5 +1360,43 @@ until a frame is genuinely complete (or the stream truly has nothing
 more available right now, `got==0`) instead of capping at a small fixed
 attempt count. Replaced `BATCH_READS=16` with an unbounded loop (a
 generous `MAX_READ_ATTEMPTS=5000` safety bound against a pathological
-runaway, not a normal-operation limit) in `Null_spectrum()`. Pending a
-real run.
+runaway, not a normal-operation limit) in `Null_spectrum()`. Real run:
+no change -- same flat pattern.
+
+## Phase 2, follow-on: I/Q pairing guard, then live observation, then DC removal
+
+**I/Q pairing guard, no effect.** New hypothesis: milestone 5's
+sentinel test only ever requested round power-of-two sizes (always
+yielding even `got` counts); real usage requests whatever's left to
+reach a full frame, which isn't always a round power of two, so a read
+could plausibly return an ODD byte count -- desyncing every
+`iq_frame_g[2*i]`/`[2*i+1]` I/Q pairing by one byte for the rest of the
+frame. Fixed (`accum_fill_g += got & ~1`, only counting whole pairs).
+Real run: `min=47 max=47 dc=93` -- still no change.
+
+**Direct live observation broke the stalemate.** Rather than keep
+guessing at more accumulation-layer bugs, asked the user to watch the
+running display continuously for several seconds (not comparing
+separate screenshots/launches) and report whether anything changes at
+all. Result: **`min`/`max` genuinely fluctuate, 28-51dB, continuously**
+-- conclusively proving the pipeline is live and recomputing every
+frame, not stuck. But **the DC bar's height never visibly changes** --
+which turns out to be simple arithmetic, not a bug: `dc` (~93) is
+*always* so much larger than `max` (which tops out around 51-54) that
+`(dc-min)/range` mathematically clips to full height (300) on every
+single frame regardless of what min/max actually are. The apparent
+"frozen line" was never evidence of a stuck pipeline -- it was the DC
+bin correctly, consistently maxing out.
+
+**Real fix candidate: DC removal before the FFT, not just excluding a
+couple of bins from the display scale.** Real spectrum analyzers
+subtract each frame's own measured mean from the samples before
+transforming, specifically because a genuine hardware DC bias
+spectrally leaks into and swamps NEARBY bins too, not just the exact
+centre one -- `DC_EXCLUDE_BINS=2` only ever hid that leakage from the
+*scale calculation*, it never stopped the leakage from corrupting the
+FFT's own bin values in the first place. `compute_spectrum()` now
+computes the frame's actual mean I and mean Q and subtracts them before
+centering-by-127.5 and calling `fft256()`, instead of only ever
+centering by the fixed assumed 127.5. This is standard, correct
+signal-processing practice, not a guess. Pending a real run.

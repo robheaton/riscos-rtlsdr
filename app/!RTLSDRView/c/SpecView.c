@@ -247,9 +247,37 @@ static void compute_spectrum(void)
     double power, scaled;
     double db_min, db_max, range;
 
-    for (i = 0; i < FFT_SIZE; i++) {
-        re[i] = (double)iq_frame_g[2 * i] - 127.5;
-        im[i] = (double)iq_frame_g[2 * i + 1] - 127.5;
+    {
+        /* DC removal: subtract this FRAME'S OWN measured mean, not just
+           the fixed assumed centre (127.5). dc has read ~93dB on every
+           single run regardless of antenna/gain/any fix so far, while
+           the user directly confirmed (watching the live display) that
+           min/max genuinely fluctuate 28-51dB over time -- so the
+           pipeline is live, but something is suppressing the ~40dB
+           station signal independently confirmed present with this
+           exact dongle+antenna in SDR# on Windows. Real spectrum
+           analyzers remove DC bias before the FFT specifically because
+           a real hardware DC offset can spectrally leak into and swamp
+           NEARBY bins too, not just the exact centre one -- excluding
+           only DC_EXCLUDE_BINS=2 bins from the *display scale*
+           calculation (below) does nothing to stop that leakage from
+           corrupting the FFT's own bins in the first place. Subtracting
+           the frame's actual mean (not the fixed 127.5) removes the
+           true DC component at its source, however large it is,
+           instead of just hiding it from the scale calculation. */
+        double sum_re, sum_im, mean_re, mean_im;
+        sum_re = 0.0;
+        sum_im = 0.0;
+        for (i = 0; i < FFT_SIZE; i++) {
+            sum_re += (double)iq_frame_g[2 * i] - 127.5;
+            sum_im += (double)iq_frame_g[2 * i + 1] - 127.5;
+        }
+        mean_re = sum_re / (double)FFT_SIZE;
+        mean_im = sum_im / (double)FFT_SIZE;
+        for (i = 0; i < FFT_SIZE; i++) {
+            re[i] = ((double)iq_frame_g[2 * i] - 127.5) - mean_re;
+            im[i] = ((double)iq_frame_g[2 * i + 1] - 127.5) - mean_im;
+        }
     }
 
     fft256(re, im);
