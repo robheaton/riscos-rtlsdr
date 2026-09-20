@@ -792,98 +792,23 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                blind. */
             sprintf(line1, "min=%.2f max=%.2f",
                     debug_db_min_g, debug_db_max_g);
-            /* ok=/bad= confirmed reads healthy (ok=15000, bad=0) --
-               replaced with the raw linear power at the min/max bins
-               (see the comment above debug_raw_min_g/max_g) now that
-               the open question is whether a real linear difference is
-               being hidden by log compression, not whether reads are
-               happening at all. */
-            {
-                char line2[32];
-                sprintf(line2, "raw %.3e %.3e",
-                        debug_raw_min_g, debug_raw_max_g);
-                GFX_VDU(5);
-                GFX_Move(ox + 4, oy - 76);
-                GFX_Write0(line2);
-                GFX_VDU(4);
-            }
-            /* min==max even in raw linear power rules out log
-               compression AND rules out this just being ordinary
-               averaged-noise variance (independent per-bin noise
-               shouldn't converge to 4-sig-fig equality) -- points at a
-               degenerate (near-impulse) TIME-domain frame instead, since
-               the DFT of a near-delta function is flat by definition.
-               byte=lo..hi is the raw ADC byte range across the WHOLE
-               512-byte frame (already computed, previously only used
-               internally); smp=lo..hi is the DC-removed time-domain
-               PER-SAMPLE power range going into the FFT. A narrow byte
-               range or a huge smp max next to a near-zero smp min is
-               the smoking gun for "mostly-constant buffer, one or two
-               real samples", not a healthy noisy signal. */
-            {
-                char line3[40];
-                sprintf(line3, "byte %d..%d smp %.1e..%.1e",
-                        (int)debug_byte_min_g, (int)debug_byte_max_g,
-                        debug_sample_pow_min_g, debug_sample_pow_max_g);
-                GFX_VDU(5);
-                GFX_Move(ox + 4, oy - 132);
-                GFX_Write0(line3);
-                GFX_VDU(4);
-            }
-            /* idx@ is WHICH of the 256 samples holds the dominant power
-               -- a fixed value every frame would point at a specific
-               copy/offset bug; scattering around would not. nElev is
-               how many of the 256 samples clear 1% of that peak -- a
-               healthy captured RF signal should have far more than a
-               handful; "1" or "2" means one lone sample dominates a
-               near-silent buffer. */
-            {
-                char line4[40];
-                sprintf(line4, "idx@%d nElev=%d",
-                        debug_max_sample_idx_g, debug_n_elevated_g);
-                GFX_VDU(5);
-                GFX_Move(ox + 4, oy - 188);
-                GFX_Write0(line4);
-                GFX_VDU(4);
-            }
-            /* g==t==256 every read rules out padding (see
-               debug_c1end_*_g comment above) -- so these test whether
-               it's specifically a USB short-packet/boundary artifact:
-               c1e = the EXACT last 2 bytes of chunk 1 (byte 254-255),
-               c2s = the EXACT first 2 bytes of chunk 2 (byte 256-257).
-               If c1e is always 0 but c2s genuinely varies, that's a
-               transfer-tail artifact, not a general corruption. */
-            {
-                char line5[40];
-                sprintf(line5, "s0=%d,%d c1e=%d,%d c2s=%d,%d",
-                        debug_first_bytes_g[0], debug_first_bytes_g[1],
-                        debug_c1end_i_g, debug_c1end_q_g,
-                        debug_c2start_i_g, debug_c2start_q_g);
-                GFX_VDU(5);
-                GFX_Move(ox + 4, oy - 244);
-                GFX_Write0(line5);
-                GFX_VDU(4);
-            }
-            /* Last 3 (got,touched) pairs from individual SWI calls --
-               `got` is what the SWI CLAIMS was transferred, `touched`
-               is how many bytes actually differ from a 0xAA sentinel
-               pre-fill (the exact technique milestone 5 used to prove
-               the original padding bug). If got==touched every time,
-               non-blocking mode really is honest here and the bug is
-               elsewhere; if touched is consistently far below got,
-               that's the padding bug again, just not caught by
-               milestone 5's narrower original test. */
-            {
-                char line6[40];
-                sprintf(line6, "g%d/t%d g%d/t%d g%d/t%d",
-                        debug_last_gots_g[0], debug_last_touched_g[0],
-                        debug_last_gots_g[1], debug_last_touched_g[1],
-                        debug_last_gots_g[2], debug_last_touched_g[2]);
-                GFX_VDU(5);
-                GFX_Move(ox + 4, oy - 300);
-                GFX_Write0(line6);
-                GFX_VDU(4);
-            }
+            /* Stripped lines 2-6 (raw power, byte/sample range, idx/
+               nElev, chunk-boundary bytes, got/touched pairs) back out
+               of the DRAWN display -- this is the exact same mistake
+               already documented and fixed once before ("Diagnostic
+               text was 5 lines tall... filled the ENTIRE window
+               height, leaving no room for the bars"), reintroduced by
+               accumulating byte-level diagnostics one at a time while
+               chasing a single stuck-at-zero artifact. The user
+               confirmed the window has no scrollbar and the
+               "barcode"/"doesn't change" pattern they were seeing WAS
+               the entire visible window -- almost certainly six dense
+               text lines plus bars that, now that real dB contrast
+               finally exists, are tall enough to overlap right through
+               that text. The underlying debug_*_g captures higher up in
+               this function stay in place -- cheap, and still handy to
+               inspect or re-enable a line temporarily -- just not drawn
+               every redraw any more. */
             GFX_VDU(5);
             GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
