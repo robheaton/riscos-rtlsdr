@@ -439,6 +439,15 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
            logic. Remove once the real cause is found. */
         GFX_RectangleFill(ox + 50, oy - 150, 100, 100);
 
+        /* Second isolation test: the 100x100 square above proved
+           drawing/colour/coordinates all work. This tests the two
+           things that differ between it and a real (invisible) bar --
+           width 1 instead of 100, and height exactly WORK_HEIGHT
+           (touching the window's top boundary) instead of 100 well
+           inside it -- at a fixed, distinct x so it can't be confused
+           with the square or a real bar. */
+        GFX_RectangleFill(ox + 300, oy - WORK_HEIGHT, 1, WORK_HEIGHT);
+
         for (i = 0; i < NUM_BINS; i++) {
             GFX_RectangleFill(ox + i * BIN_WIDTH_OS, oy - WORK_HEIGHT,
                                BIN_WIDTH_OS - 1, bin_height_g[i]);
