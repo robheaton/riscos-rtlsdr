@@ -444,10 +444,18 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
            graphics cursor (GFX_Move'd position) instead of the text
            cursor; VDU 4 reverts. */
         {
-            char line1[40];
-            sprintf(line1, "ok=%lu bad=%lu byte%u..%u",
+            char line1[48];
+            /* Fourth real run showed NOTHING drawn at all -- not even
+               the DC spike every previous run showed. Plausible good
+               explanation: that DC spike was itself an artifact of the
+               old padding bug (a mostly-constant buffer concentrates
+               all its energy at DC by definition); with real varying
+               data now filling the whole frame, DC could be much
+               smaller. But that's a guess -- show the actual computed
+               scale (min/max/dc) instead of assuming. */
+            sprintf(line1, "ok=%lu bad=%lu min=%.0f max=%.0f dc=%.0f",
                     debug_reads_ok_g, debug_reads_bad_g,
-                    (unsigned)debug_byte_min_g, (unsigned)debug_byte_max_g);
+                    debug_db_min_g, debug_db_max_g, debug_db_dc_g);
             GFX_VDU(5);
             GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
