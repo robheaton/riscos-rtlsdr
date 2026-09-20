@@ -427,8 +427,12 @@ int rtlsdr_probe_tuner(const char *dev)
 #define RTL_XTAL_FREQ_HZ 28800000.0
 
 /* Sets the demod's IF-frequency registers (page 1, 0x19/0x1a/0x1b).
-   Verbatim formula from upstream rtlsdr_set_if_freq(). */
-static int rtlsdr_set_if_freq(const char *dev, unsigned long freq)
+   Verbatim formula from upstream rtlsdr_set_if_freq(). Exposed (not
+   static) so callers can re-sync the demod's digital IF after
+   r82xx_set_bandwidth() (R82XX.c) updates the tuner's actual analog
+   IF -- see Driver.h and docs/PLAN.md for why leaving these out of
+   sync was a real, previously-missed bug. */
+int rtlsdr_set_if_freq(const char *dev, unsigned long freq)
 {
     long if_freq;
     int rc;

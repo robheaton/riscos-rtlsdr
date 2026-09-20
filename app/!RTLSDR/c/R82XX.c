@@ -619,6 +619,13 @@ static int r82xx_set_tv_standard(r82xx_t *t)
     rc = r82xx_write_reg_mask(t, 0x1d, 0x00, 0x38);
     if (rc < 0) return rc;
 
+    /* Initial analog IF, matching upstream's if_khz=3570 default for
+       the "BW < 6MHz" case this port always takes -- r82xx_set_freq()
+       uses this field (not a fixed constant) for its LO calculation.
+       Corrected later by r82xx_set_bandwidth() once the real capture
+       bandwidth is known (see R82XX.h and docs/PLAN.md). */
+    t->int_freq = 3570000;
+
     /* filter calibration -- force_calibration always true in our port
        (upstream: "we call this function only once in rtlsdr, force
        calibration") */
@@ -702,11 +709,17 @@ int r82xx_set_freq(r82xx_t *t, unsigned long freq_hz)
     upconvert_freq = (freq_hz < HF_THRESHOLD_HZ)
                           ? (freq_hz + HF_THRESHOLD_HZ)
                           : freq_hz;
-    /* R82XX_IF_FREQ (h/RTLSDR.h) is the intermediate frequency set up
-       during baseband init (RTLSDR.c's rtlsdr_set_if_freq -- not yet
-       wired in as of this port; using it directly here matches upstream's
-       priv->int_freq, which is set to the same value). */
-    lo_freq = upconvert_freq + R82XX_IF_FREQ;
+    /* t->int_freq (NOT the old fixed R82XX_IF_FREQ constant -- see
+       R82XX.h and docs/PLAN.md) is the tuner's ACTUAL analog IF: set
+       to 3.57MHz by r82xx_set_tv_standard(), then corrected by
+       r82xx_set_bandwidth() once main() knows the real capture
+       bandwidth. Matches upstream's own priv->int_freq usage here
+       exactly -- using a value that could go stale (the old fixed
+       constant, never updated after r82xx_set_bandwidth() runs) was a
+       real, previously-missed bug: it let the demod's digital IF and
+       the tuner's real analog IF disagree by however large the
+       bandwidth correction was. */
+    lo_freq = upconvert_freq + (unsigned long)t->int_freq;
 
     TRACE("set_freq: entry, about to call set_mux");
     rc = r82xx_set_mux(t, lo_freq);
@@ -834,4 +847,113 @@ int r82xx_set_gain_manual(r82xx_t *t, int index)
     if (rc < 0) return rc;
     rc = r82xx_write_reg_mask(t, 0x07, index, 0x0f); /* Mixer gain index */
     return rc;
+}
+
+/* Bandwidth contribution by low-pass filter -- verbatim table from
+   upstream (real source, fetched and read directly, not summarized;
+   see docs/PLAN.md). */
+static const int r82xx_if_low_pass_bw_table[10] = {
+    1700000, 1600000, 1550000, 1450000, 1200000, 900000, 700000, 550000,
+    450000, 350000
+};
+#define R82XX_FILT_HP_BW1 350000
+#define R82XX_FILT_HP_BW2 380000
+
+/* Verbatim port of upstream r82xx_set_bandwidth() -- computes the
+   tuner's actual analog IF/filter-bandwidth configuration for a
+   requested capture bandwidth, and writes it to registers 0x0a/0x0b.
+   Upstream's third parameter (`rate`) is declared but never referenced
+   in the function body, so it's dropped here (confirmed from source,
+   not assumed -- see docs/PLAN.md for how big a difference "declared
+   but unused" vs "actually used" can make when porting from a
+   summarizer instead of raw source).
+
+   This was the missing piece behind the flat-spectrum/demod-saturation
+   mystery (see docs/PLAN.md): without it, t->int_freq stayed at
+   r82xx_set_tv_standard()'s fixed 3.57MHz default forever, no matter
+   what capture bandwidth was actually configured, while the tuner's
+   OWN analog filter registers were never adjusted for that bandwidth
+   either -- for this project's 2.4MHz capture, upstream's real
+   computation gives ~1.815MHz, a ~1.75MHz mismatch against a capture
+   whose Nyquist limit is only 1.2MHz. A mismatch that large between
+   what the demod's digital downconversion assumes and what the
+   tuner's analog IF actually centres on aliases real content into
+   what looks exactly like unstructured noise -- matching everything
+   observed: a flat averaged spectrum, and an FM phase discriminator
+   saturating near its theoretical maximum instead of tracking real
+   modulation.
+
+   THE CALLER MUST, after this returns successfully: resync the
+   demod's digital IF to the returned value (Driver.h's
+   rtlsdr_set_if_freq()) and re-tune at the current frequency
+   (r82xx_set_freq()) -- matching upstream's r820t_set_bw(), which
+   chains all three. Call with the I2C repeater enabled. Returns the
+   new t->int_freq (>=0) on success, negative on I2C failure. */
+int r82xx_set_bandwidth(r82xx_t *t, int bw_hz)
+{
+    int rc;
+    unsigned int i;
+    int real_bw;
+    int reg_0a, reg_0b;
+    int bw;
+
+    bw = bw_hz;
+    real_bw = 0;
+
+    if (bw > 7000000) {
+        /* BW: 8 MHz */
+        reg_0a = 0x10;
+        reg_0b = 0x0b;
+        t->int_freq = 4570000;
+    } else if (bw > 6000000) {
+        /* BW: 7 MHz */
+        reg_0a = 0x10;
+        reg_0b = 0x2a;
+        t->int_freq = 4570000;
+    } else if (bw > r82xx_if_low_pass_bw_table[0] +
+                        R82XX_FILT_HP_BW1 + R82XX_FILT_HP_BW2) {
+        /* BW: 6 MHz */
+        reg_0a = 0x10;
+        reg_0b = 0x6b;
+        t->int_freq = 3570000;
+    } else {
+        reg_0a = 0x00;
+        reg_0b = 0x80;
+        t->int_freq = 2300000;
+
+        if (bw > r82xx_if_low_pass_bw_table[0] + R82XX_FILT_HP_BW1) {
+            bw -= R82XX_FILT_HP_BW2;
+            t->int_freq += R82XX_FILT_HP_BW2;
+            real_bw += R82XX_FILT_HP_BW2;
+        } else {
+            reg_0b |= 0x20;
+        }
+
+        if (bw > r82xx_if_low_pass_bw_table[0]) {
+            bw -= R82XX_FILT_HP_BW1;
+            t->int_freq += R82XX_FILT_HP_BW1;
+            real_bw += R82XX_FILT_HP_BW1;
+        } else {
+            reg_0b |= 0x40;
+        }
+
+        /* find low-pass filter */
+        for (i = 0; i < 10; i++) {
+            if (bw > r82xx_if_low_pass_bw_table[i]) {
+                break;
+            }
+        }
+        i--;
+        reg_0b |= 15 - (int)i;
+        real_bw += r82xx_if_low_pass_bw_table[i];
+
+        t->int_freq -= real_bw / 2;
+    }
+
+    rc = r82xx_write_reg_mask(t, 0x0a, reg_0a, 0x10);
+    if (rc < 0) return rc;
+    rc = r82xx_write_reg_mask(t, 0x0b, reg_0b, 0xef);
+    if (rc < 0) return rc;
+
+    return t->int_freq;
 }

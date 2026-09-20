@@ -1361,6 +1361,34 @@ int main(void)
         report_and_die("rtlsdr_set_sample_rate() failed.");
     }
 
+    /* Port of upstream's r820t_set_bw(), which this project's
+       rtlsdr_set_sample_rate() never called (a real, previously-missed
+       gap -- see docs/PLAN.md): compute the tuner's actual analog IF
+       for this capture bandwidth, write its filter registers, resync
+       the demod's digital IF to match, then re-tune so
+       r82xx_set_freq() picks up the corrected t->int_freq. Without
+       this, the demod's digital downconversion and the tuner's real
+       analog IF disagreed by ~1.75MHz for this project's 2.4MHz
+       capture -- comparable to the capture's own 1.2MHz Nyquist limit,
+       enough to alias real signal content into what looks exactly
+       like unstructured noise. This is the leading suspect for the
+       long-unresolved flat-spectrum/demod-saturation mystery. */
+    {
+        int new_if;
+
+        rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x18, 1); /* enable I2C repeater */
+        new_if = r82xx_set_bandwidth(&tuner_g, 2400000);
+        if (new_if >= 0) {
+            rtlsdr_set_if_freq(device_name_g, (unsigned long)new_if);
+            r82xx_set_freq(&tuner_g, tuned_freq_hz_g);
+        }
+        rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x10, 1); /* disable I2C repeater */
+        if (new_if < 0 || !tuner_g.has_lock) {
+            report_and_die("Bandwidth/IF resync failed -- see "
+                            "docs/PLAN.md.");
+        }
+    }
+
     rtlsdr_reset_buffer(device_name_g);
 
     sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000:%s",

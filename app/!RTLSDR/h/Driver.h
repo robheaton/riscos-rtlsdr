@@ -31,6 +31,14 @@ int rtlsdr_tuner_postinit(const char *dev);
 int rtlsdr_set_sample_rate(const char *dev, unsigned long samp_rate);
 void rtlsdr_reset_buffer(const char *dev);
 
+/* Sets the demod's digital IF-frequency registers to freq (Hz).
+   Exposed for callers to re-sync after R82XX.c's
+   r82xx_set_bandwidth() updates the tuner's actual analog IF -- see
+   docs/PLAN.md for why the two must be kept in agreement. Call with
+   the I2C repeater enabled. Returns 0 on success, negative on I2C
+   failure. */
+int rtlsdr_set_if_freq(const char *dev, unsigned long freq);
+
 /* ---- raw bulk stream I/O ----
    OS_Find/OS_GBPB, bypassing stdio entirely -- fopen()/fread() never
    worked against this DeviceFS stream at any size, for reasons never

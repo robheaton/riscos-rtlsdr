@@ -18,7 +18,19 @@
 #define R82XX_VER_NUM           49   /* 0x31, written to reg 0x13 */
 
 /* Tuner state. dev_name is the "usbN" DeviceFS name from RTLSDR.c's
-   find_device(); everything else mirrors struct r82xx_priv. */
+   find_device(); everything else mirrors struct r82xx_priv.
+   int_freq is the tuner's ACTUAL analog intermediate frequency (Hz) --
+   set to 3.57MHz by r82xx_init() (matching upstream's own TV-standard
+   default), then updated by r82xx_set_bandwidth() to whatever the
+   tuner's analog filter is really centred on for the requested
+   capture bandwidth. r82xx_set_freq() uses this field (not a fixed
+   constant) when computing the LO frequency -- see docs/PLAN.md for
+   why a stale/mismatched value here was a real, previously-missed bug:
+   the demod's digital downconversion must be told the SAME frequency
+   the tuner's analog IF is actually centred on, or the two disagree by
+   whatever the mismatch is, aliasing real content into what looks
+   exactly like unstructured noise once that mismatch is comparable to
+   or larger than the capture bandwidth's Nyquist limit. */
 typedef struct {
     const char *dev_name;
     unsigned char regs[R82XX_NUM_REGS];
@@ -26,6 +38,7 @@ typedef struct {
     unsigned char fil_cal_code;
     int has_lock;
     int is_v4;                /* always 1 for v1 -- confirmed V4 hardware */
+    int int_freq;              /* Hz -- see comment above */
 } r82xx_t;
 
 #define R82XX_BAND_HF   0
@@ -62,5 +75,20 @@ int r82xx_set_gain_agc(r82xx_t *t);
    Call after r82xx_set_freq() has locked, with the I2C repeater
    enabled. Returns 0 on success, negative on I2C failure. */
 int r82xx_set_gain_manual(r82xx_t *t, int index);
+
+/* Computes and applies the tuner's actual analog IF/filter-bandwidth
+   configuration for a requested capture bandwidth bw_hz (writes
+   registers 0x0a/0x0b, matching upstream r82xx_set_bandwidth()
+   verbatim -- note upstream's third parameter, `rate`, is declared but
+   never actually used in the function body, so it's dropped here).
+   Updates t->int_freq and returns its new value (>=0) on success, or
+   negative on I2C failure. THE CALLER MUST THEN sync the demod's
+   digital IF to match (Driver.h's rtlsdr_set_if_freq(), with the
+   returned value) and re-tune (r82xx_set_freq() at the current
+   frequency) -- matching upstream's r820t_set_bw(), which chains all
+   three. Skipping either of those leaves the tuner's analog IF and the
+   demod's digital downconversion mismatched, exactly the bug this
+   function's addition fixes. Call with the I2C repeater enabled. */
+int r82xx_set_bandwidth(r82xx_t *t, int bw_hz);
 
 #endif /* R82XX_H */
