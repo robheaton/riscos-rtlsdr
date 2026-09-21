@@ -1847,3 +1847,80 @@ rate, and likely a per-channel filter (see the note above about
 `demodulate_frame()` currently running on the full wideband capture,
 not one station) so the audio is actually intelligible rather than
 several stations at once.
+
+## Phase 2, follow-on: real audio output, milestone 2 (streaming) -- blocked on a hard throughput ceiling
+
+Built the streaming plumbing: `audio_stream_init/play/feed/rate/close`
+in `Audio.c` -- a second TimPlayer sample (index 2), looped and
+continuously refilled instead of pre-filled once, with
+`demodulate_frame()` decimating its per-sample output down to the
+mixer's real rate and feeding it in. `TimPlayer_SongPosition`'s exact
+parameter semantics were never found documented anywhere, so playback
+position is estimated from elapsed wall-clock time
+(`OS_ReadMonotonicTime`) instead of queried.
+
+**Real run: audio played in short bursts with silence between,
+repeating roughly every buffer-length.** First suspected (and fixed) a
+real bug in the throttling math: the original `audio_stream_feed()`
+computed safe write room from the difference between two WRAPPED ring
+positions, which breaks down (and gets permanently stuck refusing to
+write) if production ever falls more than one buffer-length behind
+real time -- replaced with running-total accounting
+(`stream_total_written_g` vs. elapsed-time-implied samples consumed),
+which always makes forward progress no matter how far behind
+production falls. **This fix did not change the symptom at all** --
+pointing away from the ring-buffer logic entirely.
+
+**Added a direct throughput diagnostic** (`r=Xk` in the demod readout
+line: `debug_reads_ok_g * FFT_SIZE` samples processed, divided by real
+elapsed wall-clock time since app start, compared against the SDR's
+actual 2400 kHz rate). **Real measurement at `FIXED_CHUNK_SIZE=8` (the
+size that fixed the flat-spectrum mystery): `r=15k` -- about 0.6% of
+real-time, ~160x too slow.** This is the actual root cause: per-call
+SWI overhead (not USB hardware bandwidth) dominates when every read is
+tiny -- 8 bytes needs 60+ individual non-blocking SWI calls to fill
+one 256-sample frame, and no amount of ring-buffer cleverness can turn
+a ~160x-too-slow production rate into a continuous stream.
+
+**Searched for a correctness/throughput sweet spot between 8 (correct,
+overhead-bound) and 256 (fast, corrupted) -- none found that meaningfully
+closes the gap:**
+
+| chunk size | spectrum correctness | measured throughput |
+|---|---|---|
+| 8 | correct (confirmed multi-peak) | r=15k |
+| 16 | correct (confirmed multi-peak) | r=23k |
+| 32 | **broken** -- comb of evenly-spaced sharp spikes (a periodic artifact repeating at a fixed sample interval, same category as the earlier 256-byte idx@0/128-alternating finding, different period) | r=33k |
+| 64 | **broken** -- back to flat/noisy | r=40k |
+| 256 | **broken** -- idx@0/128 alternating (see the milestone-1 section above) | (not re-measured, but the same category) |
+| 512 | **broken** -- idx@ permanently stuck at 0 | (not re-measured) |
+
+The honesty threshold sits between 16 and 32. **Settled on
+`FIXED_CHUNK_SIZE=16` as the working baseline** (best throughput found
+that stays correct) -- but even there, `r=23k` is only ~1% of the
+2.4MHz needed. This isn't a tuning problem any nearby chunk size fixes;
+it's a hard ceiling on this read mechanism.
+
+**Where this leaves audio streaming: blocked, not abandoned.** The
+spectrum display and FM demod readout work fine at this throughput
+(they only need a modest update rate, not real-time sample-for-sample
+throughput) -- but a continuous, real-time audio stream needs
+something close to the SDR's actual 2.4 MSPS flowing through
+continuously, which this non-blocking-read architecture cannot
+sustain at any chunk size that also avoids the padding-by-repetition
+corruption. Real progress here needs one of:
+- Understanding WHY larger reads corrupt (what's actually happening
+  inside DeviceFS's non-blocking short-read implementation at sizes
+  above ~16-31 bytes) well enough to find a workaround that preserves
+  correctness without the overhead -- the same kind of deep, real-
+  source-level research that resolved the original flat-spectrum
+  mystery, not yet attempted for this specific question.
+- A fundamentally different read mechanism (larger blocking reads with
+  some other technique to avoid the original padding bug; a different,
+  more specialised DeviceFS/USB bulk-transfer SWI not yet explored)
+  that doesn't pay non-blocking mode's evident per-call tax at small
+  sizes.
+- Accepting that live, real-time audio may not be achievable through
+  this specific USB access path at all, and treating the working test
+  tone + numeric demod readout as where this sub-feature settles for
+  now.
