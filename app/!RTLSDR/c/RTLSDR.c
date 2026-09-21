@@ -669,6 +669,134 @@ static void milestone7_transfer_info_diagnostic(int device_num)
     printf("\n--- milestone 7 diagnostic done ---\n");
 }
 
+/* ---- milestone 8 (diagnostic): multiple independent streams on the
+   SAME bulk endpoint ----
+
+   USBDriver's start_read() (real source, gitlab.riscosopen.org) keeps
+   only one transfer in flight AT A TIME -- but that busy flag lives on
+   the per-stream state (the 'str' struct for one DeviceFS OPENIN
+   handle), not on the endpoint itself. Every measurement so far (this
+   file's milestones 6-7) used exactly one stream, so it could never
+   have more than one real transfer in flight regardless of chunk
+   size, DeviceFS buffer size, or retry strategy -- matching the flat
+   ~15-65 KB/s ceiling seen no matter what got tuned.
+
+   This is untested: does DeviceFS/USBDriver allow the SAME bulk
+   endpoint to be opened as several INDEPENDENT streams at once, each
+   with its OWN busy flag? If so, round-robin reading across N of them
+   should let N real transfers be in flight simultaneously -- genuine
+   pipelining, at the application level, needing no driver change --
+   and aggregate throughput should scale with N (until some other
+   limit appears). If the endpoint can only be opened once, or
+   DeviceFS serialises across streams to the same endpoint under the
+   hood, aggregate throughput should stay flat -- which would mean the
+   one-transfer-in-flight limit is real and not fixable from here. */
+
+#define M8_NSTREAMS 4
+
+static void milestone8_multistream_throughput(int device_num)
+{
+    char dev[16];
+    char path[80];
+    unsigned char *bufs[M8_NSTREAMS];
+    int handles[M8_NSTREAMS];
+    int opened;
+    int i, got;
+    unsigned long total_bytes;
+    unsigned long total_reads;
+    unsigned long empty_polls;
+    clock_t tstart, tnow;
+    double tsec;
+    double bps;
+
+    printf("\n--- milestone 8 (diagnostic): %d independent streams on "
+           "the same bulk endpoint ---\n", M8_NSTREAMS);
+
+    sprintf(dev, "usb%d", device_num);
+    rtlsdr_reset_buffer(dev);
+    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
+                  "nopad:%s",
+            RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, dev);
+
+    opened = 0;
+    for (i = 0; i < M8_NSTREAMS; i++) {
+        bufs[i] = (unsigned char *)malloc(4096);
+        if (bufs[i] == NULL) {
+            printf("stream %d: malloc FAILED\n", i);
+            break;
+        }
+        handles[i] = os_find_open(path);
+        if (handles[i] == 0) {
+            printf("stream %d: OS_Find FAILED (endpoint may only allow "
+                   "one open stream)\n", i);
+            free(bufs[i]);
+            break;
+        }
+        if (os_args_set_nonblocking(handles[i], 1) != 0) {
+            printf("stream %d: could not enable non-blocking\n", i);
+            os_find_close(handles[i]);
+            free(bufs[i]);
+            break;
+        }
+        opened++;
+        printf("stream %d: opened OK (handle 0x%08X)\n", i,
+               (unsigned int)handles[i]);
+    }
+
+    if (opened == 0) {
+        printf("\n--- milestone 8 diagnostic done (no streams opened) "
+               "---\n");
+        return;
+    }
+
+    printf("\n-- round-robin 4096-byte reads across %d stream(s), %d "
+           "second(s) --\n", opened, M6_TEST_SECONDS);
+    fflush(stdout);
+
+    total_bytes = 0;
+    total_reads = 0;
+    empty_polls = 0;
+    tstart = clock();
+    for (;;) {
+        for (i = 0; i < opened; i++) {
+            got = os_gbpb_read4(handles[i], bufs[i], 4096);
+            if (got < 0) {
+                continue;
+            }
+            if (got == 0) {
+                empty_polls++;
+            } else {
+                total_bytes += (unsigned long)got;
+                total_reads++;
+            }
+        }
+        tnow = clock();
+        if (((double)(tnow - tstart) / CLOCKS_PER_SEC) >=
+            (double)M6_TEST_SECONDS) {
+            break;
+        }
+    }
+    tsec = (double)(clock() - tstart) / CLOCKS_PER_SEC;
+    bps = (tsec > 0.0) ? ((double)total_bytes / tsec) : 0.0;
+
+    printf("  %lu bytes in %.1fs = %.0f bytes/sec (%.1f%% of target) "
+           "across %d stream(s)\n", total_bytes, tsec, bps,
+           bps / (double)STREAM_TARGET_BPS * 100.0, opened);
+    printf("  %lu successful reads, %lu empty (busy) polls, avg %.0f "
+           "bytes/successful read\n", total_reads, empty_polls,
+           (total_reads > 0) ?
+           ((double)total_bytes / (double)total_reads) : 0.0);
+    fflush(stdout);
+
+    for (i = 0; i < opened; i++) {
+        os_args_set_nonblocking(handles[i], 0);
+        os_find_close(handles[i]);
+        free(bufs[i]);
+    }
+
+    printf("\n--- milestone 8 diagnostic done ---\n");
+}
+
 /* ---- entry point ---- */
 
 int main(void)
@@ -730,6 +858,12 @@ int main(void)
        since milestone 6 alone couldn't distinguish "genuinely tiny
        transfers" from "polling faster than one big transfer fills". */
     milestone7_transfer_info_diagnostic(n);
+
+    /* Diagnostic, not gating -- tests whether the one-transfer-in-
+       flight limit is per-stream (fixable by opening several streams
+       from our own app) or a deeper, unfixable-from-here constraint.
+       See the comment above milestone8_multistream_throughput(). */
+    milestone8_multistream_throughput(n);
 
     return 0;
 }
