@@ -9,13 +9,21 @@
    fills a plain memory buffer with PCM samples and hands it to
    TimPlayer via documented SWIs.
 
-   This first pass proves the whole audio chain works at all (module
-   load, RMA buffer allocation, sample registration, looped playback)
-   with a simple generated test tone -- NOT the real FM-demodulated
-   audio yet. Streaming the real demod output needs periodically
-   rewriting portions of the loop buffer ahead of TimPlayer's current
-   playback position, which needs more research (e.g.
-   TimPlayer_SongPosition) before attempting -- see docs/PLAN.md.
+   The test tone proved the whole chain works at all (module load, RMA
+   buffer allocation, sample registration, looped playback). The
+   streaming functions below build on that for real, continuously-
+   generated audio (like FM demod output): a second RMA buffer, looped
+   the same way, that the caller keeps refilling via
+   audio_stream_feed() -- writing only as far "ahead" of wherever
+   TimPlayer's playback position is currently estimated to be as is
+   safe, so new data never overwrites audio that's about to be played.
+   TimPlayer's real playback position isn't queried (no documented
+   parameter semantics for TimPlayer_SongPosition were found -- see
+   docs/PLAN.md); position is instead estimated from elapsed wall-clock
+   time since audio_stream_start(), which needs the caller to actually
+   call audio_stream_feed() often enough to keep up in real time (a
+   couple of seconds' buffer plus a safety margin gives some slack, but
+   this isn't a bulletproof scheduler guarantee).
 
    C89 only (Norcroft): all declarations at top of block, no //
    comments. */
@@ -41,5 +49,45 @@ void audio_test_tone_play(int play);
    the RMA buffer). Call once at shutdown. Safe to call even if init()
    was never called or failed. */
 void audio_test_tone_close(void);
+
+/* Claims a second RMA buffer (a few seconds of silence, at the
+   mixer's real configured rate) and registers it with TimPlayer as a
+   second loopable sample, ready to be fed via audio_stream_feed().
+   Requires audio_test_tone_init() to have already succeeded (reuses
+   its FX/song handles rather than claiming its own -- this project
+   only ever needs one FX handler and one song). Returns 0 on success,
+   negative on failure (non-fatal, same as the test tone). */
+int audio_stream_init(void);
+
+/* Starts (play != 0) or stops (play == 0) looped playback of the
+   streaming buffer, and (re)establishes the wall-clock reference
+   audio_stream_feed()'s position estimate is based on. Safe to call
+   even if audio_stream_init() failed or wasn't called (does nothing). */
+void audio_stream_play(int play);
+
+/* Appends up to n samples (16-bit signed PCM, already at
+   audio_stream_rate() Hz -- the caller must decimate/resample its own
+   source material to that rate first) into the streaming ring buffer,
+   as far as there's safe room ahead of the estimated playback
+   position. Returns how many were actually written (0..n) -- callers
+   should be prepared for fewer than n (e.g. playback not started yet,
+   or temporarily caught up to the play position) and just drop the
+   rest rather than block; this is a real-time stream, not a queue with
+   backpressure. */
+int audio_stream_feed(const short *samples, int n);
+
+/* The streaming buffer's actual sample rate in Hz (the mixer's real
+   configured rate, read once during audio_stream_init()), or 0 if
+   audio_stream_init() hasn't succeeded. */
+int audio_stream_rate(void);
+
+/* Releases the streaming buffer specifically (stops playback if
+   running, releases its sample slot and RMA buffer) -- does NOT touch
+   the FX/song handles or the test-tone buffer, since those are shared
+   with / owned by audio_test_tone_*(). Call audio_test_tone_close()
+   (which releases the shared FX/song handles too) once at shutdown;
+   call this first if streaming was ever started. Safe to call even if
+   audio_stream_init() was never called or failed. */
+void audio_stream_close(void);
 
 #endif /* AUDIO_H */

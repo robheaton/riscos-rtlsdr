@@ -319,6 +319,20 @@ static int audio_ok_g = 0;
 static int tone_playing_g = 0;
 static icon_handle icon_tone_g = 0;
 
+/* ---- audio streaming (see Audio.h) ----
+   Real FM-demodulated audio, decimated down from demodulate_frame()'s
+   full 2.4MHz-rate deviation output to whatever rate the mixer/
+   TimPlayer actually runs at, and fed continuously into a looping ring
+   buffer. stream_ok_g mirrors audio_ok_g's role -- tracks whether
+   audio_stream_init() succeeded, since it depends on
+   audio_test_tone_init() having already claimed the shared FX/song
+   handles. Clicking STREAM also turns demod_enabled_g on if it wasn't
+   already (streaming needs the same per-sample computation the DEM
+   readout uses; no reason to make the user click both). */
+static int stream_ok_g = 0;
+static int stream_enabled_g = 0;
+static icon_handle icon_stream_g = 0;
+
 /* Diagnostic-only globals, drawn as a text line during redraw (see
    Redraw_spectrum). Originally added to chase down a real bug: DeviceFS
    pads short reads to the requested size in its default blocking mode
@@ -508,10 +522,45 @@ static int debug_n_elevated_g = 0;
    something on the order of the format's actual deviation (up to
    ~75kHz for wideband FM), not near-zero (no real modulation) or wildly
    erratic/clipped-looking (pure noise / no real signal). */
+/* Decimation counter for the audio-streaming path below -- persists
+   across calls (many frames contribute to one audio chunk), reset
+   whenever streaming starts (see Click_spectrum) so a stale count
+   from a previous session at a different mixer rate can't leave the
+   first chunk misaligned. */
+static int stream_decim_counter_g = 0;
+
 static void demodulate_frame(const double *re, const double *im)
 {
+    static short audio_chunk[FFT_SIZE]; /* worst case one sample per
+                                            input sample (divisor==1);
+                                            always enough room */
+    int audio_chunk_len;
+    int decim_divisor;
+    int stream_rate;
     int k;
     double prod_re, prod_im, dev_hz, sum_sq, peak_abs, rms_hz;
+
+    /* +-75kHz is standard wideband FM's full-scale deviation --
+       scaling that range to +-32767 gives a normally-loud PCM signal
+       for a properly-tuned station without needing per-station gain
+       adjustment. audio_stream_rate() reflects the mixer's REAL
+       configured rate (queried once at audio_stream_init()), not an
+       assumed constant -- 2.4MHz/rate rounds to the nearest whole
+       divisor so decimation stays close to exact even for
+       non-round mixer rates. */
+    stream_rate = 0;
+    decim_divisor = 1;
+    audio_chunk_len = 0;
+    if (stream_enabled_g) {
+        stream_rate = audio_stream_rate();
+        if (stream_rate > 0) {
+            decim_divisor =
+                (int)(DEMOD_SAMPLE_RATE_HZ / (double)stream_rate + 0.5);
+            if (decim_divisor < 1) {
+                decim_divisor = 1;
+            }
+        }
+    }
 
     sum_sq = 0.0;
     peak_abs = 0.0;
@@ -524,6 +573,24 @@ static void demodulate_frame(const double *re, const double *im)
         if (fabs(dev_hz) > peak_abs) {
             peak_abs = fabs(dev_hz);
         }
+
+        if (stream_enabled_g && stream_rate > 0) {
+            stream_decim_counter_g++;
+            if (stream_decim_counter_g >= decim_divisor) {
+                double pcm;
+                stream_decim_counter_g = 0;
+                pcm = dev_hz / 75000.0 * 32767.0;
+                if (pcm > 32767.0) {
+                    pcm = 32767.0;
+                }
+                if (pcm < -32768.0) {
+                    pcm = -32768.0;
+                }
+                if (audio_chunk_len < FFT_SIZE) {
+                    audio_chunk[audio_chunk_len++] = (short)pcm;
+                }
+            }
+        }
     }
     rms_hz = sqrt(sum_sq / (double)(FFT_SIZE - 1));
 
@@ -531,6 +598,15 @@ static void demodulate_frame(const double *re, const double *im)
                        rms_hz * DEMOD_ALPHA;
     demod_dev_peak_g = demod_dev_peak_g * (1.0 - DEMOD_ALPHA) +
                         peak_abs * DEMOD_ALPHA;
+
+    if (audio_chunk_len > 0) {
+        /* Return value (samples actually accepted) is deliberately
+           ignored -- this is a real-time stream, not a queue with
+           backpressure; audio_stream_feed() already drops whatever it
+           can't safely fit, which is the correct behaviour under a
+           production hiccup, not an error to handle here. */
+        audio_stream_feed(audio_chunk, audio_chunk_len);
+    }
 }
 
 static void accumulate_frame(void)
@@ -580,7 +656,7 @@ static void accumulate_frame(void)
         }
     }
 
-    if (demod_enabled_g) {
+    if (demod_enabled_g || stream_enabled_g) {
         demodulate_frame(re, im);
     }
 
@@ -676,6 +752,8 @@ static void finalize_display(void)
 
 static void cleanup_and_exit(void)
 {
+    audio_stream_close();     /* must precede audio_test_tone_close() --
+                                  see Audio.h */
     audio_test_tone_close();
     if (stream_handle_g != 0) {
         os_find_close(stream_handle_g);
@@ -1105,6 +1183,11 @@ static void update_tone_icon(void)
     set_icon_selected(icon_tone_g, tone_playing_g);
 }
 
+static void update_stream_icon(void)
+{
+    set_icon_selected(icon_stream_g, stream_enabled_g);
+}
+
 /* All three gain buttons need the I2C repeater enabled around the
    register write, same as main()'s own init/tune bracket -- the
    repeater is disabled the rest of the time, and this handler runs
@@ -1139,6 +1222,26 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
             tone_playing_g = !tone_playing_g;
             audio_test_tone_play(tone_playing_g);
             update_tone_icon();
+        }
+        return TRUE;
+    }
+
+    if (icon == icon_stream_g) {
+        /* Same pattern as TONE -- pure software, does nothing if
+           audio_stream_init() never succeeded. Turning STREAM on also
+           turns DEM on (streaming needs the same per-sample
+           computation the DEM readout uses -- no reason to make the
+           user click both), but turning STREAM off leaves DEM as the
+           user had it, since they might still want the readout. */
+        if (stream_ok_g) {
+            stream_enabled_g = !stream_enabled_g;
+            if (stream_enabled_g) {
+                demod_enabled_g = 1;
+                update_demod_icon();
+                stream_decim_counter_g = 0;
+            }
+            audio_stream_play(stream_enabled_g);
+            update_stream_icon();
         }
         return TRUE;
     }
@@ -1391,6 +1494,15 @@ static void create_tone_icon(window_handle win)
     icon_tone_g = create_button_icon(win, 8, 88, ICON_ROW2_Y, "TONE");
 }
 
+/* Same row as TONE, to its right -- "STREAM" (6 characters) gets
+   generous width (160, vs 80 for the 3-4 character labels) given how
+   tight DEM/TONE already were at narrower widths. Up to x=256, well
+   clear of WORK_WIDTH=512. */
+static void create_stream_icon(window_handle win)
+{
+    icon_stream_g = create_button_icon(win, 96, 256, ICON_ROW2_Y, "STREAM");
+}
+
 int main(void)
 {
     int n;
@@ -1494,9 +1606,11 @@ int main(void)
     create_freq_icons(spectrum_window_g);
     create_demod_icon(spectrum_window_g);
     create_tone_icon(spectrum_window_g);
-    update_agc_icon();   /* reflect gain_mode_g's initial AGC state */
-    update_demod_icon(); /* reflect demod_enabled_g's initial OFF state */
-    update_tone_icon();  /* reflect tone_playing_g's initial OFF state */
+    create_stream_icon(spectrum_window_g);
+    update_agc_icon();    /* reflect gain_mode_g's initial AGC state */
+    update_demod_icon();  /* reflect demod_enabled_g's initial OFF state */
+    update_tone_icon();   /* reflect tone_playing_g's initial OFF state */
+    update_stream_icon(); /* reflect stream_enabled_g's initial OFF state */
 
     /* Non-fatal: a brand new, experimental subsystem (see Audio.h)
        shouldn't take down the whole proven spectrum display if
@@ -1507,6 +1621,18 @@ int main(void)
         report_warning("Audio test tone setup failed (TimPlayer module "
                         "not available?) -- the TONE button will do "
                         "nothing. Everything else is unaffected.");
+    }
+
+    /* Requires audio_ok_g (audio_stream_init() reuses the FX/song
+       handles audio_test_tone_init() claims -- see Audio.h). Same
+       non-fatal treatment as the test tone. */
+    if (audio_ok_g) {
+        stream_ok_g = (audio_stream_init() == 0);
+        if (!stream_ok_g) {
+            report_warning("Audio streaming setup failed -- the STREAM "
+                            "button will do nothing. Everything else "
+                            "(including TONE) is unaffected.");
+        }
     }
 
     Window_Show(spectrum_window_g, open_CENTERED);

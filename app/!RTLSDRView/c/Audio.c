@@ -18,6 +18,12 @@
 #include "Audio.h"
 
 #define SWI_OS_Module 0x1E
+#define SWI_OS_ReadMonotonicTime 0x42 /* returns centiseconds in r0 --
+                                          same counter DeskLib's
+                                          Time_Monotonic() wraps, used
+                                          directly here since Audio.c
+                                          (like Driver.c) doesn't pull
+                                          in DeskLib */
 
 #define TimPlayer_Configure         0x051381
 #define TimPlayer_SongNew           0x051384
@@ -44,6 +50,39 @@ static int fx_handle_g = -1;
 static short *sample_buf_g = 0;
 static int sample_size_g = 0; /* samples actually filled/registered */
 static int playing_g = 0;
+
+/* ---- streaming ring buffer (see Audio.h) ---- */
+#define STREAM_SAMPLE_INDEX 2 /* distinct from the test tone's index 1
+                                  -- both live in the same song/FX
+                                  handles, and could in principle play
+                                  at once, though the app only ever
+                                  drives one at a time in practice */
+#define STREAM_BUF_SECONDS 2  /* ring buffer length -- long enough to
+                                  ride out a brief production stall
+                                  without an audible underrun, short
+                                  enough that the inherent latency
+                                  (audio you hear reflects input from
+                                  up to this long ago) stays reasonable
+                                  for a live radio receiver */
+#define STREAM_SAFETY_MS    200 /* don't write within this many ms
+                                    "ahead of" the estimated play
+                                    position -- guards against our
+                                    wall-clock position estimate (see
+                                    Audio.h) being slightly off */
+
+static short *stream_buf_g = 0;
+static int stream_capacity_g = 0;  /* samples */
+static int stream_rate_g = 0;      /* Hz */
+static int stream_write_pos_g = 0; /* samples, 0..stream_capacity_g-1 */
+static int stream_playing_g = 0;
+static unsigned int stream_start_time_g = 0; /* centiseconds */
+
+static unsigned int monotonic_cs(void)
+{
+    _kernel_swi_regs regs;
+    _kernel_swi(SWI_OS_ReadMonotonicTime, &regs, &regs);
+    return (unsigned int)regs.r[0];
+}
 
 /* OS_Module reason 18 (Lookup): is TimPlayer already resident? Most
    RISC OS 5 desktops already have it loaded (boot sounds etc.), so
@@ -259,4 +298,210 @@ void audio_test_tone_close(void)
         _kernel_swi(SWI_OS_Module, &regs, &regs);
         sample_buf_g = 0;
     }
+}
+
+int audio_stream_init(void)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *err;
+
+    if (song_handle_g < 0 || fx_handle_g < 0) {
+        return -1; /* audio_test_tone_init() must succeed first */
+    }
+
+    regs.r[0] = 5; /* Configure reason: read mixer sample rate */
+    err = _kernel_swi(TimPlayer_Configure, &regs, &regs);
+    if (err != 0) {
+        return -1;
+    }
+    stream_rate_g = regs.r[1];
+
+    stream_capacity_g = stream_rate_g * STREAM_BUF_SECONDS;
+    if (stream_capacity_g > MAX_BUFFER_SAMPLES) {
+        stream_capacity_g = MAX_BUFFER_SAMPLES;
+    }
+
+    regs.r[0] = 6; /* Claim */
+    regs.r[3] = stream_capacity_g * (int)sizeof(short);
+    err = _kernel_swi(SWI_OS_Module, &regs, &regs);
+    if (err != 0) {
+        stream_rate_g = 0;
+        stream_capacity_g = 0;
+        return -1;
+    }
+    stream_buf_g = (short *)regs.r[2];
+    memset(stream_buf_g, 0, (size_t)stream_capacity_g * sizeof(short));
+    stream_write_pos_g = 0;
+
+    regs.r[0] = song_handle_g;
+    regs.r[1] = (int)(0x80000000u | (unsigned)STREAM_SAMPLE_INDEX);
+    regs.r[2] = stream_capacity_g;
+    regs.r[3] = (int)stream_buf_g;
+    regs.r[4] = 0xC; /* sample format flags -- verbatim from PlayTone */
+    regs.r[5] = 0;
+    regs.r[6] = 0;
+    err = _kernel_swi(TimPlayer_SampleInfo, &regs, &regs);
+    if (err != 0) {
+        return -1;
+    }
+
+    regs.r[0] = song_handle_g;
+    regs.r[1] = (int)(0x80000000u | (unsigned)STREAM_SAMPLE_INDEX);
+    regs.r[2] = 256;
+    regs.r[3] = 256;
+    regs.r[4] = 0;
+    regs.r[5] = stream_rate_g;
+    regs.r[6] = 0;
+    regs.r[7] = 0;
+    err = _kernel_swi(TimPlayer_SampleMisc, &regs, &regs);
+    if (err != 0) {
+        return -1;
+    }
+
+    regs.r[0] = song_handle_g;
+    regs.r[1] = (int)(0x80000000u | (unsigned)STREAM_SAMPLE_INDEX);
+    regs.r[2] = 0;
+    regs.r[3] = stream_capacity_g;
+    regs.r[4] = 0;
+    regs.r[5] = 0;
+    err = _kernel_swi(TimPlayer_SampleLoops, &regs, &regs);
+    if (err != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+void audio_stream_play(int play)
+{
+    _kernel_swi_regs regs;
+
+    if (stream_buf_g == 0) {
+        return; /* audio_stream_init() never succeeded */
+    }
+
+    stream_playing_g = play ? 1 : 0;
+
+    if (stream_playing_g) {
+        /* Fresh reference point for audio_stream_feed()'s wall-clock
+           position estimate -- and start from a silent (zeroed)
+           buffer position 0, so there's no stale leftover content
+           from a previous run audible before real data catches up. */
+        stream_write_pos_g = 0;
+        stream_start_time_g = monotonic_cs();
+
+        regs.r[0] = fx_handle_g;
+        regs.r[1] = 0;
+        regs.r[2] = song_handle_g;
+        regs.r[3] = STREAM_SAMPLE_INDEX;
+        regs.r[4] = 0x40;
+        regs.r[5] = 256; /* volume */
+        regs.r[6] = 128; /* panning */
+        _kernel_swi(TimPlayer_FXPlaySample, &regs, &regs);
+    } else {
+        regs.r[0] = fx_handle_g;
+        regs.r[1] = 0;
+        regs.r[2] = 0;
+        regs.r[3] = 0;
+        _kernel_swi(TimPlayer_FXNoteAction, &regs, &regs);
+    }
+}
+
+int audio_stream_feed(const short *samples, int n)
+{
+    unsigned int elapsed_cs;
+    int play_pos;
+    int safety;
+    int space;
+    int written;
+    int i;
+
+    if (!stream_playing_g || stream_buf_g == 0) {
+        return 0;
+    }
+
+    /* elapsed_cs wraps the same way OS_ReadMonotonicTime's own counter
+       does (roughly every 497 days) -- unsigned subtraction handles
+       that correctly regardless of which side of a wrap
+       stream_start_time_g and "now" fall on. */
+    elapsed_cs = monotonic_cs() - stream_start_time_g;
+
+    play_pos = (int)(((unsigned long)elapsed_cs *
+                       (unsigned long)stream_rate_g / 100UL) %
+                      (unsigned long)stream_capacity_g);
+
+    safety = (stream_rate_g * STREAM_SAFETY_MS) / 1000;
+    if (safety >= stream_capacity_g) {
+        safety = stream_capacity_g - 1;
+    }
+
+    /* How much room is there going FORWARD from stream_write_pos_g
+       before reaching (play_pos - safety)? This throttles production
+       to match real-time playback consumption automatically: if we're
+       already comfortably ahead, space is large and everything gets
+       written; if we've caught up close to the play head, space
+       shrinks toward 0 and writes get held back until playback has
+       consumed more. */
+    space = play_pos - stream_write_pos_g;
+    if (space < 0) {
+        space += stream_capacity_g;
+    }
+    space -= safety;
+    if (space < 0) {
+        space = 0;
+    }
+
+    written = (n < space) ? n : space;
+    for (i = 0; i < written; i++) {
+        stream_buf_g[stream_write_pos_g] = samples[i];
+        stream_write_pos_g++;
+        if (stream_write_pos_g >= stream_capacity_g) {
+            stream_write_pos_g = 0;
+        }
+    }
+    return written;
+}
+
+int audio_stream_rate(void)
+{
+    return stream_rate_g;
+}
+
+void audio_stream_close(void)
+{
+    _kernel_swi_regs regs;
+
+    if (stream_playing_g) {
+        audio_stream_play(0);
+    }
+
+    if (song_handle_g >= 0 && stream_buf_g != 0) {
+        /* Unlike audio_test_tone_close()'s release call (which uses
+           index 0, verbatim from PlayTone's own App_Close -- PlayTone
+           only ever has one sample, at index 1, so whether "release"
+           genuinely means "release index 0" or something else was
+           never distinguishable from that source alone), this
+           releases the SPECIFIC index this buffer was registered at.
+           Worst case if that's wrong is a harmless TimPlayer-internal
+           leak until the module's next reload, not a crash -- see
+           docs/PLAN.md. */
+        regs.r[0] = song_handle_g;
+        regs.r[1] = (int)(0x80000000u | (unsigned)STREAM_SAMPLE_INDEX);
+        regs.r[2] = 0;
+        regs.r[3] = 0;
+        regs.r[4] = 0;
+        regs.r[5] = 0;
+        regs.r[6] = 0;
+        _kernel_swi(TimPlayer_SampleInfo, &regs, &regs);
+    }
+
+    if (stream_buf_g != 0) {
+        regs.r[0] = 7; /* Free */
+        regs.r[2] = (int)stream_buf_g;
+        _kernel_swi(SWI_OS_Module, &regs, &regs);
+        stream_buf_g = 0;
+    }
+
+    stream_rate_g = 0;
+    stream_capacity_g = 0;
 }
