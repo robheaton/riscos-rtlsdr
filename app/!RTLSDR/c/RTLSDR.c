@@ -797,6 +797,68 @@ static void milestone8_multistream_throughput(int device_num)
     printf("\n--- milestone 8 diagnostic done ---\n");
 }
 
+/* ---- milestone 9 (diagnostic): does the sample-rate register write
+   actually hold? ----
+
+   Every real, sustained measurement so far (milestones 6-8) implies an
+   actual captured rate of roughly 10-30K IQ samples/sec -- 2-3 orders
+   of magnitude below the 2.4 MSPS rtlsdr_set_sample_rate(2400000) is
+   supposed to configure. All the obvious software explanations (chunk
+   size, DeviceFS buffer size, retry strategy, GUI overhead, one-
+   transfer-in-flight, wrong USB controller) have been tested and ruled
+   out or found insufficient. rtlsdr_set_sample_rate()'s register math
+   was checked against upstream and matches exactly, but that only
+   proves the WRITE is correct -- never confirmed the chip actually
+   LATCHED it. This reads registers 0x9f/0xa1 (page 1) straight back
+   after rtlsdr_set_sample_rate(dev, 2400000) and compares against the
+   resample ratio that rate should produce, direct and cheap, before
+   concluding the ceiling is unfixable from application code. */
+
+static void milestone9_sample_rate_readback(const char *dev)
+{
+    unsigned long expect_ratio;
+    int hi, lo;
+    unsigned long actual_ratio;
+
+    printf("\n--- milestone 9 (diagnostic): sample-rate register "
+           "readback ---\n");
+
+    printf("Re-issuing rtlsdr_set_sample_rate(dev, 2400000)...\n");
+    rtlsdr_set_sample_rate(dev, 2400000UL);
+
+    expect_ratio = (unsigned long)((28800000.0 * 4194304.0) / 2400000.0);
+    expect_ratio &= 0x0ffffffcUL;
+
+    hi = rtlsdr_demod_read_reg(dev, 1, 0x9f, 2);
+    lo = rtlsdr_demod_read_reg(dev, 1, 0xa1, 2);
+
+    if (hi < 0 || lo < 0) {
+        printf("readback FAILED (hi=%d lo=%d)\n", hi, lo);
+        printf("\n--- milestone 9 diagnostic done ---\n");
+        return;
+    }
+
+    actual_ratio = (((unsigned long)hi & 0xffffUL) << 16) |
+                   ((unsigned long)lo & 0xffffUL);
+
+    printf("expected rsamp_ratio for 2.4 MSPS: 0x%08lX\n", expect_ratio);
+    printf("register 0x9f (hi 16 bits) = 0x%04X\n", (unsigned int)hi);
+    printf("register 0xa1 (lo 16 bits) = 0x%04X\n", (unsigned int)lo);
+    printf("readback rsamp_ratio        : 0x%08lX\n", actual_ratio);
+
+    if (actual_ratio == expect_ratio) {
+        printf("MATCH -- the register write held. Sample-rate config "
+               "is not the cause of the low captured rate.\n");
+    } else {
+        printf("MISMATCH -- the register did NOT hold the expected "
+               "value. This would explain the whole throughput "
+               "ceiling: the chip may be running at a much lower real "
+               "rate than we think we configured.\n");
+    }
+
+    printf("\n--- milestone 9 diagnostic done ---\n");
+}
+
 /* ---- entry point ---- */
 
 int main(void)
@@ -864,6 +926,12 @@ int main(void)
        from our own app) or a deeper, unfixable-from-here constraint.
        See the comment above milestone8_multistream_throughput(). */
     milestone8_multistream_throughput(n);
+
+    /* Diagnostic, not gating -- sanity-checks that the sample-rate
+       register write actually held, since every real measurement so
+       far implies a captured rate far below what 2.4 MSPS should give
+       us. See the comment above milestone9_sample_rate_readback(). */
+    milestone9_sample_rate_readback(device_name);
 
     return 0;
 }
