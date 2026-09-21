@@ -893,7 +893,22 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
        returning to Wimp_Poll -- the two caps serve different purposes
        and both still apply. */
 #define MAX_READ_ATTEMPTS 1200
-#define MAX_FRAMES_PER_TICK 8
+/* Raised from 8 now that `nopad` (see the stream-open path in main())
+   fixes correctness at any chunk size -- measured throughput at
+   FIXED_CHUNK_SIZE=512 with nopad was, surprisingly, WORSE than the
+   old tiny-chunk workaround (r=7k vs. r=23k), even though each frame
+   now fills in far fewer, far cheaper read attempts. That points at
+   THIS cap, not chunk size, as the real remaining bottleneck: overall
+   throughput is roughly (Wimp idle-tick rate) x MAX_FRAMES_PER_TICK x
+   FFT_SIZE, so capping frames-per-tick this low limits total
+   throughput regardless of how efficiently each individual frame
+   fills. Non-blocking reads still can't hang, so this is safe to
+   raise -- the real risk is the SAME category the original 8 was
+   chosen to avoid (reintroducing the CPU-hogging unresponsiveness the
+   very first MAX_FRAMES_PER_TICK cap fixed), so raised by 8x, not
+   removed outright, to test the throughput hypothesis while watching
+   for that regression. */
+#define MAX_FRAMES_PER_TICK 64
     any_ok = 0;
     n_frames = 0;
     for (i = 0; i < MAX_READ_ATTEMPTS; i++) {
