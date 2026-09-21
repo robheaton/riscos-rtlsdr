@@ -1154,7 +1154,11 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                        elapsed_s / 1000.0)
                     : 0.0;
 
-                sprintf(line2, "dev pk=%.1fk rms=%.1fk Hz r=%.0fk/2400k",
+                /* Shortened after this line was reported clipped off
+                   the edge of the window on real hardware -- dropped
+                   "Hz"/"/2400k" (the 2400 target is implicit/known)
+                   and tightened the labels. */
+                sprintf(line2, "pk=%.0fk rms=%.0fk r=%.0fk",
                         demod_dev_peak_g / 1000.0,
                         demod_dev_rms_g / 1000.0, achieved_ksps);
                 GFX_VDU(5);
