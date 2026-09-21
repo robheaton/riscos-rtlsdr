@@ -219,8 +219,17 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    real data (at the cost of many more individual SWI calls per frame
    -- non-blocking mode means none of them can hang, so this is safe
    to test even though it's a lot more calls). 8 bytes = 4 samples,
-   smaller than anything in milestone 4's original size sweep. */
-#define FIXED_CHUNK_SIZE 8
+   smaller than anything in milestone 4's original size sweep, DID
+   fix the spectrum (real multi-peak shape, confirmed on hardware) --
+   but real achieved throughput measured only ~15k samples/sec against
+   the SDR's actual 2.4M (see app_start_time_g's diagnostic comment in
+   Redraw_spectrum), ~160x too slow for any real-time audio, and per-
+   call SWI overhead (not USB hardware bandwidth) is the obvious
+   suspect: 8 bytes needs 60+ individual calls to fill one 256-sample
+   frame. Never tested anything BETWEEN 8 (correct, overhead-bound) and
+   256 (fast, corrupted) -- trying 64 now to see whether the
+   correctness/throughput tradeoff has a viable middle ground. */
+#define FIXED_CHUNK_SIZE 64
 
 /* ---- global state ---- */
 static char device_name_g[16];
