@@ -570,6 +570,105 @@ static void milestone6_honest_throughput(int device_num)
     printf("\n--- milestone 6 diagnostic done ---\n");
 }
 
+/* ---- milestone 7 (diagnostic): DeviceCall_USB_TransferInfo ----
+
+   Milestone 6 found "avg bytes/successful read" pinned at almost
+   exactly 2, rock solid across every chunk size (512-65536) and every
+   DeviceFS `size/N` stream-buffer size tried (default/128KB/512KB),
+   while total bytes/sec bounced noisily between runs (e.g. 4096-byte
+   chunks: 63 KB/s with a 128KB buffer, 33 KB/s with a 512KB buffer,
+   same code, different run) -- the signature of polling far faster
+   than real data arrives, catching a small dribble each time, rather
+   than a chunk-size-dependent effect. That means total bytes/sec IS
+   already close to the true achieved rate, and no read-loop tuning
+   parameter tried so far has been able to move it.
+
+   This uses a DIFFERENT diagnostic API, never tried before now: the
+   USB doc's "Transfer Info" DeviceFS_CallDevice extension (added in
+   USBDriver 0.49), which reports on the ACTUAL underlying USB
+   transfer DeviceFS has open right now -- bytes received so far vs.
+   total requested, live status (in progress/complete/error), and how
+   many bytes were synthetic padding. It needs a USB stream handle
+   first, from "Return Handles 2" (reason 7, given the fileswitch
+   stream handle from os_find_open). Reading this immediately after a
+   read() call should show directly whether DeviceFS is really running
+   ONE big transfer per read() (in which case bytes-received should
+   climb toward the full requested size over repeated polls) or
+   something else -- information the r/got numbers alone can't give
+   us. */
+
+#define SWI_DeviceFS_CallDevice 0x42744
+#define DEVCALL_RETURN_HANDLES_2 ((int)0x80000007u)
+#define DEVCALL_TRANSFER_INFO    ((int)0x80000006u)
+
+static void milestone7_transfer_info_diagnostic(int device_num)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *err;
+    char dev[16];
+    char path[80];
+    unsigned char buf[4096];
+    int handle;
+    int usb_stream_handle;
+    int i, got;
+
+    printf("\n--- milestone 7 (diagnostic): DeviceCall_USB_TransferInfo "
+           "---\n");
+
+    sprintf(dev, "usb%d", device_num);
+    rtlsdr_reset_buffer(dev);
+    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
+                  "nopad;size131072:%s",
+            RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, dev);
+    handle = os_find_open(path);
+    if (handle == 0) {
+        printf("OS_Find FAILED -- aborting milestone 7.\n");
+        return;
+    }
+    if (os_args_set_nonblocking(handle, 1) != 0) {
+        printf("could not enable non-blocking -- aborting milestone 7.\n");
+        os_find_close(handle);
+        return;
+    }
+
+    regs.r[0] = DEVCALL_RETURN_HANDLES_2;
+    regs.r[1] = (int)dev;
+    regs.r[2] = handle;
+    err = _kernel_swi(SWI_DeviceFS_CallDevice, &regs, &regs);
+    if (err != NULL) {
+        printf("Return Handles 2 FAILED: %s\n", err->errmess);
+        os_args_set_nonblocking(handle, 0);
+        os_find_close(handle);
+        return;
+    }
+    usb_stream_handle = regs.r[5];
+    printf("USB stream handle = 0x%08X\n", (unsigned int)usb_stream_handle);
+
+    printf("\n-- 4096-byte reads, checking TransferInfo right after each "
+           "--\n");
+    for (i = 0; i < 15; i++) {
+        got = os_gbpb_read4(handle, buf, sizeof(buf));
+
+        regs.r[0] = DEVCALL_TRANSFER_INFO;
+        regs.r[1] = (int)dev;
+        regs.r[2] = usb_stream_handle;
+        err = _kernel_swi(SWI_DeviceFS_CallDevice, &regs, &regs);
+        if (err != NULL) {
+            printf("read %2d: got=%4d  TransferInfo FAILED: %s\n", i, got,
+                   err->errmess);
+            continue;
+        }
+        printf("read %2d: got=%4d  xfer: received=%d requested=%d "
+               "status=%d padded=%d\n", i, got, regs.r[0], regs.r[1],
+               regs.r[3], regs.r[4]);
+        fflush(stdout);
+    }
+
+    os_args_set_nonblocking(handle, 0);
+    os_find_close(handle);
+    printf("\n--- milestone 7 diagnostic done ---\n");
+}
+
 /* ---- entry point ---- */
 
 int main(void)
@@ -625,6 +724,12 @@ int main(void)
        throughput ceiling is a USB/driver limit or a Wimp idle-tick
        artifact. See the comment above milestone6_honest_throughput(). */
     milestone6_honest_throughput(n);
+
+    /* Diagnostic, not gating -- a different API (Transfer Info) to see
+       what DeviceFS's own view of the in-flight transfer looks like,
+       since milestone 6 alone couldn't distinguish "genuinely tiny
+       transfers" from "polling faster than one big transfer fills". */
+    milestone7_transfer_info_diagnostic(n);
 
     return 0;
 }
