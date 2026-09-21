@@ -949,7 +949,30 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
             break;
         }
         if (got == 0) {
-            break;
+            /* THE REAL THROUGHPUT BOTTLENECK (found by reading
+               USBDriver's start_read()/read_cb() this session): the
+               driver allows only ONE bulk transfer in flight at a
+               time. If a read() call finds the previous transfer
+               still busy, it returns 0 immediately WITHOUT submitting
+               anything and without checking completion -- completion
+               is only noticed, via an interrupt-driven callback
+               clearing xfer_busy, on a LATER read() call. So got==0
+               here does not mean "no more data available right now"
+               (this loop's old assumption, correct for the earlier
+               DeviceFS-padding-era model) -- it means "the single
+               outstanding transfer hasn't completed yet, try again."
+               Breaking out here (as this loop used to) abandons the
+               whole frame-fill attempt after essentially ONE real
+               transfer, handing control back to Wimp_Poll and not
+               resuming until the next idle tick -- which matches
+               every throughput figure measured all session (7k-40k)
+               regardless of chunk size or MAX_FRAMES_PER_TICK, since
+               those never mattered if only ~1 transfer/tick was ever
+               completing. Retrying immediately (bounded by
+               MAX_READ_ATTEMPTS, still non-blocking so this can't
+               hang) is the driver's own intended polling pattern for
+               waiting on the in-flight transfer to complete. */
+            continue;
         }
         memcpy(accum_buf_g + accum_fill_g, read_tmp_g, (size_t)got);
         /* Only count whole I/Q pairs. want is always even (IQ_BYTES and
