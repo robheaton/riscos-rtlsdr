@@ -231,9 +231,11 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    the spectrum again (back to the flat/noisy pattern) while only
    raising achieved throughput to ~40k -- so the honesty threshold
    sits somewhere between 8 and 64, and 40k is still nowhere near
-   2.4M anyway. Narrowing down: 16 next, the smallest step up from
-   the known-good size. */
-#define FIXED_CHUNK_SIZE 16
+   2.4M anyway. 16 confirmed correct on real hardware (r=23k, up from
+   15k at 8 -- a modest but real improvement) -- trying 32 next,
+   continuing to narrow toward the threshold between working (<=16
+   so far) and broken (64). */
+#define FIXED_CHUNK_SIZE 32
 
 /* ---- global state ---- */
 static char device_name_g[16];
