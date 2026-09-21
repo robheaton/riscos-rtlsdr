@@ -438,6 +438,130 @@ static void milestone5_read_primitive_diagnostic(int device_num)
     printf("\n--- milestone 5 diagnostic done ---\n");
 }
 
+/* ---- milestone 6 (diagnostic): honest sustained throughput, no Wimp/
+   GUI involved at all ----
+
+   !RTLSDRView's live spectrum/audio app measures real (non-blocking,
+   nopad, honest-short-read) throughput stuck around 7-23k samples/sec
+   (~14-46 KB/s) no matter how FIXED_CHUNK_SIZE, MAX_FRAMES_PER_TICK,
+   or the read-retry logic are tuned -- roughly 0.5% of the 2.4 MSPS
+   target. Every one of those tuning attempts still runs inside its
+   Wimp idle-tick loop (Event_Claim(event_NULL, ...), one bounded batch
+   of work per Wimp_Poll return), so it's never been possible to tell
+   whether that ceiling is a real USB/driver/hardware limit or an
+   artifact of how infrequently/cheaply that idle handler gets to run.
+   This test removes the GUI entirely: open the same nopad + non-
+   blocking stream !RTLSDRView uses, then read in a tight loop bounded
+   ONLY by wall-clock time (no per-call attempt cap, no round trips
+   through any event loop) and report the real, honest bytes/sec.
+   Also worth noting: milestone 4's own 25.6 MB/s figure (this same
+   file, above) was later shown by milestone 5's sentinel test to be
+   fake -- blocking-mode reads claiming got==512 every time while only
+   the first ~2 bytes were genuinely written. So there has never
+   actually been a trustworthy measurement of this driver's real
+   sustained bulk-read rate until this one. */
+
+#define M6_TEST_SECONDS 3
+
+static void milestone6_honest_throughput(int device_num)
+{
+    static const int sizes[] = { 512, 4096, 16384, 65536 };
+    char dev[16];
+    char path[80];
+    unsigned char *buf;
+    unsigned char last_good[8];
+    int handle;
+    int s;
+    int got;
+    unsigned long total_bytes;
+    unsigned long total_reads;
+    unsigned long empty_polls;
+    clock_t tstart, tnow;
+    double tsec;
+    double bps;
+
+    printf("\n--- milestone 6 (diagnostic): honest sustained throughput, "
+           "no Wimp/GUI involved ---\n");
+
+    sprintf(dev, "usb%d", device_num);
+
+    for (s = 0; s < 4; s++) {
+        buf = (unsigned char *)malloc((size_t)sizes[s]);
+        if (buf == NULL) {
+            printf("size=%d: malloc FAILED, skipping\n", sizes[s]);
+            continue;
+        }
+
+        rtlsdr_reset_buffer(dev);
+        sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
+                      "nopad:%s",
+                RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, dev);
+        handle = os_find_open(path);
+        if (handle == 0) {
+            printf("size=%d: OS_Find FAILED, skipping\n", sizes[s]);
+            free(buf);
+            continue;
+        }
+        if (os_args_set_nonblocking(handle, 1) != 0) {
+            printf("size=%d: could not enable non-blocking, skipping\n",
+                   sizes[s]);
+            os_find_close(handle);
+            free(buf);
+            continue;
+        }
+
+        printf("\n-- size=%d bytes, %d second(s) --\n", sizes[s],
+               M6_TEST_SECONDS);
+        fflush(stdout);
+
+        total_bytes = 0;
+        total_reads = 0;
+        empty_polls = 0;
+        memset(last_good, 0, sizeof(last_good));
+        tstart = clock();
+        for (;;) {
+            got = os_gbpb_read4(handle, buf, sizes[s]);
+            if (got < 0) {
+                printf("  ERROR on read after %lu reads\n", total_reads);
+                break;
+            }
+            if (got == 0) {
+                empty_polls++;
+            } else {
+                total_bytes += (unsigned long)got;
+                total_reads++;
+                memcpy(last_good, buf, sizeof(last_good));
+            }
+            tnow = clock();
+            if (((double)(tnow - tstart) / CLOCKS_PER_SEC) >=
+                (double)M6_TEST_SECONDS) {
+                break;
+            }
+        }
+        tsec = (double)(clock() - tstart) / CLOCKS_PER_SEC;
+        bps = (tsec > 0.0) ? ((double)total_bytes / tsec) : 0.0;
+
+        printf("  %lu bytes in %.1fs = %.0f bytes/sec (%.1f%% of "
+               "target)\n", total_bytes, tsec, bps,
+               bps / (double)STREAM_TARGET_BPS * 100.0);
+        printf("  %lu successful reads, %lu empty (busy) polls, "
+               "avg %.0f bytes/successful read\n", total_reads,
+               empty_polls, (total_reads > 0) ?
+               ((double)total_bytes / (double)total_reads) : 0.0);
+        printf("  first bytes of last successful read: %02X %02X %02X "
+               "%02X %02X %02X %02X %02X\n", last_good[0], last_good[1],
+               last_good[2], last_good[3], last_good[4], last_good[5],
+               last_good[6], last_good[7]);
+        fflush(stdout);
+
+        os_args_set_nonblocking(handle, 0);
+        os_find_close(handle);
+        free(buf);
+    }
+
+    printf("\n--- milestone 6 diagnostic done ---\n");
+}
+
 /* ---- entry point ---- */
 
 int main(void)
@@ -488,6 +612,11 @@ int main(void)
     /* Diagnostic, not gating -- runs regardless of milestone 4's own
        pass/fail so we get the content-verification data either way. */
     milestone5_read_primitive_diagnostic(n);
+
+    /* Diagnostic, not gating -- isolates whether !RTLSDRView's real-
+       throughput ceiling is a USB/driver limit or a Wimp idle-tick
+       artifact. See the comment above milestone6_honest_throughput(). */
+    milestone6_honest_throughput(n);
 
     return 0;
 }
