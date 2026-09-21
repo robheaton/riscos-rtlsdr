@@ -465,7 +465,7 @@ static void milestone5_read_primitive_diagnostic(int device_num)
 
 static void milestone6_honest_throughput(int device_num)
 {
-    static const int sizes[] = { 512, 4096, 16384, 65536 };
+    static const int sizes[] = { 1024, 2048, 4096, 8192 };
     char dev[16];
     char path[80];
     unsigned char *buf;
@@ -493,21 +493,16 @@ static void milestone6_honest_throughput(int device_num)
         }
 
         rtlsdr_reset_buffer(dev);
-        /* size131072: DeviceFS's OWN documented `size/N` path field --
-           "the preferred stream BUFFER size to use. Some devices may
-           benefit from a larger buffer than the default." (USB API
-           doc, gitlab.riscosopen.org). Never set before this test --
-           every previous size sweep only ever changed the per-call
-           `want` argument to os_gbpb_read4(), never DeviceFS's own
-           internal buffer behind it, which may have been sitting at a
-           small default the whole time regardless of what we asked
-           for per call. Real syntax confirmed from the doc's own
-           worked example ("usbtimeout10000;size16384", no slashes) --
-           matches this file's existing usbtimeout2000, not a literal
-           "/". 128KB gives generous headroom over every chunk size
-           this sweep tests. */
+        /* First test at size131072 (128KB DeviceFS stream buffer, see
+           the size/N doc comment this replaced) found real gains from
+           a bigger buffer -- best result was 4096-byte chunks (21.6
+           -> 63 KB/s), notably better than either the smallest (512)
+           or largest (16384/65536) sizes tested. Pushing the buffer
+           bigger still (512KB) and narrowing the chunk-size sweep
+           around that 4096 sweet spot (1024/2048/4096/8192) to find
+           the real peak instead of the coarse 4x jumps tried so far. */
         sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
-                      "nopad;size131072:%s",
+                      "nopad;size524288:%s",
                 RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, dev);
         handle = os_find_open(path);
         if (handle == 0) {
