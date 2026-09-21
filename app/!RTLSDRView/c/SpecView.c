@@ -246,17 +246,18 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    that disables this at the source (see os_find_open()'s call site in
    main()) -- 512 (one atomic read per frame) confirmed CORRECT with
    nopad on real hardware (real multi-peak spectrum), but throughput
-   was WORSE than the old tiny-chunk workaround (r=7k vs r=23k), and
-   raising MAX_FRAMES_PER_TICK 8x barely moved it (r=8k) -- ruling that
-   cap out too. Points at nopad itself (or specifically large requests
-   under nopad) adding real per-call latency: without nopad, a request
-   could "succeed" instantly via padding; with it, the driver may now
-   genuinely wait to see whether more real data is coming before
-   reporting a short read, rather than faking completion immediately.
-   Testing 64 next -- small enough to hopefully avoid that latency,
-   but nopad should mean it no longer NEEDS to be tiny for
-   correctness, unlike the old 8/16-byte workaround. */
-#define FIXED_CHUNK_SIZE 64
+   stayed stuck around r=7-9k regardless of size (512, then 64 with
+   MAX_FRAMES_PER_TICK raised 8x -- barely moved either time), ruling
+   out chunk size and that cap as the bottleneck. Found a real,
+   different culprit instead: the read loop was still running a 0xAA
+   sentinel-fill + byte-by-byte "touched" comparison on EVERY attempt
+   -- essential while the padding mystery was open, pure overhead now
+   that nopad fixes it at the source, and its cost scaled directly
+   with FIXED_CHUNK_SIZE (more iterations at larger sizes), the
+   opposite of what should happen as size goes up. Removed. Back to
+   512 (one atomic read per frame, maximally efficient) now that
+   nothing should scale against it any more. */
+#define FIXED_CHUNK_SIZE 512
 
 /* ---- global state ---- */
 static char device_name_g[16];
@@ -421,19 +422,6 @@ static unsigned char debug_end_i_g = 0, debug_end_q_g = 0;
    incremental honest reads that just aren't summing to a full varied
    frame for some other reason. */
 static int debug_last_gots_g[3] = { -1, -1, -1 };
-
-/* gots 256,256,256 -- ALWAYS exactly matching `want`, never anything
-   else -- flatly contradicts milestone 5's own finding that honest
-   non-blocking reads typically return only about HALF of what's
-   requested. That's the original short-read-padding bug's exact
-   signature (len - r3 always equals len, i.e. r3 always reported as 0
-   regardless of true transfer size). Milestone 5's sentinel-fill test
-   (RTLSDR.c) proved non-blocking mode WAS honest -- but only for that
-   test's specific call pattern (a handful of isolated calls). Applying
-   the identical sentinel technique HERE, under SpecView's actual
-   sustained rapid-polling pattern, checks whether honesty holds up in
-   practice or silently reverts. */
-static int debug_last_touched_g[3] = { -1, -1, -1 };
 
 /* ---- in-place iterative radix-2 DIT FFT, fixed N=FFT_SIZE ---- */
 static void fft256(double *re, double *im)
@@ -937,23 +925,25 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
            entirely by never passing the SWI anything but a small, fixed,
            offset-0 buffer. */
         static unsigned char read_tmp_g[FIXED_CHUNK_SIZE];
-        int touched;
-        int k;
-        memset(read_tmp_g, 0xAA, FIXED_CHUNK_SIZE);
+        /* The 0xAA sentinel-fill + byte-by-byte "touched" comparison
+           that used to run HERE, on every single read attempt, was
+           essential while the padding mystery was open (see
+           docs/PLAN.md) -- but it's pure overhead now that the real
+           mechanism (USBDriver's own read_cb() padding) was found and
+           fixed via `nopad`. Cost scaled directly with
+           FIXED_CHUNK_SIZE (64 or 512 redundant iterations per
+           attempt, on potentially hundreds of attempts per tick), and
+           removing it is the leading suspect for why throughput
+           dropped when chunk size went up rather than improving --
+           the diagnostic itself may have been the bottleneck, not the
+           read mechanism it was measuring. debug_last_gots_g is kept
+           (cheap, 3 assignments) since it's still a handy live
+           readout. */
         want = FIXED_CHUNK_SIZE;
         got = os_gbpb_read4(stream_handle_g, read_tmp_g, want);
-        touched = 0;
-        for (k = 0; k < FIXED_CHUNK_SIZE; k++) {
-            if (read_tmp_g[k] != 0xAA) {
-                touched++;
-            }
-        }
         debug_last_gots_g[0] = debug_last_gots_g[1];
         debug_last_gots_g[1] = debug_last_gots_g[2];
         debug_last_gots_g[2] = got;
-        debug_last_touched_g[0] = debug_last_touched_g[1];
-        debug_last_touched_g[1] = debug_last_touched_g[2];
-        debug_last_touched_g[2] = touched;
         if (got < 0) {
             debug_reads_bad_g++;
             break;
