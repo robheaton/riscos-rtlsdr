@@ -236,16 +236,19 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    comb of evenly-spaced sharp spikes -- the classic signature of a
    periodic artifact repeating at a fixed sample interval, same
    category as the earlier 256-byte idx@0/128-alternating finding,
-   just at a different period). So the honesty threshold sits between
-   16 and 32. Even at the best correct size found (16, r=23k), that's
-   still only ~1% of the SDR's real 2.4M rate -- nowhere close to
-   sustaining any real-time audio stream regardless of further tuning
-   in this range; see docs/PLAN.md for why this looks like a hard
-   architectural limit of the non-blocking-read approach, not
-   something more chunk-size searching will fix. Settled on 16 as the
-   working baseline (correct data, best throughput found that stays
-   correct). */
-#define FIXED_CHUNK_SIZE 16
+   just at a different period). So the honesty threshold sat between
+   16 and 32 -- UNTIL the real root cause was found by reading
+   USBDriver's actual source (gitlab.riscosopen.org): its own
+   read_cb() zero-pads the remainder of any request that completes
+   short of the full size, a SECOND padding mechanism entirely
+   separate from (and not fixed by) the earlier non-blocking-mode fix.
+   The stream-open path now includes the real, documented `nopad` flag
+   that disables this at the source (see os_find_open()'s call site in
+   main()) -- testing 512 (the endpoint's native USB max packet size,
+   one atomic read per frame, maximally efficient) now that the actual
+   corruption mechanism should be disabled rather than merely dodged
+   by staying small. */
+#define FIXED_CHUNK_SIZE 512
 
 /* ---- global state ---- */
 static char device_name_g[16];
@@ -1650,7 +1653,22 @@ int main(void)
 
     rtlsdr_reset_buffer(device_name_g);
 
-    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000:%s",
+    /* nopad: a REAL, DOCUMENTED USBDriver stream-open flag (real
+       fetched source + docs, gitlab.riscosopen.org/RiscOS/Sources/
+       HWSupport/USB/USBDriver -- not guessed), found while
+       investigating why no chunk size above ~16-31 bytes could stay
+       correct. USBDriver's own read_cb() zero-pads the REMAINDER of a
+       request whenever a USB transfer completes short of the full
+       requested size (its own comment literally says "fill up the
+       rest of the request with garbage!") -- a SECOND, separate
+       padding mechanism from the DeviceFS-level short-read-count bug
+       fixed via the OS_Args non-blocking IOCtl earlier this session.
+       Zero-padding still differs from the 0xAA sentinel used to
+       "prove" reads were honest, so that fix's own validation never
+       caught it. `nopad` disables this at the source -- see
+       docs/PLAN.md. */
+    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
+                  "nopad:%s",
             RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, device_name_g);
     stream_handle_g = os_find_open(path);
     if (stream_handle_g == 0) {
