@@ -227,9 +227,13 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    call SWI overhead (not USB hardware bandwidth) is the obvious
    suspect: 8 bytes needs 60+ individual calls to fill one 256-sample
    frame. Never tested anything BETWEEN 8 (correct, overhead-bound) and
-   256 (fast, corrupted) -- trying 64 now to see whether the
-   correctness/throughput tradeoff has a viable middle ground. */
-#define FIXED_CHUNK_SIZE 64
+   256 (fast, corrupted) -- 64 was tried and, on real hardware, broke
+   the spectrum again (back to the flat/noisy pattern) while only
+   raising achieved throughput to ~40k -- so the honesty threshold
+   sits somewhere between 8 and 64, and 40k is still nowhere near
+   2.4M anyway. Narrowing down: 16 next, the smallest step up from
+   the known-good size. */
+#define FIXED_CHUNK_SIZE 16
 
 /* ---- global state ---- */
 static char device_name_g[16];
