@@ -344,6 +344,17 @@ static icon_handle icon_stream_g = 0;
    Left these counters in place -- still useful to see the pipeline is
    alive at a glance. */
 static unsigned long debug_reads_ok_g = 0;
+/* Set once in main(), right after Event_Initialise() -- used to
+   compute an ACHIEVED throughput figure (debug_reads_ok_g * FFT_SIZE
+   samples, divided by real elapsed wall-clock time) for the
+   diagnostic line below. Added while investigating why STREAM audio
+   plays in short bursts with silence between -- checking directly
+   whether real-world read throughput is anywhere near the 2.4MHz the
+   SDR is actually producing, rather than continuing to guess at the
+   ring-buffer logic (already fixed once -- see docs/PLAN.md -- without
+   resolving the symptom, which points at a throughput shortfall
+   upstream of the buffer entirely). */
+static unsigned int app_start_time_g = 0;
 static unsigned long debug_reads_bad_g = 0;
 static double debug_db_min_g = 0.0;
 static double debug_db_max_g = 0.0;
@@ -1123,10 +1134,29 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                detected) or wildly pegged near the Nyquist-limited max
                (clipping/no real signal, just noise). */
             if (demod_enabled_g) {
-                char line2[40];
-                sprintf(line2, "dev pk=%.1fk rms=%.1fk Hz",
+                char line2[48];
+                double elapsed_s;
+                double achieved_ksps;
+
+                /* Achieved read/process throughput (see
+                   app_start_time_g's comment) -- the real point of
+                   this whole diagnostic: is it anywhere near the
+                   2400 (kHz/ksps) the SDR is actually producing? If
+                   it's a small fraction of that, no amount of
+                   ring-buffer cleverness can make a continuous audio
+                   stream out of it -- the shortfall is upstream, in
+                   how much raw data gets read and processed per real
+                   second. */
+                elapsed_s = (double)(Time_Monotonic() - app_start_time_g) /
+                            100.0;
+                achieved_ksps = (elapsed_s > 0.0)
+                    ? ((double)debug_reads_ok_g * (double)FFT_SIZE /
+                       elapsed_s / 1000.0)
+                    : 0.0;
+
+                sprintf(line2, "dev pk=%.1fk rms=%.1fk Hz r=%.0fk/2400k",
                         demod_dev_peak_g / 1000.0,
-                        demod_dev_rms_g / 1000.0);
+                        demod_dev_rms_g / 1000.0, achieved_ksps);
                 GFX_VDU(5);
                 GFX_Move(ox + 4, oy - 158); /* below icon row 2 now */
                 GFX_Write0(line2);
@@ -1510,6 +1540,7 @@ int main(void)
     char path[64];
 
     Event_Initialise("RTLSDRView");
+    app_start_time_g = Time_Monotonic();
 
     n = find_device();
     if (n < 0) {
