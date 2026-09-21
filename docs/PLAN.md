@@ -1782,3 +1782,68 @@ single filtered 200kHz channel, so it's currently demodulating the
 combined energy of everything in view (multiple stations at once,
 per the new multi-peak spectrum), not one station -- a real per-channel
 filter/decimate stage is future work, not part of this fix.
+
+## Phase 2, follow-on: real audio output, milestone 1 (test tone)
+
+User supplied DigitalCD's own real source (`dcdsrc.zip`) as grounding
+for RISC OS audio output -- a much better foundation than guessing at
+undocumented SWIs, which this project had explicitly deferred earlier
+rather than risk (the interrupt-driven "linear handler" mechanism is
+the same category of risk as the GPIO/UpCall approach already avoided
+once). Two things fell out of reading it:
+
+- **TimPlayer** is a standard RISC OS module (normally already
+  resident, or loadable from
+  `System:Modules.Audio.Trackers.TimPlayer` -- confirmed NOT bundled
+  with DigitalCD itself, referenced purely by that standard system
+  path) that does all the actual interrupt-driven DMA/mixing work
+  internally. An app never touches assembler or an interrupt handler
+  itself -- it fills a plain RMA buffer with PCM and hands it off via
+  documented SWIs. `!PlayTone`, a small complete example app in the
+  same source drop, demonstrates the full sequence for a looped test
+  tone: `FXRegister` -> `SongNew` -> `SampleInfo`/`SampleMisc`/
+  `SampleLoops` -> `FXPlaySample`/`FXNoteAction`.
+- **DCDUtils**, DigitalCD's own module, has a SEPARATE, more directly
+  streaming-shaped API (`DCDUtils_RegisterPlayer`,
+  `DCDUtils_SetPlayerInfo` "uses DMA", `DCDUtils_FillABuffer` --
+  hand it a fresh pointer range of PCM to queue) -- likely the better
+  fit for continuously-growing audio (like live FM demod output) than
+  TimPlayer's fixed-length-loop model, but its exact calling
+  convention needs more reading of the module source
+  (`DCDUtils/s/Module`, 4173 lines) before attempting.
+
+**Milestone 1, scoped deliberately small: prove the whole chain works
+at all before attempting real streaming.** New `Audio.c`/`Audio.h` in
+`!RTLSDRView`, every SWI number and register value ported verbatim
+from `!PlayTone` (this project's own `_kernel_swi_regs`/`_kernel_swi()`
+style used instead of WimpLib's `_swix()` macros, but the actual
+values unchanged): claim an RMA buffer, generate a one-second 440Hz
+sine wave into it, register it with TimPlayer as a loopable sample, and
+play/stop it via a new "TONE" toggle button (added to its own second
+icon row -- row 1 was already full after DEM, and "TONE" being longer
+than any existing label needed the room, the same lesson already
+learned once with DEM's own label getting clipped). Setup is
+deliberately non-fatal (`report_warning`, not `report_and_die`) --
+if TimPlayer isn't available on a given machine, the TONE button
+just does nothing rather than taking down the whole proven spectrum
+display.
+
+**Real run: confirmed working end-to-end, first try.** User verified
+TimPlayer itself was genuinely loaded (by using DigitalCD, a real
+third-party app, independently of this project's own code), then
+confirmed our own new `Audio.c` code: "pressing the Tone button
+works! I get a audio tone." Module load/lookup, RMA claim, sample
+registration, and looped playback all work through this project's own
+from-scratch SWI sequence.
+
+**Next (not yet started):** streaming the REAL FM-demodulated audio
+instead of a fixed looped tone. This needs periodically rewriting
+portions of the loop buffer ahead of wherever TimPlayer's playback
+position currently is (research `TimPlayer_SongPosition`'s exact
+semantics, or fall back to time-based position tracking via
+`Time_Monotonic()` if that proves awkward), decimating the demod
+output down from the raw 2.4MHz rate to the mixer's actual configured
+rate, and likely a per-channel filter (see the note above about
+`demodulate_frame()` currently running on the full wideband capture,
+not one station) so the audio is actually intelligible rather than
+several stations at once.

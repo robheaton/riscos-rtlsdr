@@ -36,13 +36,14 @@ with this fix; treat the old number as void until it is.
 **Phase 2, milestone 1 (`!RTLSDRView`, a live spectrum display) is
 done, confirmed on real hardware: a real, multi-peak spectrum showing
 genuine broadcast stations, live gain control (AGC/manual), live
-frequency tuning, and an FM demodulator (numeric readout only — no
-audio output yet).** A real Wimp GUI app: continuous idle-driven honest
+frequency tuning, an FM demodulator (numeric readout only — no
+streamed audio yet), and a working audio test tone via the standard
+TimPlayer module.** A real Wimp GUI app: continuous idle-driven honest
 USB reads, a hand-written FFT, power-domain frame averaging, and a
 live-updating bar-graph redraw, all running inside the Wimp event loop
 without freezing the desktop. A long list of real bugs was found and
 fixed getting here (see `docs/PLAN.md`'s "Phase 2" section for the full
-history) — most recently a genuine analog/digital IF mismatch (this
+history) — most notably a genuine analog/digital IF mismatch (this
 port never called the real upstream bandwidth-configuration step,
 leaving the tuner's actual analog IF and the demod's digital
 downconversion offset by ~1.75MHz, comparable to the capture's own
@@ -56,6 +57,18 @@ request. Shrinking the read size down to 8 bytes (4 samples) fixed it:
 `nElev` (samples per frame carrying real energy, out of 256) jumped
 from 1-2 to 256, and the rendered spectrum finally shows real,
 distinct station peaks instead of noise.
+
+**Real audio output work has started.** RISC OS's actual streaming-
+audio mechanism was researched from real, working source (DigitalCD's
+own `!PlayTone` example, user-supplied) rather than guessed at — it
+goes through the standard **TimPlayer** module (already resident on
+most RISC OS 5 systems, or auto-loaded from
+`System:Modules.Audio.Trackers.TimPlayer`), which handles all
+interrupt-driven DMA/mixing internally; the app itself never touches
+assembler. A new "TONE" button in `!RTLSDRView` plays a generated test
+tone through it — confirmed working on real hardware, first try.
+Streaming the actual FM-demodulated audio (not just a fixed test tone)
+is the next step.
 
 Getting here was a real diagnostic journey — full blow-by-blow in
 `docs/PLAN.md`, including several real bugs only found by actually
