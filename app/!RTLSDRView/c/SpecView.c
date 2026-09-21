@@ -232,10 +232,20 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    raising achieved throughput to ~40k -- so the honesty threshold
    sits somewhere between 8 and 64, and 40k is still nowhere near
    2.4M anyway. 16 confirmed correct on real hardware (r=23k, up from
-   15k at 8 -- a modest but real improvement) -- trying 32 next,
-   continuing to narrow toward the threshold between working (<=16
-   so far) and broken (64). */
-#define FIXED_CHUNK_SIZE 32
+   15k at 8). 32 confirmed BROKEN too (r=33k, but the spectrum became a
+   comb of evenly-spaced sharp spikes -- the classic signature of a
+   periodic artifact repeating at a fixed sample interval, same
+   category as the earlier 256-byte idx@0/128-alternating finding,
+   just at a different period). So the honesty threshold sits between
+   16 and 32. Even at the best correct size found (16, r=23k), that's
+   still only ~1% of the SDR's real 2.4M rate -- nowhere close to
+   sustaining any real-time audio stream regardless of further tuning
+   in this range; see docs/PLAN.md for why this looks like a hard
+   architectural limit of the non-blocking-read approach, not
+   something more chunk-size searching will fix. Settled on 16 as the
+   working baseline (correct data, best throughput found that stays
+   correct). */
+#define FIXED_CHUNK_SIZE 16
 
 /* ---- global state ---- */
 static char device_name_g[16];
