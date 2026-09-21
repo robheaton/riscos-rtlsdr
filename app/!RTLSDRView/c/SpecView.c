@@ -248,16 +248,32 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    nopad on real hardware (real multi-peak spectrum), but throughput
    stayed stuck around r=7-9k regardless of size (512, then 64 with
    MAX_FRAMES_PER_TICK raised 8x -- barely moved either time), ruling
-   out chunk size and that cap as the bottleneck. Found a real,
-   different culprit instead: the read loop was still running a 0xAA
-   sentinel-fill + byte-by-byte "touched" comparison on EVERY attempt
-   -- essential while the padding mystery was open, pure overhead now
-   that nopad fixes it at the source, and its cost scaled directly
-   with FIXED_CHUNK_SIZE (more iterations at larger sizes), the
-   opposite of what should happen as size goes up. Removed. Back to
-   512 (one atomic read per frame, maximally efficient) now that
-   nothing should scale against it any more. */
-#define FIXED_CHUNK_SIZE 512
+   out chunk size and that cap as the bottleneck. Removing the leftover
+   0xAA sentinel-fill diagnostic (pure per-attempt overhead once nopad
+   fixed correctness at the source) barely moved it either (r=10k).
+
+   Reading USBDriver's actual start_read()/read_cb() source (see
+   MAX_READ_ATTEMPTS's got==0 handling below) found the real driver
+   model: only ONE bulk transfer is ever in flight, submitted by one
+   read() call and completed asynchronously via an interrupt callback
+   that a LATER read() call picks up. Changing got==0 from "give up"
+   to "retry" (so the loop actually waits out that one transfer
+   instead of surrendering to Wimp_Poll after each one) barely moved
+   throughput either (r=10-11k) -- meaning per-transfer completion
+   latency itself (scheduling + interrupt latency, not our polling
+   strategy) is the real fixed cost per read() call, roughly ~25ms
+   judging by ~39 frames/sec x 512 bytes matching r=10k. At 512 bytes,
+   that wire time is negligible next to 25ms (USB2 HS could carry it
+   in microseconds) -- so if that ~25ms really is a fixed per-call
+   cost regardless of transfer size, a much bigger request should
+   amortize it across far more data per transfer, multiplying
+   throughput almost linearly instead of chasing overhead that turned
+   out not to matter. Untested until now since every earlier large-
+   chunk attempt (256/512 before nopad) was testing the PADDING
+   question, not this latency question -- nopad means those old
+   correctness failures shouldn't recur at any size. Jumping to 16384
+   (32x) to test this aggressively rather than creeping up. */
+#define FIXED_CHUNK_SIZE 16384
 
 /* ---- global state ---- */
 static char device_name_g[16];
@@ -1027,11 +1043,11 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
             debug_end_i_g = iq_frame_g[IQ_BYTES - 2];
             debug_end_q_g = iq_frame_g[IQ_BYTES - 1];
             /* debug_c1end_*_g/debug_c2start_*_g (chunk-boundary bytes)
-               retired: with FIXED_CHUNK_SIZE now equal to IQ_BYTES,
-               each frame is a single chunk -- there's no second chunk
-               boundary left inside the frame to sample, and indexing
-               iq_frame_g[FIXED_CHUNK_SIZE] would now read one byte past
-               the end of the array. */
+               retired: they made sense back when FIXED_CHUNK_SIZE was
+               small enough that a frame spanned several chunks: now
+               that a chunk can hold many whole frames (or, at 512, be
+               exactly one), there's no single fixed chunk-boundary
+               offset inside a frame worth sampling any more. */
             /* raw byte range across the WHOLE frame, not just the first
                4 bytes -- distinguishes "the ADC genuinely sees almost no
                swing" from "the FFT/scaling math is flattening real
