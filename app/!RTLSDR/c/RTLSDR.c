@@ -493,8 +493,21 @@ static void milestone6_honest_throughput(int device_num)
         }
 
         rtlsdr_reset_buffer(dev);
+        /* size131072: DeviceFS's OWN documented `size/N` path field --
+           "the preferred stream BUFFER size to use. Some devices may
+           benefit from a larger buffer than the default." (USB API
+           doc, gitlab.riscosopen.org). Never set before this test --
+           every previous size sweep only ever changed the per-call
+           `want` argument to os_gbpb_read4(), never DeviceFS's own
+           internal buffer behind it, which may have been sitting at a
+           small default the whole time regardless of what we asked
+           for per call. Real syntax confirmed from the doc's own
+           worked example ("usbtimeout10000;size16384", no slashes) --
+           matches this file's existing usbtimeout2000, not a literal
+           "/". 128KB gives generous headroom over every chunk size
+           this sweep tests. */
         sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
-                      "nopad:%s",
+                      "nopad;size131072:%s",
                 RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, dev);
         handle = os_find_open(path);
         if (handle == 0) {
