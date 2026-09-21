@@ -73,7 +73,22 @@ static int playing_g = 0;
 static short *stream_buf_g = 0;
 static int stream_capacity_g = 0;  /* samples */
 static int stream_rate_g = 0;      /* Hz */
-static int stream_write_pos_g = 0; /* samples, 0..stream_capacity_g-1 */
+/* Running total of samples ever written (NOT wrapped -- the actual
+   ring position is always this mod stream_capacity_g), and the
+   equivalent running total of samples "expected consumed" from
+   elapsed wall-clock time. Using running totals rather than wrapped
+   positions for the throttling math (audio_stream_feed()) avoids a
+   real bug the wrapped version had: if production ever fell behind
+   real-time playback by more than one full buffer length (plausible
+   under load), the modular difference between two wrapped positions
+   can't tell "genuinely far ahead" from "behind by more than a lap",
+   and computed a near-zero safe-room estimate either way -- getting
+   permanently stuck refusing to write once that happened, rather than
+   recovering. Running totals never wrap in practice (would take over
+   two million years of continuous playback at 48kHz to overflow an
+   unsigned long), so "ahead = written - consumed" stays meaningful
+   however far behind production ever falls. */
+static unsigned long stream_total_written_g = 0;
 static int stream_playing_g = 0;
 static unsigned int stream_start_time_g = 0; /* centiseconds */
 
@@ -331,7 +346,7 @@ int audio_stream_init(void)
     }
     stream_buf_g = (short *)regs.r[2];
     memset(stream_buf_g, 0, (size_t)stream_capacity_g * sizeof(short));
-    stream_write_pos_g = 0;
+    stream_total_written_g = 0;
 
     regs.r[0] = song_handle_g;
     regs.r[1] = (int)(0x80000000u | (unsigned)STREAM_SAMPLE_INDEX);
@@ -387,7 +402,7 @@ void audio_stream_play(int play)
            position estimate -- and start from a silent (zeroed)
            buffer position 0, so there's no stale leftover content
            from a previous run audible before real data catches up. */
-        stream_write_pos_g = 0;
+        stream_total_written_g = 0;
         stream_start_time_g = monotonic_cs();
 
         regs.r[0] = fx_handle_g;
@@ -410,10 +425,12 @@ void audio_stream_play(int play)
 int audio_stream_feed(const short *samples, int n)
 {
     unsigned int elapsed_cs;
-    int play_pos;
-    int safety;
-    int space;
+    unsigned long expected_consumed;
+    long ahead;
+    long safety;
+    long room;
     int written;
+    int pos;
     int i;
 
     if (!stream_playing_g || stream_buf_g == 0) {
@@ -425,40 +442,48 @@ int audio_stream_feed(const short *samples, int n)
        that correctly regardless of which side of a wrap
        stream_start_time_g and "now" fall on. */
     elapsed_cs = monotonic_cs() - stream_start_time_g;
+    expected_consumed = ((unsigned long)elapsed_cs *
+                          (unsigned long)stream_rate_g) / 100UL;
 
-    play_pos = (int)(((unsigned long)elapsed_cs *
-                       (unsigned long)stream_rate_g / 100UL) %
-                      (unsigned long)stream_capacity_g);
+    /* How far ahead of actual real-time consumption our writes
+       currently are. Comfortably positive and less than the buffer's
+       own capacity is the healthy steady state (some safe margin of
+       already-written-but-not-yet-played audio queued up). */
+    ahead = (long)(stream_total_written_g - expected_consumed);
+    safety = (long)((stream_rate_g * STREAM_SAFETY_MS) / 1000);
 
-    safety = (stream_rate_g * STREAM_SAFETY_MS) / 1000;
-    if (safety >= stream_capacity_g) {
-        safety = stream_capacity_g - 1;
-    }
-
-    /* How much room is there going FORWARD from stream_write_pos_g
-       before reaching (play_pos - safety)? This throttles production
-       to match real-time playback consumption automatically: if we're
-       already comfortably ahead, space is large and everything gets
-       written; if we've caught up close to the play head, space
-       shrinks toward 0 and writes get held back until playback has
-       consumed more. */
-    space = play_pos - stream_write_pos_g;
-    if (space < 0) {
-        space += stream_capacity_g;
-    }
-    space -= safety;
-    if (space < 0) {
-        space = 0;
-    }
-
-    written = (n < space) ? n : space;
-    for (i = 0; i < written; i++) {
-        stream_buf_g[stream_write_pos_g] = samples[i];
-        stream_write_pos_g++;
-        if (stream_write_pos_g >= stream_capacity_g) {
-            stream_write_pos_g = 0;
+    if (ahead <= safety) {
+        /* At or behind the estimated play position (production has
+           been struggling to keep up with real time) -- accept
+           everything rather than continuing to hold back. A fresh
+           sample landing right at (or even slightly behind) the play
+           head is a normal, recoverable hiccup; refusing to write
+           because we're "not far enough ahead" is what got this stuck
+           in the original version of this function -- see the
+           stream_total_written_g comment above. */
+        written = n;
+    } else {
+        /* Comfortably ahead already -- cap how much more so writes
+           never lap all the way around and overwrite audio that's
+           genuinely still queued up, not yet played. */
+        room = (long)stream_capacity_g - ahead;
+        if (room <= 0) {
+            written = 0;
+        } else {
+            written = (n < room) ? n : (int)room;
         }
     }
+
+    pos = (int)(stream_total_written_g % (unsigned long)stream_capacity_g);
+    for (i = 0; i < written; i++) {
+        stream_buf_g[pos] = samples[i];
+        pos++;
+        if (pos >= stream_capacity_g) {
+            pos = 0;
+        }
+    }
+    stream_total_written_g += (unsigned long)written;
+
     return written;
 }
 
