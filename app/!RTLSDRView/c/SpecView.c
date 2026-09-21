@@ -244,11 +244,19 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
    separate from (and not fixed by) the earlier non-blocking-mode fix.
    The stream-open path now includes the real, documented `nopad` flag
    that disables this at the source (see os_find_open()'s call site in
-   main()) -- testing 512 (the endpoint's native USB max packet size,
-   one atomic read per frame, maximally efficient) now that the actual
-   corruption mechanism should be disabled rather than merely dodged
-   by staying small. */
-#define FIXED_CHUNK_SIZE 512
+   main()) -- 512 (one atomic read per frame) confirmed CORRECT with
+   nopad on real hardware (real multi-peak spectrum), but throughput
+   was WORSE than the old tiny-chunk workaround (r=7k vs r=23k), and
+   raising MAX_FRAMES_PER_TICK 8x barely moved it (r=8k) -- ruling that
+   cap out too. Points at nopad itself (or specifically large requests
+   under nopad) adding real per-call latency: without nopad, a request
+   could "succeed" instantly via padding; with it, the driver may now
+   genuinely wait to see whether more real data is coming before
+   reporting a short read, rather than faking completion immediately.
+   Testing 64 next -- small enough to hopefully avoid that latency,
+   but nopad should mean it no longer NEEDS to be tiny for
+   correctness, unlike the old 8/16-byte workaround. */
+#define FIXED_CHUNK_SIZE 64
 
 /* ---- global state ---- */
 static char device_name_g[16];
