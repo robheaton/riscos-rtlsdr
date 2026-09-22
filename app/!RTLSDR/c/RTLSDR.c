@@ -859,6 +859,104 @@ static void milestone9_sample_rate_readback(const char *dev)
     printf("\n--- milestone 9 diagnostic done ---\n");
 }
 
+/* ---- milestone 10 (diagnostic): configured sample rate vs. achieved
+   rate, and the 'short' path flag ----
+
+   Two remaining untried angles before concluding the ~15-65 KB/s
+   ceiling is unfixable from application code:
+
+   1. Every measurement so far used the same 2.4 MSPS configuration.
+      If achieved throughput is really capped by a USB/driver-level
+      transaction rate (not by how much the chip produces), then
+      configuring a much LOWER sample rate should barely change the
+      achieved bytes/sec -- the ceiling would stay put regardless of
+      what the chip is asked to produce. If achieved throughput instead
+      tracks the configured rate (goes down with it), that points back
+      at chip-side production/delivery rather than a fixed USB ceiling
+      -- a materially different conclusion.
+
+   2. The USB API doc's `short/S` path field ("force a short packet to
+      be sent at the end of each transfer... even if the data is an
+      exact multiple of the max packet size" -- equivalent to NetBSD's
+      USBD_FORCE_SHORT_XFER) has never been tried. It's meant for OUT
+      transfers signalling end-of-data, but its effect on our bulk-IN
+      pattern is untested -- cheap, one path-string change, worth
+      trying alongside `nopad`. */
+
+static void measure_once(const char *dev, const char *path_extra,
+                          const char *label)
+{
+    char path[96];
+    unsigned char buf[4096];
+    int handle;
+    int got;
+    unsigned long total_bytes;
+    unsigned long total_reads;
+    clock_t tstart, tnow;
+    double tsec, bps;
+
+    rtlsdr_reset_buffer(dev);
+    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
+                  "nopad%s:%s",
+            RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, path_extra, dev);
+    handle = os_find_open(path);
+    if (handle == 0) {
+        printf("%s: OS_Find FAILED\n", label);
+        return;
+    }
+    if (os_args_set_nonblocking(handle, 1) != 0) {
+        printf("%s: could not enable non-blocking\n", label);
+        os_find_close(handle);
+        return;
+    }
+
+    total_bytes = 0;
+    total_reads = 0;
+    tstart = clock();
+    for (;;) {
+        got = os_gbpb_read4(handle, buf, sizeof(buf));
+        if (got > 0) {
+            total_bytes += (unsigned long)got;
+            total_reads++;
+        }
+        tnow = clock();
+        if (((double)(tnow - tstart) / CLOCKS_PER_SEC) >=
+            (double)M6_TEST_SECONDS) {
+            break;
+        }
+    }
+    tsec = (double)(clock() - tstart) / CLOCKS_PER_SEC;
+    bps = (tsec > 0.0) ? ((double)total_bytes / tsec) : 0.0;
+
+    printf("%s: %lu bytes in %.1fs = %.0f bytes/sec (%lu reads)\n",
+           label, total_bytes, tsec, bps, total_reads);
+    fflush(stdout);
+
+    os_args_set_nonblocking(handle, 0);
+    os_find_close(handle);
+}
+
+static void milestone10_rate_and_short_flag(const char *dev)
+{
+    printf("\n--- milestone 10 (diagnostic): sample rate vs. achieved "
+           "throughput, and the 'short' flag ---\n");
+
+    printf("\nSetting sample rate to 2.4 MSPS (baseline)...\n");
+    rtlsdr_set_sample_rate(dev, 2400000UL);
+    measure_once(dev, "", "2.4 MSPS, no short flag");
+
+    printf("\nSetting sample rate to 250 kHz (near minimum valid)...\n");
+    rtlsdr_set_sample_rate(dev, 250000UL);
+    measure_once(dev, "", "250 kHz, no short flag");
+
+    printf("\nRestoring sample rate to 2.4 MSPS, testing 'short' "
+           "flag...\n");
+    rtlsdr_set_sample_rate(dev, 2400000UL);
+    measure_once(dev, ";short", "2.4 MSPS, WITH short flag");
+
+    printf("\n--- milestone 10 diagnostic done ---\n");
+}
+
 /* ---- entry point ---- */
 
 int main(void)
@@ -932,6 +1030,12 @@ int main(void)
        far implies a captured rate far below what 2.4 MSPS should give
        us. See the comment above milestone9_sample_rate_readback(). */
     milestone9_sample_rate_readback(device_name);
+
+    /* Diagnostic, not gating -- does achieved throughput track the
+       configured sample rate (chip-side limit) or stay flat regardless
+       (USB/driver-side limit)? Also tries the untested 'short' path
+       flag. See the comment above milestone10_rate_and_short_flag(). */
+    milestone10_rate_and_short_flag(device_name);
 
     return 0;
 }
