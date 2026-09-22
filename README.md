@@ -58,17 +58,29 @@ request. Shrinking the read size down to 8 bytes (4 samples) fixed it:
 from 1-2 to 256, and the rendered spectrum finally shows real,
 distinct station peaks instead of noise.
 
-**Real audio output work has started.** RISC OS's actual streaming-
-audio mechanism was researched from real, working source (DigitalCD's
-own `!PlayTone` example, user-supplied) rather than guessed at — it
-goes through the standard **TimPlayer** module (already resident on
-most RISC OS 5 systems, or auto-loaded from
+**Real audio output work has started, but real-time streaming is
+blocked on a structural RISC OS USB limitation.** RISC OS's actual
+streaming-audio mechanism was researched from real, working source
+(DigitalCD's own `!PlayTone` example, user-supplied) rather than
+guessed at — it goes through the standard **TimPlayer** module (already
+resident on most RISC OS 5 systems, or auto-loaded from
 `System:Modules.Audio.Trackers.TimPlayer`), which handles all
 interrupt-driven DMA/mixing internally; the app itself never touches
-assembler. A new "TONE" button in `!RTLSDRView` plays a generated test
-tone through it — confirmed working on real hardware, first try.
-Streaming the actual FM-demodulated audio (not just a fixed test tone)
-is the next step.
+assembler. A "TONE" button in `!RTLSDRView` plays a generated test tone
+through it — confirmed working on real hardware, first try. Streaming
+the actual FM-demodulated audio was attempted next, and after an
+exhaustive investigation (chunk size, DeviceFS buffer size, retry
+strategy, GUI-vs-CLI isolation, USB controller identity, multi-stream
+pipelining, sample-rate independence — see `docs/PLAN.md`'s "milestone
+3" for the full elimination process), achieved throughput tops out
+around 10-13k IQ samples/sec against the 2.4M needed — a genuine,
+structural limitation in how RISC OS's USBDriver services bulk-IN
+endpoints (only one transfer ever in flight per stream, frequent
+short-packet completions), not an application-level bug. A follow-up
+project investigating the USB driver stack itself (`USBDriver`/
+`DWCDriver`) is the planned next step for unblocking this; `!RTLSDRView`
+itself keeps the test tone and a numeric FM-deviation readout as where
+real-time audio settles for now.
 
 Getting here was a real diagnostic journey — full blow-by-blow in
 `docs/PLAN.md`, including several real bugs only found by actually

@@ -1924,3 +1924,153 @@ corruption. Real progress here needs one of:
   this specific USB access path at all, and treating the working test
   tone + numeric demod readout as where this sub-feature settles for
   now.
+
+## Phase 2, follow-on: real audio output, milestone 3 -- the `nopad` breakthrough, and a much deeper throughput investigation
+
+The "blocked, not abandoned" conclusion above held until real
+USBDriver source was fetched (`gitlab.riscosopen.org/RiscOS/Sources/
+HWSupport/USB/USBDriver`, `build/c/usbmodule`'s `read_cb()`), revealing
+a **second, separate padding mechanism** from the one already fixed:
+whenever a USB transfer completes short of the requested size, the
+driver zero-pads the remainder -- its own comment says "fill up the
+rest of the request with garbage!". `build/Doc/USB` documents the real
+fix: the `nopad/S` stream-open path flag, "Disable the code that adds
+padding bytes to received data if it is shorter than the requested
+read size." Adding `;nopad` to the stream-open path (`os_find_open()`'s
+call site in `SpecView.c`'s `main()`) confirmed CORRECT spectra
+(real multi-peak shape) at `FIXED_CHUNK_SIZE=512`, breaking the
+correctness/chunk-size tradeoff the table above was built around.
+
+**But throughput stayed stuck at r=7-11k regardless of chunk size**
+(512, then 64 with `MAX_FRAMES_PER_TICK` raised 8x -- barely moved
+either time), ruling out chunk size and that cap as the bottleneck.
+Removing a leftover 0xAA sentinel-fill diagnostic (pure per-attempt
+overhead, essential while the padding mystery was open, dead weight
+once `nopad` fixed the root cause) barely moved it either (r=10k).
+Changing the read loop's `got==0` handling from "give up, return to
+Wimp_Poll" to "retry" -- after reading USBDriver's `start_read()`/
+`read_cb()` and confirming only ONE bulk transfer is ever in flight
+per stream, with `got==0` meaning "still busy", not "no data" -- also
+barely moved it (r=10-11k).
+
+### A dedicated, GUI-free CLI investigation (`!RTLSDR` milestones 6-10)
+
+To separate real USB/driver behaviour from anything specific to
+`!RTLSDRView`'s Wimp idle-tick loop, `RTLSDR.c` grew a series of
+non-gating diagnostics (all still in the file, all still runnable via
+`RTLSDR,ff8` directly):
+
+- **Milestone 6**: tight, wall-clock-bounded (no per-call attempt cap,
+  no event loop) `nopad` + non-blocking reads across several chunk
+  sizes and several DeviceFS `size/N` stream-buffer sizes (a
+  documented-but-never-before-used path field: "the preferred stream
+  buffer size to use"). Result: **~15-65 KB/s regardless of chunk size
+  (512-65536, a 128x range) or buffer size (default/128KB/512KB)** --
+  "avg bytes/successful read" stayed pinned at ~2 across every single
+  configuration, while total bytes/sec bounced noisily between runs at
+  the identical configuration -- the signature of polling far faster
+  than real data arrives, not a size-dependent effect.
+- **Milestone 7**: wired up `DeviceCall_USB_TransferInfo` (reason 6,
+  via a USB stream handle from `Return Handles 2`, reason 7) to see
+  DeviceFS's own live view of the in-flight transfer. Found the
+  underlying transfer size DeviceFS actually submits is much bigger
+  than our request (observed `requested=83384`/`84776`/`85720`,
+  varying run to run -- almost certainly however much free space was
+  left in the `size131072`-ish buffer at that moment, not a fixed
+  constant) and, critically, **caught a transfer reporting
+  `status=1` (successfully completed) after receiving only 2 of the
+  tens-of-thousands of requested bytes** -- a genuine short-packet
+  completion, not a timeout or error. This repeats constantly.
+- **Milestone 8**: tested whether the same bulk endpoint could be
+  opened as several independent DeviceFS streams at once (each with
+  its own busy flag, per USBDriver's source), to pipeline transfers
+  from application code without any driver change. **`OS_Find` fails
+  on the second open** -- the endpoint can only be opened once. Ruled
+  out.
+- **Milestone 9**: attempted a register-readback sanity check on the
+  sample-rate resampler registers (0x9f/0xa1) after
+  `rtlsdr_set_sample_rate(dev, 2400000)`, worried the chip might not
+  actually be running anywhere near 2.4 MSPS. Initially looked like a
+  mismatch (`0x00030000` read back vs. `0x03000000` expected) but this
+  turned out to be a **false alarm**: `rtlsdr_demod_write_reg()`/
+  `rtlsdr_demod_read_reg()` (both verbatim upstream librtlsdr) use
+  inconsistent byte-order conventions between write and read, so a
+  correct write of `0x0300` naturally reads back byte-swapped as
+  `0x0003` -- not evidence the write failed. Given real, correctly-
+  shaped spectra were confirmed on hardware many times this session,
+  the sample-rate configuration is almost certainly fine.
+- **Milestone 10**: two more tests. (a) Does achieved throughput track
+  the *configured* sample rate? 2.4 MSPS vs. 250 kHz (near the minimum
+  valid rate) gave near-identical achieved bytes/sec in the same run
+  (30041 vs. 39482 B/s) -- confirming the ceiling is USB/driver-side,
+  not chip-production-side (if it were chip-side, 250 kHz should have
+  been dramatically slower). (b) The USB API doc's `short/S` path flag
+  ("force a short packet at the end of each transfer, even on an exact
+  max-packet multiple" -- equivalent to NetBSD's
+  `USBD_FORCE_SHORT_XFER`), never tried before: **gave a real,
+  directly-comparable ~65% throughput gain in the same run** (30041 ->
+  49679 B/s, all three measurements back-to-back so not confounded by
+  reception conditions).
+
+### Other angles ruled out
+
+- **Wrong USB controller**: Pi4-class boards route their USB-A ports
+  through a separate VL805/XHCI chip rather than the SoC's DWC2, and
+  one source claims XHCI is measurably slower under RISC OS. `*Modules`
+  confirmed `DWCDriver` is loaded and no XHCI/VL805 module is present
+  at all on this hardware (a Compute Module 4 on the official CM4 IO
+  Board) -- ruled out.
+- **A simple driver bug**: cloned the actual `DWCDriver` source
+  (`gitlab.riscosopen.org/.../HWSupport/USB/Controllers/DWCDriver`,
+  44,810 lines -- the same Synopsys DWC2 HCD Linux uses, not a RISC-OS-
+  specific reimplementation) looking for an obvious scheduling/queue-
+  depth bug. Nothing obvious found, and a real bug in code this mature
+  and widely shared is unlikely; not practical to fully audit from
+  here.
+- **RTL2832U init/sample-rate register sequence**: `rtlsdr_init_baseband()`
+  and `rtlsdr_set_sample_rate()` in `Driver.c` were checked line-by-line
+  against real upstream `librtlsdr.c` (including `rtlsdr_tuner_postinit()`'s
+  R820T/R828D-specific zero-IF-disable/spectrum-inversion overrides) --
+  exact matches throughout. Also confirmed `USB_EPA_MAXPKT=0x0002`
+  (which looks like a `0x0002`/`0x0200` transcription bug at a glance)
+  is verbatim upstream too.
+
+### Brought back into `!RTLSDRView`
+
+`;short;size131072` added to `SpecView.c`'s stream-open path alongside
+the existing `nopad` (both real, measured gains from the CLI
+investigation above). Real-hardware result: the GUI's `r=` figure
+moved only slightly (10-11k -> 13k -- much less than the CLI's ~65%
+gain, likely because the Wimp idle-tick loop's own overhead dominates
+in the GUI in a way the CLI's tight loop doesn't hit), and **STREAM's
+actual audio was reported unchanged** -- still the same short-burst-
+then-silence pattern as the very first streaming attempt. At ~13k
+samples/sec against the 2.4M needed (roughly 0.5%, ~180x short), this
+is far too large a gap for any further read-loop tuning to plausibly
+close.
+
+### Conclusion: this is a real, structural ceiling, not an application-level bug
+
+Every application-level lever has now been tried and either ruled out
+or found to give gains far too small to matter at this scale: chunk
+size (8-65536, three orders of magnitude), DeviceFS buffer size
+(default/128KB/512KB), busy-retry vs. give-up on a busy transfer,
+per-attempt diagnostic overhead, GUI vs. CLI isolation, USB controller
+identity, multi-stream pipelining (blocked by DeviceFS itself), sample-
+rate configuration, and the `short` flag (real but small). The evidence
+(one transfer in flight per stream by USBDriver's own design; frequent
+short-packet completions after only ~2 bytes; throughput independent of
+configured sample rate) points at a genuine, structural limitation in
+how RISC OS's DeviceFS/USBDriver abstraction services bulk-IN
+endpoints on this hardware -- not something fixable from application
+code.
+
+**Decision (2026-09-22): pursue this as a separate project investigating
+the RISC OS USB driver stack itself** (`USBDriver`/`DWCDriver`), rather
+than continuing to tune `!RTLSDRView`/`RTLSDR`'s read strategy. That
+work belongs in its own session/repository, not this one -- see
+`project_phase2_audio_output.md` in this project's memory for the
+pointer. `!RTLSDRView` itself is left with `nopad;short;size131072`
+(the best real-hardware-confirmed configuration found), the test tone,
+and the numeric FM-deviation readout as where real-time audio settles
+for now.
