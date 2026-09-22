@@ -1718,9 +1718,26 @@ int main(void)
        Zero-padding still differs from the 0xAA sentinel used to
        "prove" reads were honest, so that fix's own validation never
        caught it. `nopad` disables this at the source -- see
-       docs/PLAN.md. */
+       docs/PLAN.md.
+
+       `short` and `size131072` added after a dedicated CLI throughput
+       investigation (RTLSDR milestones 6-10, docs/PLAN.md): with nopad
+       already making correctness independent of chunk size, a careful
+       GUI-free sweep found neither chunk size (8-65536) nor DeviceFS
+       buffer size alone moved achieved throughput much -- but ADDING
+       `short` (USBDriver's documented "force a short packet at the end
+       of each transfer, even on an exact max-packet multiple" flag,
+       equivalent to NetBSD's USBD_FORCE_SHORT_XFER) gave a real,
+       directly-comparable ~65% throughput gain in the same test run
+       (30041 -> 49679 bytes/sec). Also confirmed throughput does NOT
+       meaningfully track the configured sample rate (2.4 MSPS vs. 250
+       kHz gave near-identical achieved bytes/sec), which is why this
+       is a USB/driver-level fix rather than a signal-chain one.
+       `size131072` (a 128KB DeviceFS stream buffer, vs. the small
+       default) gave a smaller but still real gain in the same
+       investigation. */
     sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
-                  "nopad:%s",
+                  "nopad;short;size131072:%s",
             RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, device_name_g);
     stream_handle_g = os_find_open(path);
     if (stream_handle_g == 0) {
