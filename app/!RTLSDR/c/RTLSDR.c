@@ -957,6 +957,147 @@ static void milestone10_rate_and_short_flag(const char *dev)
     printf("\n--- milestone 10 diagnostic done ---\n");
 }
 
+/* ---- milestone 11 (diagnostic): fine-grained timing of ONE armed
+   transfer's progress, via tight TransferInfo-only polling ----
+
+   Cross-session collaboration (riscos-usb-investigation, the sibling
+   project investigating USBDriver/DWC2 itself): their retry-patch test
+   (re-arming a fresh transfer instantly from read_cb()'s own interrupt
+   context on every short completion) found no throughput improvement,
+   which rules out the APPLICATION-level round-trip gap (one os_gbpb_
+   read4() call to the next, via DeviceFS) as the cause of short
+   packets. It does NOT rule out slow servicing WITHIN a single already-
+   armed transfer -- e.g. a slow per-packet or per-NAK turnaround at the
+   DWC2/interrupt level that would be invisible to read_cb()'s retry
+   logic entirely, since that logic only ever sees the *end* state
+   (received=X, status) of a transfer that already went short, never
+   its progress while still in flight.
+
+   This tests that missing dimension from application code, no driver
+   change needed: arm ONE read via a single os_gbpb_read4() call, then
+   poll ONLY DeviceCall_USB_TransferInfo (never read() again) in as
+   tight a loop as possible, recording a new sample only when
+   `received` or `status` CHANGES from the last one seen. If the
+   device is genuinely slow to hand over even the first couple of
+   bytes (many unchanged-received samples before the first change),
+   that's real evidence for a per-transaction/per-NAK servicing
+   bottleneck operating below read_cb()'s own visibility -- consistent
+   with the sibling investigation's reframing (a fixed, slow host-side
+   extraction rate that would also explain the already-observed
+   independence from the *configured* SDR sample rate, and would
+   explain why the CTRLTRACE control-transfer cadence measured
+   separately was also ~3-4x slower than the real Linux capture, even
+   though that comparison used control transfers, not bulk). If
+   instead `received` jumps straight from 0 to its final short value
+   between two adjacent polls (no visible dwell time at all, even at
+   this tight a polling granularity), that would argue AGAINST a slow-
+   servicing explanation and point back toward something else again. */
+
+#define M11_MAX_SAMPLES 64
+#define M11_MAX_POLLS_PER_TRIAL 200000
+#define M11_TRIALS 5
+
+static void milestone11_transfer_progress_timing(int device_num)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *err;
+    char dev[16];
+    char path[80];
+    unsigned char buf[4096];
+    int handle;
+    int usb_stream_handle;
+    int trial, i, got;
+    int last_received, last_status;
+    int sample_poll[M11_MAX_SAMPLES];
+    int sample_received[M11_MAX_SAMPLES];
+    int sample_status[M11_MAX_SAMPLES];
+    int nsamples;
+    clock_t tstart, tend;
+    double tsec;
+
+    printf("\n--- milestone 11 (diagnostic): fine-grained single-"
+           "transfer progress timing ---\n");
+
+    sprintf(dev, "usb%d", device_num);
+    rtlsdr_reset_buffer(dev);
+    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
+                  "nopad:%s",
+            RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, dev);
+    handle = os_find_open(path);
+    if (handle == 0) {
+        printf("OS_Find FAILED -- aborting milestone 11.\n");
+        return;
+    }
+    if (os_args_set_nonblocking(handle, 1) != 0) {
+        printf("could not enable non-blocking -- aborting milestone "
+               "11.\n");
+        os_find_close(handle);
+        return;
+    }
+
+    regs.r[0] = DEVCALL_RETURN_HANDLES_2;
+    regs.r[1] = (int)dev;
+    regs.r[2] = handle;
+    err = _kernel_swi(SWI_DeviceFS_CallDevice, &regs, &regs);
+    if (err != NULL) {
+        printf("Return Handles 2 FAILED: %s\n", err->errmess);
+        os_args_set_nonblocking(handle, 0);
+        os_find_close(handle);
+        return;
+    }
+    usb_stream_handle = regs.r[5];
+
+    for (trial = 0; trial < M11_TRIALS; trial++) {
+        /* Arm exactly one transfer. This call itself may or may not
+           return data immediately (a previous transfer could already
+           be mid-flight) -- either way, we now poll TransferInfo only,
+           never read() again, until this trial's transfer finishes. */
+        got = os_gbpb_read4(handle, buf, sizeof(buf));
+
+        nsamples = 0;
+        last_received = -1;
+        last_status = -2;
+        tstart = clock();
+
+        for (i = 0; i < M11_MAX_POLLS_PER_TRIAL; i++) {
+            regs.r[0] = DEVCALL_TRANSFER_INFO;
+            regs.r[1] = (int)dev;
+            regs.r[2] = usb_stream_handle;
+            err = _kernel_swi(SWI_DeviceFS_CallDevice, &regs, &regs);
+            if (err != NULL) {
+                break;
+            }
+            if ((regs.r[0] != last_received || regs.r[3] != last_status)
+                && nsamples < M11_MAX_SAMPLES) {
+                sample_poll[nsamples] = i;
+                sample_received[nsamples] = regs.r[0];
+                sample_status[nsamples] = regs.r[3];
+                nsamples++;
+                last_received = regs.r[0];
+                last_status = regs.r[3];
+            }
+            if (regs.r[3] != 0) {
+                /* -1 = error, 1 = complete -- this trial is done */
+                break;
+            }
+        }
+        tend = clock();
+        tsec = (double)(tend - tstart) / CLOCKS_PER_SEC;
+
+        printf("\ntrial %d: initial read() got=%d, %d poll(s) over "
+               "%.3fs\n", trial, got, i, tsec);
+        for (i = 0; i < nsamples; i++) {
+            printf("  poll %6d: received=%d status=%d\n",
+                   sample_poll[i], sample_received[i], sample_status[i]);
+        }
+        fflush(stdout);
+    }
+
+    os_args_set_nonblocking(handle, 0);
+    os_find_close(handle);
+    printf("\n--- milestone 11 diagnostic done ---\n");
+}
+
 /* ---- entry point ---- */
 
 int main(void)
@@ -1036,6 +1177,13 @@ int main(void)
        (USB/driver-side limit)? Also tries the untested 'short' path
        flag. See the comment above milestone10_rate_and_short_flag(). */
     milestone10_rate_and_short_flag(device_name);
+
+    /* Diagnostic, not gating -- cross-session request from the sibling
+       riscos-usb-investigation project: fine-grained timing of a single
+       armed transfer's progress, to test for slow per-transaction
+       servicing that read_cb()'s own retry logic can't see. See the
+       comment above milestone11_transfer_progress_timing(). */
+    milestone11_transfer_progress_timing(n);
 
     return 0;
 }
