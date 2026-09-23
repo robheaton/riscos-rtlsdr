@@ -250,7 +250,27 @@ static void rtlsdr_set_bias_tee_gpio(const char *dev, int gpio, int on)
    0x05-0x1F) ---- */
 
 static const unsigned char r82xx_init_array[27] = {
-    0x83, 0x30, 0x75,                  /* 05 to 07 */
+    /* register 0x06 corrected 0x30 -> 0x32 (bit 1): found by the
+       riscos-usb-investigation project's byte-level control-transfer
+       diff against a real Linux capture and upstream osmocom/rtl-sdr's
+       tuner_r82xx.c r82xx_init_array -- all 27 bytes matched across
+       both references except this one, a single flipped bit in a
+       constant written once at init (before any AGC/adaptive logic
+       runs, so not explainable by differing RF conditions the way
+       later divergences in the sequence plausibly are). A later
+       r82xx_set_tv_standard()-equivalent write (r82xx_write_reg_mask,
+       reg 0x06, mask 0x30) only touches bits 5:4, not bit 1, so this
+       never got silently corrected downstream -- confirmed by
+       decoding this project's own CTRLTRACE capture (i2c write to
+       target 0x74, "05 83 30 75 ..." -- reg 0x05=0x83, 0x06=0x30,
+       0x07=0x75, matching this array exactly before the fix). Not yet
+       confirmed whether this explains the bulk-IN throughput ceiling
+       (register 0x06 is a filter-gain/AGC-adjacent register whose
+       exact bit-level function on real R820T2 silicon isn't
+       documented here) -- fixing it because it's a real, verified
+       bug regardless, and testing its effect on throughput is the
+       obvious next step. */
+    0x83, 0x32, 0x75,                  /* 05 to 07 */
     0xc0, 0x40, 0xd6, 0x6c,             /* 08 to 0b */
     0xf5, 0x63, 0x75, 0x68,             /* 0c to 0f */
     0x6c, 0x83, 0x80, 0x00,             /* 10 to 13 */
