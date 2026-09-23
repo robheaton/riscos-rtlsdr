@@ -59,28 +59,40 @@ from 1-2 to 256, and the rendered spectrum finally shows real,
 distinct station peaks instead of noise.
 
 **Real audio output work has started, but real-time streaming is
-blocked on a structural RISC OS USB limitation.** RISC OS's actual
-streaming-audio mechanism was researched from real, working source
-(DigitalCD's own `!PlayTone` example, user-supplied) rather than
-guessed at — it goes through the standard **TimPlayer** module (already
-resident on most RISC OS 5 systems, or auto-loaded from
-`System:Modules.Audio.Trackers.TimPlayer`), which handles all
+blocked at the hardware/wire level, confirmed by a two-session
+investigation that went all the way down to raw DWC2 register state.**
+RISC OS's actual streaming-audio mechanism was researched from real,
+working source (DigitalCD's own `!PlayTone` example, user-supplied)
+rather than guessed at — it goes through the standard **TimPlayer**
+module (already resident on most RISC OS 5 systems, or auto-loaded
+from `System:Modules.Audio.Trackers.TimPlayer`), which handles all
 interrupt-driven DMA/mixing internally; the app itself never touches
 assembler. A "TONE" button in `!RTLSDRView` plays a generated test tone
 through it — confirmed working on real hardware, first try. Streaming
-the actual FM-demodulated audio was attempted next, and after an
-exhaustive investigation (chunk size, DeviceFS buffer size, retry
-strategy, GUI-vs-CLI isolation, USB controller identity, multi-stream
-pipelining, sample-rate independence — see `docs/PLAN.md`'s "milestone
-3" for the full elimination process), achieved throughput tops out
-around 10-13k IQ samples/sec against the 2.4M needed — a genuine,
-structural limitation in how RISC OS's USBDriver services bulk-IN
-endpoints (only one transfer ever in flight per stream, frequent
-short-packet completions), not an application-level bug. A follow-up
-project investigating the USB driver stack itself (`USBDriver`/
-`DWCDriver`) is the planned next step for unblocking this; `!RTLSDRView`
-itself keeps the test tone and a numeric FM-deviation readout as where
-real-time audio settles for now.
+the actual FM-demodulated audio was attempted next; achieved throughput
+tops out around 10-13k IQ samples/sec against the 2.4M needed (~0.5%).
+
+A sibling project (`riscos-usb-investigation`, cloned `USBDriver`/
+`DWCDriver` ROOL sources) ran in parallel and eliminated every
+software-side explanation with real hardware evidence: chunk/buffer
+size, retry strategy, GUI-vs-CLI overhead, USB controller identity,
+multi-stream pipelining, the one-transfer-in-flight design (real, but
+Linux also only has one transfer in flight and still gets ~59KB per
+transfer vs. RISC OS's ~2 bytes), the app-level round-trip gap between
+reads, slow per-transaction servicing, the device bring-up sequence,
+and sample-rate configuration (one real one-bit register bug was found
+and fixed along the way, with zero effect on throughput). The decisive
+test added diagnostic logging directly inside `DWCDriver`'s own
+completion handler: across 500 real bulk completions, the raw DWC2
+hardware register state confirms **every single one** is a genuine
+`XFER_COMPLETE` with exactly 2 bytes actually crossing the wire — not
+a driver misclassification at any layer. See `docs/PLAN.md`'s
+"milestone 4" for the full elimination chain. **Conclusion: this isn't
+a RISC OS software bug — the device is genuinely sending short packets
+to this specific host at the electrical level, which needs a real USB
+bus analyzer to investigate further.** `!RTLSDRView` keeps its best
+configuration (`nopad;short;size131072`), the test tone, and a numeric
+FM-deviation readout as where real-time audio settles for now.
 
 Getting here was a real diagnostic journey — full blow-by-blow in
 `docs/PLAN.md`, including several real bugs only found by actually

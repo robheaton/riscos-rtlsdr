@@ -2074,3 +2074,86 @@ pointer. `!RTLSDRView` itself is left with `nopad;short;size131072`
 (the best real-hardware-confirmed configuration found), the test tone,
 and the numeric FM-deviation readout as where real-time audio settles
 for now.
+
+## Phase 2, follow-on: real audio output, milestone 4 -- the sibling driver investigation reaches a definitive conclusion
+
+The separate `~/Development/riscos-usb-investigation` project (cloned
+`USBDriver`/`DWCDriver` ROOL sources, run as a parallel Claude session
+collaborating with this one over cross-session messages) picked up
+where milestone 3 above left off. Full history in that repo's
+`docs/FINDINGS.md`; summary here for this project's own record.
+
+**Ruled out, each with real-hardware evidence:**
+- **The application-level read()-to-read() round-trip gap.** A drafted
+  `USBDriver` patch re-arming bulk reads instantly from `read_cb()`'s
+  own interrupt context (up to 32 consecutive re-arms, near-zero host
+  gap) was built into a full ROM and cold-booted -- no material
+  throughput change.
+- **Slow per-transaction/per-NAK servicing within an already-armed
+  transfer.** `RTLSDR.c` milestone 11 (added this session) arms one
+  transfer then polls `DeviceCall_USB_TransferInfo` in as tight a loop
+  as possible with no `read()` calls in between -- transfers complete
+  within ~16 polls, under one centisecond. Fast, not slow.
+- **A missing or malformed step in RISC OS's device bring-up sequence.**
+  `Driver.c`'s `usb_ctrl_transfer()` was instrumented (`CTRLTRACE`,
+  `investigation/ctrl-transfer-trace` branch) to log every control
+  transfer's request fields and (v2) actual data payload bytes. A full
+  210-transaction, byte-level diff against a real Linux `libusb`
+  capture of the same bring-up sequence found the transaction shape
+  and count closely matched (210 RISC OS vs. 245 Linux -- RISC OS does
+  fewer, not more, so nothing's silently skipped).
+- **Wrong USB controller / device-side register misconfiguration.**
+  `*Modules` confirmed `DWCDriver` (not a slower XHCI/VL805 path) is
+  active; `rtlsdr_init_baseband()`/`rtlsdr_set_sample_rate()` checked
+  line-by-line against upstream, exact matches.
+- **`DWCDriver`/DWC2 HCD itself misreporting or misclassifying the
+  completion.** The one genuine, real bug this whole investigation
+  found: the byte-level CTRLTRACE diff caught `R82XX.c`'s tuner
+  init-array register 0x06 at `0x30` instead of the correct `0x32`
+  (verified against both the real Linux capture and upstream
+  `osmocom/rtl-sdr` source) -- a real, one-bit-flip bug, fixed in this
+  repo (see `R82XX.c`), but a real-hardware retest after the fix
+  showed **zero effect on throughput**, closing off that lead too.
+
+**The decisive final test:** diagnostic-only instrumentation added
+directly inside `DWCDriver`'s own completion interrupt handler
+(`handle_hc_xfercomp_intr`, the `UE_BULK` case, in
+`dwc_otg_hcd_intr` -- one layer below anything `USBDriver` has ever
+exposed), logging the DWC2 hardware's own raw channel-register state
+(`hctsiz.xfersize`, `hctsiz.pktcnt`, `hc->xfer_len`, and the actual
+`halt_status` DWC2 itself assigned) at the moment each bulk transfer
+completes. Built into a full ROM, cold-booted, and run through
+milestone 4's sustained bulk streaming test. Result, across 500
+captured completions (the diagnostic's cap): **every single one**
+shows `halt=2` (`DWC_OTG_HC_XFER_COMPLETE` -- never a NAK, STALL, or
+transaction error being folded into the result) and `actual_len=2`
+(zero variance), spanning all 8 DWC2 hardware channels, with
+`hctsiz.xfersize` (the hardware's own remaining-byte counter)
+confirming exactly 2 real bytes crossed the wire before each channel
+legitimately halted.
+
+**Conclusion: this is not a RISC OS software bug at any layer.**
+Application code, `USBDriver`'s abstraction, `DWCDriver`'s software
+state machine, and the raw DWC2 hardware register state all
+independently agree -- the RTL2832U genuinely sends a ~2-byte short
+packet on very close to every single bulk-IN activation when talking
+to this specific host, at the electrical/wire level. Three
+independent software layers agreeing, down to reading the hardware
+counter register directly, is about as strong a negative result as is
+obtainable without a real USB protocol/bus analyzer capturing the
+actual wire traffic -- ideally simultaneously on a known-good Linux
+session and this RISC OS session, to see whether the device's
+electrical/protocol behaviour genuinely differs between hosts (both
+sessions' working theory, never tested: something about how this
+specific host's electrical/timing characteristics interact with the
+RTL2832U's bulk endpoint that differs from Linux's, invisible to any
+register-level RISC OS-side instrumentation).
+
+**Status as of 2026-09-24: parked, pending either a real bus analyzer
+or new information.** Both this project and the sibling investigation
+agree this is a legitimate stopping point, not a premature one --
+every layer of the software stack on this side has been checked with
+real hardware evidence, not guesswork. `!RTLSDRView` keeps its current
+best configuration (`nopad;short;size131072`, test tone, numeric FM-
+deviation readout); the register 0x06 fix stays regardless, since it's
+a real bug independent of this investigation's outcome.
