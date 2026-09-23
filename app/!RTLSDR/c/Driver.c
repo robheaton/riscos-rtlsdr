@@ -19,6 +19,50 @@
 #define SWI_DeviceFS_CallDevice 0x42744
 #define USB_CALL_CONTROL_REQUEST ((int)0x80000000u) /* (1<<31) + 0 */
 
+/* Throughput investigation (riscos-usb-investigation), not a permanent
+   feature: logs every control transfer issued through usb_ctrl_transfer()
+   -- a running count, elapsed centiseconds since the first call, and the
+   request fields -- to stderr. Purpose: get a real count and cadence for
+   RTL-SDR's device-bringup control-transfer sequence on RISC OS hardware,
+   to diff against a real Linux capture of the same thing (245 control
+   transfers, ~980ms from device open to the first bulk read -- see
+   riscos-usb-investigation's docs/linux-setup-phase.md). Centisecond
+   resolution (OS_ReadMonotonicTime) is coarse next to Linux's ~2.6ms
+   cadence, but is enough to compare total count and aggregate elapsed
+   time, which is the comparison that matters here. Strip this once the
+   comparison's done -- it's not meant to stay. */
+#define SWI_OS_ReadMonotonicTime 0x42
+
+static int g_ctrl_transfer_count = 0;
+static int g_ctrl_transfer_start_cs = -1;
+
+static void log_ctrl_transfer(int bm_request_type, int b_request,
+                               int w_value, int w_index, int w_length)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *err;
+    int now_cs;
+    int elapsed_cs;
+
+    regs.r[0] = 0;
+    err = _kernel_swi(SWI_OS_ReadMonotonicTime, &regs, &regs);
+    now_cs = (err == NULL) ? regs.r[0] : -1;
+
+    if (g_ctrl_transfer_start_cs < 0 && now_cs >= 0) {
+        g_ctrl_transfer_start_cs = now_cs;
+    }
+    elapsed_cs = (now_cs >= 0 && g_ctrl_transfer_start_cs >= 0) ?
+                 (now_cs - g_ctrl_transfer_start_cs) : -1;
+
+    g_ctrl_transfer_count++;
+
+    fprintf(stderr, "CTRLTRACE %d elapsed_cs=%d bmreq=0x%02x breq=0x%02x "
+            "wvalue=0x%04x windex=0x%04x wlength=%d\n",
+            g_ctrl_transfer_count, elapsed_cs,
+            bm_request_type & 0xFF, b_request & 0xFF,
+            w_value & 0xFFFF, w_index & 0xFFFF, w_length & 0xFFFF);
+}
+
 /* ---- register read/write over DeviceFS_CallDevice ----
    Mirrors librtlsdr's rtlsdr_read_reg/write_reg (src/librtlsdr.c), which use
    libusb_control_transfer with:
@@ -36,6 +80,9 @@ int usb_ctrl_transfer(const char *device_name, int bm_request_type,
 {
     _kernel_swi_regs regs;
     _kernel_oserror *err;
+
+    log_ctrl_transfer(bm_request_type, b_request, w_value, w_index,
+                       w_length);
 
     regs.r[0] = USB_CALL_CONTROL_REQUEST;
     regs.r[1] = (int)device_name;
