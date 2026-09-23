@@ -21,28 +21,37 @@
 
 /* Throughput investigation (riscos-usb-investigation), not a permanent
    feature: logs every control transfer issued through usb_ctrl_transfer()
-   -- a running count, elapsed centiseconds since the first call, and the
-   request fields -- to stderr. Purpose: get a real count and cadence for
-   RTL-SDR's device-bringup control-transfer sequence on RISC OS hardware,
-   to diff against a real Linux capture of the same thing (245 control
-   transfers, ~980ms from device open to the first bulk read -- see
-   riscos-usb-investigation's docs/linux-setup-phase.md). Centisecond
-   resolution (OS_ReadMonotonicTime) is coarse next to Linux's ~2.6ms
-   cadence, but is enough to compare total count and aggregate elapsed
-   time, which is the comparison that matters here. Strip this once the
-   comparison's done -- it's not meant to stay. */
+   -- a running count, elapsed centiseconds since the first call, the
+   request fields, AND (v2) the actual data payload bytes -- to stderr.
+   Purpose: the v1 version of this (count/timing/request-envelope only)
+   was already diffed against a real Linux capture and found to match --
+   same transaction shape, ruling out "RISC OS does a different or
+   incomplete control-transfer setup." What's never been checked at
+   runtime is whether the DATA actually read back from (or written to)
+   the device matches upstream byte-for-byte -- register *source values*
+   were checked once statically against librtlsdr, never confirmed live
+   against what genuinely round-trips over the wire on this hardware.
+   Logged AFTER the SWI call (not before, like v1) so an IN transfer's
+   buffer reflects genuine results, not whatever was in it beforehand;
+   an OUT transfer's buffer is valid either before or after since the
+   caller fills it before calling. Strip this once the comparison's
+   done -- it's not meant to stay. */
 #define SWI_OS_ReadMonotonicTime 0x42
 
 static int g_ctrl_transfer_count = 0;
 static int g_ctrl_transfer_start_cs = -1;
 
 static void log_ctrl_transfer(int bm_request_type, int b_request,
-                               int w_value, int w_index, int w_length)
+                               int w_value, int w_index, int w_length,
+                               const unsigned char *data, int ok)
 {
     _kernel_swi_regs regs;
     _kernel_oserror *err;
     int now_cs;
     int elapsed_cs;
+    char databuf[64];
+    int i;
+    int n;
 
     regs.r[0] = 0;
     err = _kernel_swi(SWI_OS_ReadMonotonicTime, &regs, &regs);
@@ -56,11 +65,21 @@ static void log_ctrl_transfer(int bm_request_type, int b_request,
 
     g_ctrl_transfer_count++;
 
+    databuf[0] = '\0';
+    if (ok) {
+        n = w_length & 0xFFFF;
+        if (n > 8) { n = 8; }
+        for (i = 0; i < n; i++) {
+            sprintf(databuf + (i * 3), "%02x ", data[i]);
+        }
+    }
+
     fprintf(stderr, "CTRLTRACE %d elapsed_cs=%d bmreq=0x%02x breq=0x%02x "
-            "wvalue=0x%04x windex=0x%04x wlength=%d\n",
+            "wvalue=0x%04x windex=0x%04x wlength=%d ok=%d data=%s\n",
             g_ctrl_transfer_count, elapsed_cs,
             bm_request_type & 0xFF, b_request & 0xFF,
-            w_value & 0xFFFF, w_index & 0xFFFF, w_length & 0xFFFF);
+            w_value & 0xFFFF, w_index & 0xFFFF, w_length & 0xFFFF,
+            ok, databuf);
 }
 
 /* ---- register read/write over DeviceFS_CallDevice ----
@@ -81,9 +100,6 @@ int usb_ctrl_transfer(const char *device_name, int bm_request_type,
     _kernel_swi_regs regs;
     _kernel_oserror *err;
 
-    log_ctrl_transfer(bm_request_type, b_request, w_value, w_index,
-                       w_length);
-
     regs.r[0] = USB_CALL_CONTROL_REQUEST;
     regs.r[1] = (int)device_name;
     regs.r[3] = (bm_request_type & 0xFF) |
@@ -94,6 +110,14 @@ int usb_ctrl_transfer(const char *device_name, int bm_request_type,
     regs.r[6] = 0; /* block until command completion/failure/timeout */
 
     err = _kernel_swi(SWI_DeviceFS_CallDevice, &regs, &regs);
+    /* Logged AFTER completion (success or failure) -- see the comment
+       above log_ctrl_transfer() for why (an IN transfer's data buffer
+       isn't valid until now). Logging failures too, not just successes,
+       since milestone 3's baseband init has a known "Bad request" -- a
+       real event worth having in the trace, not silently dropped. */
+    log_ctrl_transfer(bm_request_type, b_request, w_value, w_index,
+                       w_length, (const unsigned char *)data,
+                       err == NULL);
     if (err != NULL) {
         fprintf(stderr, "usb_ctrl_transfer: %s\n", err->errmess);
         return -1;
