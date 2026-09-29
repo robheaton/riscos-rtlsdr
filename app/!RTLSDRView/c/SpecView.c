@@ -841,9 +841,9 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
 {
     int i;
     int got;
-    int want;
     int any_ok;
     int n_frames;
+    unsigned int tick_start_cs;
 
     UNUSED_ARG(event);
     UNUSED_ARG(reference);
@@ -920,162 +920,99 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
    very first MAX_FRAMES_PER_TICK cap fixed), so raised by 8x, not
    removed outright, to test the throughput hypothesis while watching
    for that regression. */
-#define MAX_FRAMES_PER_TICK 64
+#define MAX_FRAMES_PER_TICK 512
+/* Wall-clock budget per idle tick, in centiseconds (Time_Monotonic()
+   resolution): stop processing frames once this much time has elapsed
+   even if frames remain, so the Wimp always gets control back promptly. */
+#define TICK_BUDGET_CS 2
     any_ok = 0;
     n_frames = 0;
+    tick_start_cs = Time_Monotonic();
     for (i = 0; i < MAX_READ_ATTEMPTS; i++) {
-        /* Read into a FIXED buffer at offset 0 -- the exact pattern
-           milestone 4/5 actually validated as getting honest
-           non-blocking short-read counts -- then copy the genuinely-
-           received bytes into accum_buf_g ourselves. Two previous real-
-           hardware fixes (a fixed, validated CHUNK SIZE, then forcing
-           4-BYTE-ALIGNED destination offsets) both failed to move two
-           specific, fixed sample offsets (250-251, 510-511) off of
-           permanent zero while other positions genuinely varied -- the
-           one thing neither fix changed was reading into a GROWING,
-           NON-ZERO destination offset within accum_buf_g
-           (accum_buf_g+accum_fill_g). If DeviceFS's honest-short-read
-           mechanism has any quirk tied to non-zero/varying destination
-           addresses, that would explain a fixed-position failure size
-           and alignment couldn't touch. This sidesteps the question
-           entirely by never passing the SWI anything but a small, fixed,
-           offset-0 buffer. */
         static unsigned char read_tmp_g[FIXED_CHUNK_SIZE];
-        /* The 0xAA sentinel-fill + byte-by-byte "touched" comparison
-           that used to run HERE, on every single read attempt, was
-           essential while the padding mystery was open (see
-           docs/PLAN.md) -- but it's pure overhead now that the real
-           mechanism (USBDriver's own read_cb() padding) was found and
-           fixed via `nopad`. Cost scaled directly with
-           FIXED_CHUNK_SIZE (64 or 512 redundant iterations per
-           attempt, on potentially hundreds of attempts per tick), and
-           removing it is the leading suspect for why throughput
-           dropped when chunk size went up rather than improving --
-           the diagnostic itself may have been the bottleneck, not the
-           read mechanism it was measuring. debug_last_gots_g is kept
-           (cheap, 3 assignments) since it's still a handy live
-           readout. */
-        want = FIXED_CHUNK_SIZE;
-        got = os_gbpb_read4(stream_handle_g, read_tmp_g, want);
-        debug_last_gots_g[0] = debug_last_gots_g[1];
-        debug_last_gots_g[1] = debug_last_gots_g[2];
-        debug_last_gots_g[2] = got;
-        if (got < 0) {
-            debug_reads_bad_g++;
-            break;
-        }
-        if (got == 0) {
-            /* THE REAL THROUGHPUT BOTTLENECK (found by reading
-               USBDriver's start_read()/read_cb() this session): the
-               driver allows only ONE bulk transfer in flight at a
-               time. If a read() call finds the previous transfer
-               still busy, it returns 0 immediately WITHOUT submitting
-               anything and without checking completion -- completion
-               is only noticed, via an interrupt-driven callback
-               clearing xfer_busy, on a LATER read() call. So got==0
-               here does not mean "no more data available right now"
-               (this loop's old assumption, correct for the earlier
-               DeviceFS-padding-era model) -- it means "the single
-               outstanding transfer hasn't completed yet, try again."
-               Breaking out here (as this loop used to) abandons the
-               whole frame-fill attempt after essentially ONE real
-               transfer, handing control back to Wimp_Poll and not
-               resuming until the next idle tick -- which matches
-               every throughput figure measured all session (7k-40k)
-               regardless of chunk size or MAX_FRAMES_PER_TICK, since
-               those never mattered if only ~1 transfer/tick was ever
-               completing. Retrying immediately (bounded by
-               MAX_READ_ATTEMPTS, still non-blocking so this can't
-               hang) is the driver's own intended polling pattern for
-               waiting on the in-flight transfer to complete. */
-            continue;
-        }
-        memcpy(accum_buf_g + accum_fill_g, read_tmp_g, (size_t)got);
-        /* Only count whole I/Q pairs. want is always even (IQ_BYTES and
-           accum_fill_g are both kept even by this same rule), but the
-           SWI decides how much to actually deliver -- if that "got"
-           happens to be odd (very plausible once want stops being a
-           round power of two, which milestone 5's sentinel test never
-           exercised), accepting it as-is would leave accum_fill_g odd,
-           permanently shifting every iq_frame_g[2*i]/[2*i+1] I/Q
-           pairing by one byte for the rest of the frame -- silently
-           swapping I and Q with the wrong neighbours. That would
-           scramble frequency content while leaving the DC sum (order-
-           independent) untouched, which matches exactly what real runs
-           have shown: real signal present, DC always the same, every
-           other bin flat. Dropping a lone trailing byte here (left in
-           the buffer to be overwritten next read) costs one sample out
-           of many thousands and keeps pairing intact throughout.
+        int off;
 
-           A 4-byte-alignment variant of this mask was also tried (in
-           case the SWI needed a word-aligned destination) and made no
-           difference -- ruled out now that the SWI always targets
-           read_tmp_g[0] regardless of accum_fill_g, so only 2-byte/
-           I-Q-pairing alignment matters for the C-level memcpy
-           destination. */
-        accum_fill_g += got & ~1;
-        if (accum_fill_g < IQ_BYTES) {
-            continue;
-        }
+        /* Rewritten once the real root cause of the long-running
+           "2 bytes per read" behaviour was found and fixed (Driver.c's
+           rtlsdr_write_reg() packed 2-byte values low-byte-first, so
+           USB_EPA_MAXPKT went out as 2 instead of 512). Reads now
+           return real, full-size chunks at the true ~4.8 MB/s, which
+           exposed that the old loop -- built around reads that were
+           only ever a few bytes -- extracted just ONE frame per chunk
+           and kept appending: with a 16 KB chunk that overran
+           accum_buf_g by ~15 KB on the second read.
 
-        {
-            int j;
-            int carry;
-            memcpy(iq_frame_g, accum_buf_g, IQ_BYTES);
-            /* A fixed-size read can overshoot the frame boundary (e.g.
-               accum_fill_g was 400, a 256-byte chunk arrives, landing at
-               656 -- 144 bytes past IQ_BYTES). Those extra bytes are
-               genuine, already-read samples for the START of the NEXT
-               frame, not garbage -- carry them down to the front of
-               accum_buf_g instead of discarding them (which would have
-               reintroduced a real data gap, the same category of bug as
-               the frame-contiguity issue documented in docs/PLAN.md). */
-            carry = accum_fill_g - IQ_BYTES;
-            if (carry > 0) {
-                memmove(accum_buf_g, accum_buf_g + IQ_BYTES, (size_t)carry);
+           New shape: only read when the accumulator has room for a
+           whole chunk (so it can never overflow), then drain EVERY
+           complete frame from it, then compact the remainder once.
+           got==0 now simply means "nothing buffered right now" and
+           yields back to Wimp_Poll (the busy-retry that used to sit
+           here only made sense while every transfer was 2 bytes and
+           the buffer was always empty). A wall-clock budget bounds the
+           work per idle tick so the desktop stays responsive whatever
+           the FPU speed turns out to be. */
+        if (accum_fill_g <= (int)sizeof(accum_buf_g) - FIXED_CHUNK_SIZE) {
+            got = os_gbpb_read4(stream_handle_g, read_tmp_g,
+                                FIXED_CHUNK_SIZE);
+            debug_last_gots_g[0] = debug_last_gots_g[1];
+            debug_last_gots_g[1] = debug_last_gots_g[2];
+            debug_last_gots_g[2] = got;
+            if (got < 0) {
+                debug_reads_bad_g++;
+                break;
             }
-            accum_fill_g = carry;
+            if (got == 0) {
+                break;
+            }
+            memcpy(accum_buf_g + accum_fill_g, read_tmp_g, (size_t)got);
+            /* Whole I/Q pairs only: a lone trailing byte would shift the
+               I/Q pairing of everything after it. */
+            accum_fill_g += got & ~1;
+        }
+
+        off = 0;
+        while (accum_fill_g - off >= IQ_BYTES &&
+               n_frames < MAX_FRAMES_PER_TICK) {
+            memcpy(iq_frame_g, accum_buf_g + off, IQ_BYTES);
+            off += IQ_BYTES;
             any_ok = 1;
             debug_reads_ok_g++;
-            memcpy(debug_first_bytes_g, iq_frame_g, sizeof(debug_first_bytes_g));
-            debug_mid_i_g = iq_frame_g[250];
-            debug_mid_q_g = iq_frame_g[251];
-            debug_end_i_g = iq_frame_g[IQ_BYTES - 2];
-            debug_end_q_g = iq_frame_g[IQ_BYTES - 1];
-            /* debug_c1end_*_g/debug_c2start_*_g (chunk-boundary bytes)
-               retired: they made sense back when FIXED_CHUNK_SIZE was
-               small enough that a frame spanned several chunks: now
-               that a chunk can hold many whole frames (or, at 512, be
-               exactly one), there's no single fixed chunk-boundary
-               offset inside a frame worth sampling any more. */
-            /* raw byte range across the WHOLE frame, not just the first
-               4 bytes -- distinguishes "the ADC genuinely sees almost no
-               swing" from "the FFT/scaling math is flattening real
-               variation". See the debug_*_g comment above. */
-            debug_byte_min_g = 255;
-            debug_byte_max_g = 0;
-            for (j = 0; j < IQ_BYTES; j++) {
-                if (iq_frame_g[j] < debug_byte_min_g) {
-                    debug_byte_min_g = iq_frame_g[j];
-                }
-                if (iq_frame_g[j] > debug_byte_max_g) {
-                    debug_byte_max_g = iq_frame_g[j];
-                }
-            }
-
-            /* FFT this frame and fold it into the running power
-               average NOW, every time a frame completes -- which can
-               happen many times a second, far faster than the ~5Hz
-               display throttle below. Averaging as many frames as
-               actually arrive (rather than only the single one that
-               happens to be latest when the display updates) is the
-               whole point: it's what reduces a single raw FFT
-               snapshot's high per-bin variance. See the comment above
-               accumulate_frame(). */
             accumulate_frame();
             n_frames++;
-            if (n_frames >= MAX_FRAMES_PER_TICK) {
+            if (Time_Monotonic() - tick_start_cs >= TICK_BUDGET_CS) {
                 break;
+            }
+        }
+        if (off > 0) {
+            accum_fill_g -= off;
+            if (accum_fill_g > 0) {
+                memmove(accum_buf_g, accum_buf_g + off,
+                        (size_t)accum_fill_g);
+            }
+        }
+        if (n_frames >= MAX_FRAMES_PER_TICK ||
+            Time_Monotonic() - tick_start_cs >= TICK_BUDGET_CS) {
+            break;
+        }
+    }
+
+    if (any_ok) {
+        /* Cheap per-tick debug snapshots of the LAST frame processed
+           (these used to run on every single frame). */
+        int j;
+        memcpy(debug_first_bytes_g, iq_frame_g, sizeof(debug_first_bytes_g));
+        debug_mid_i_g = iq_frame_g[250];
+        debug_mid_q_g = iq_frame_g[251];
+        debug_end_i_g = iq_frame_g[IQ_BYTES - 2];
+        debug_end_q_g = iq_frame_g[IQ_BYTES - 1];
+        debug_byte_min_g = 255;
+        debug_byte_max_g = 0;
+        for (j = 0; j < IQ_BYTES; j++) {
+            if (iq_frame_g[j] < debug_byte_min_g) {
+                debug_byte_min_g = iq_frame_g[j];
+            }
+            if (iq_frame_g[j] > debug_byte_max_g) {
+                debug_byte_max_g = iq_frame_g[j];
             }
         }
     }
@@ -1720,24 +1657,19 @@ int main(void)
        caught it. `nopad` disables this at the source -- see
        docs/PLAN.md.
 
-       `short` and `size131072` added after a dedicated CLI throughput
-       investigation (RTLSDR milestones 6-10, docs/PLAN.md): with nopad
-       already making correctness independent of chunk size, a careful
-       GUI-free sweep found neither chunk size (8-65536) nor DeviceFS
-       buffer size alone moved achieved throughput much -- but ADDING
-       `short` (USBDriver's documented "force a short packet at the end
-       of each transfer, even on an exact max-packet multiple" flag,
-       equivalent to NetBSD's USBD_FORCE_SHORT_XFER) gave a real,
-       directly-comparable ~65% throughput gain in the same test run
-       (30041 -> 49679 bytes/sec). Also confirmed throughput does NOT
-       meaningfully track the configured sample rate (2.4 MSPS vs. 250
-       kHz gave near-identical achieved bytes/sec), which is why this
-       is a USB/driver-level fix rather than a signal-chain one.
-       `size131072` (a 128KB DeviceFS stream buffer, vs. the small
-       default) gave a smaller but still real gain in the same
-       investigation. */
+       UPDATE (2026-09-29): the throughput ceiling that the `short` and
+       `size131072` experiments were chasing turned out to have a single
+       root cause elsewhere -- Driver.c's rtlsdr_write_reg() packed
+       2-byte values in the wrong byte order, so USB_EPA_MAXPKT was set
+       to 2 instead of 512 (see the comment there). With that fixed,
+       reads return full chunks at ~98% of the true 2.4 MSPS rate.
+       `short` never gave a real benefit (it is documented as an OUT-
+       transfer flag; milestone 10 measured 3.1 MB/s with it vs. 3.5
+       without) and has been dropped. `size131072` (a 128 KB DeviceFS
+       stream buffer instead of the small default) does help -- ~4.7
+       MB/s vs. ~3.5 MB/s in the same investigation -- so it stays. */
     sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
-                  "nopad;short;size131072:%s",
+                  "nopad;size131072:%s",
             RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, device_name_g);
     stream_handle_g = os_find_open(path);
     if (stream_handle_g == 0) {
