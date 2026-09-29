@@ -56,43 +56,41 @@ to validate the original milestone-5 fix, and worse the larger the
 request. Shrinking the read size down to 8 bytes (4 samples) fixed it:
 `nElev` (samples per frame carrying real energy, out of 256) jumped
 from 1-2 to 256, and the rendered spectrum finally shows real,
-distinct station peaks instead of noise.
+distinct station peaks instead of noise. (Update: that DeviceFS/padding
+explanation described the symptoms accurately but not the cause — every
+read only ever contained one genuinely fresh I/Q sample because the
+dongle's bulk endpoint was mis-programmed to 2-byte packets; see below.)
 
-**Real audio output work has started, but real-time streaming is
-blocked at the hardware/wire level, confirmed by a two-session
-investigation that went all the way down to raw DWC2 register state.**
-RISC OS's actual streaming-audio mechanism was researched from real,
-working source (DigitalCD's own `!PlayTone` example, user-supplied)
-rather than guessed at — it goes through the standard **TimPlayer**
-module (already resident on most RISC OS 5 systems, or auto-loaded
-from `System:Modules.Audio.Trackers.TimPlayer`), which handles all
+**Real audio output: the USB throughput blocker is fixed; FM demodulation
+for audio is the remaining work.** RISC OS's actual streaming-audio
+mechanism was researched from real, working source (DigitalCD's own
+`!PlayTone` example, user-supplied) rather than guessed at — it goes
+through the standard **TimPlayer** module (already resident on most
+RISC OS 5 systems, or auto-loaded from
+`System:Modules.Audio.Trackers.TimPlayer`), which handles all
 interrupt-driven DMA/mixing internally; the app itself never touches
 assembler. A "TONE" button in `!RTLSDRView` plays a generated test tone
-through it — confirmed working on real hardware, first try. Streaming
-the actual FM-demodulated audio was attempted next; achieved throughput
-tops out around 10-13k IQ samples/sec against the 2.4M needed (~0.5%).
+through it — confirmed working on real hardware, first try.
 
-A sibling project (`riscos-usb-investigation`, cloned `USBDriver`/
-`DWCDriver` ROOL sources) ran in parallel and eliminated every
-software-side explanation with real hardware evidence: chunk/buffer
-size, retry strategy, GUI-vs-CLI overhead, USB controller identity,
-multi-stream pipelining, the one-transfer-in-flight design (real, but
-Linux also only has one transfer in flight and still gets ~59KB per
-transfer vs. RISC OS's ~2 bytes), the app-level round-trip gap between
-reads, slow per-transaction servicing, the device bring-up sequence,
-and sample-rate configuration (one real one-bit register bug was found
-and fixed along the way, with zero effect on throughput). The decisive
-test added diagnostic logging directly inside `DWCDriver`'s own
-completion handler: across 500 real bulk completions, the raw DWC2
-hardware register state confirms **every single one** is a genuine
-`XFER_COMPLETE` with exactly 2 bytes actually crossing the wire — not
-a driver misclassification at any layer. See `docs/PLAN.md`'s
-"milestone 4" for the full elimination chain. **Conclusion: this isn't
-a RISC OS software bug — the device is genuinely sending short packets
-to this specific host at the electrical level, which needs a real USB
-bus analyzer to investigate further.** `!RTLSDRView` keeps its best
-configuration (`nopad;short;size131072`), the test tone, and a numeric
-FM-deviation readout as where real-time audio settles for now.
+Streaming the actual FM-demodulated audio was blocked for a long time by
+a throughput ceiling of ~10-30 KB/s against the ~4.8 MB/s a 2.4 MSPS
+capture needs. After an exhaustive investigation (a two-session effort
+that eliminated the application, `USBDriver` and `DWCDriver` layers, and
+even read the DWC2 hardware registers directly), the cause turned out to
+be a single byte-order bug in this project's own `rtlsdr_write_reg()`:
+2-byte values were packed low-byte-first instead of high-byte-first, so
+the dongle's bulk endpoint max packet size was programmed as **2 bytes**
+instead of 512. Every packet was 2 bytes, every transfer ended after 2
+bytes. Fixed 2026-09-29 — sustained reads now run at **~4.7 MB/s (98% of
+the 2.4 MSPS rate)** and throughput tracks the configured sample rate.
+The same bug was behind the earlier "flat spectrum" / "padding" mystery.
+See `docs/PLAN.md`'s "milestone 5" for the full story (and milestones
+3-4 for the honest record of the wrong turns).
+
+What remains for audio is DSP: at the true data rate the app needs a
+channel filter and decimation ahead of the FM discriminator, rather than
+running `atan2` on every wideband sample. `!RTLSDRView` currently offers
+the test tone and a numeric FM-deviation readout.
 
 Getting here was a real diagnostic journey — full blow-by-blow in
 `docs/PLAN.md`, including several real bugs only found by actually

@@ -2077,6 +2077,15 @@ for now.
 
 ## Phase 2, follow-on: real audio output, milestone 4 -- the sibling driver investigation reaches a definitive conclusion
 
+> **SUPERSEDED (2026-09-29): the conclusion below is WRONG.** It was
+> reasoned correctly from the evidence available, but every layer it
+> checked was *downstream* of the real bug -- a byte-order error in
+> `Driver.c`'s `rtlsdr_write_reg()` that told the dongle its bulk
+> endpoint's max packet size is 2 bytes. See "milestone 5" at the end of
+> this file for the actual root cause, the fix, and the hardware
+> confirmation. The "needs a bus analyzer" recommendation is withdrawn.
+> Everything below is kept as an honest record of the investigation.
+
 The separate `~/Development/riscos-usb-investigation` project (cloned
 `USBDriver`/`DWCDriver` ROOL sources, run as a parallel Claude session
 collaborating with this one over cross-session messages) picked up
@@ -2157,3 +2166,91 @@ real hardware evidence, not guesswork. `!RTLSDRView` keeps its current
 best configuration (`nopad;short;size131072`, test tone, numeric FM-
 deviation readout); the register 0x06 fix stays regardless, since it's
 a real bug independent of this investigation's outcome.
+
+## Phase 2, follow-on: real audio output, milestone 5 -- the ACTUAL root cause, fixed and confirmed on hardware
+
+**The bug (found 2026-09-29): `Driver.c`'s `rtlsdr_write_reg()` packed
+2-byte values in the wrong byte order.** Upstream librtlsdr writes a
+2-byte register as `data[0] = val >> 8; data[1] = val & 0xff` (high byte
+first); this port did `data[0] = val & 0xff; data[1] = val >> 8`.
+`rtlsdr_demod_write_reg()` in the same file packed correctly, which is
+why every demod and tuner register worked and the bug hid for so long:
+only the USB-block registers are written with `len == 2`, and there are
+only two of them.
+
+| write | Linux (wire bytes) | this port before the fix | meaning |
+|---|---|---|---|
+| `USB_EPA_MAXPKT` (0x2158) <- 0x0002 | `00 02` = 0x0200 = **512** | `02 00` = 0x0002 = **2** | bulk-IN endpoint max packet size |
+| `USB_EPA_CTL` (0x2148) <- 0x1002 | `10 02` (stall + reset EPA) | `02 10` (unintended bits) | endpoint control |
+
+So the RTL2832U's bulk-IN endpoint was configured with a **2-byte max
+packet size**. Every packet it sent was exactly 2 bytes -- a "short"
+packet from the host's point of view (the endpoint descriptor says 512)
+-- so every transfer completed after exactly 2 bytes. That single fact
+explains *everything* previously chased as separate mysteries:
+
+- `actual_len=2` with zero variance across all 500 DWC2 completions
+  (`halt=2` XFER_COMPLETE, `hctsiz.xfersize` dropping by exactly 2): the
+  hardware was reporting the truth -- the device really did send 2-byte
+  packets. The milestone-4 "three layers agree, needs a bus analyzer"
+  conclusion was accurate about the layers and blind to the cause.
+- Independence from chunk size, DeviceFS buffer size, `short`/`nopad`,
+  read-loop strategy, and configured sample rate.
+- The ~30,000x bytes-per-transfer gap versus Linux (~59 KB / 2 B).
+- The earlier "flat-spectrum mystery" / "padding-by-repetition" saga:
+  every read only ever had one genuinely fresh I/Q sample (2 bytes); the
+  rest was padding. The 8-byte-chunk workaround, `nopad`, and the whole
+  chunk-size sweep were all working around this one bug.
+- Milestone 4's original "25 MB/s" figure (blocking mode padding a
+  2-byte transfer up to the requested size).
+
+**How it was finally found:** an in-order diff of the *raw wire bytes*
+of every control-transfer write between the sibling investigation's real
+Linux capture (`riscos-usb-investigation/data/linux_ctrltrace_v2.txt`)
+and this port's CTRLTRACE v2 capture. Earlier passes compared source
+register *values* (`0x0002` matches upstream -- a suspicion about it was
+raised early and wrongly dismissed for exactly that reason), transaction
+*counts* and categories, and the R82XX init array -- none of which can
+see a byte-order difference in the packing. Lesson: when diffing against
+a reference implementation, diff what actually goes on the wire, not the
+values you meant to send. (The same diff also isolated the R82XX register
+0x06 bug fixed earlier, plus GPIO/bias-tee state and an absent-tuner I2C
+probe -- all irrelevant to bulk transfers.)
+
+**Hardware confirmation** (fixed `RTLSDR,ff8`, real CM4, milestones 4-11):
+- Milestone 5 sentinel test: reads now contain genuine ADC noise centred
+  on 0x7F/0x80 (I/Q are offset-binary), every byte "touched"; the old
+  "2 real bytes then zeros" pattern is gone.
+- Milestone 6 (tight loop, `nopad;size131072`): **4.66-4.73 MB/s, 97-98.6%
+  of the 4.8 MB/s target**, at every chunk size 1024-8192, with average
+  bytes per successful read equal to the chunk size (was 2).
+- Milestone 10: throughput now *tracks the configured sample rate* --
+  250 kHz gave 496 KB/s (99% of 500 KB/s); before the fix it was
+  independent of it. The `short` flag gave no benefit (3.1 vs 3.5 MB/s
+  with the default buffer). The default DeviceFS buffer gives ~3.5 MB/s;
+  `size131072` gives ~4.7 MB/s, so it stays.
+- Milestone 11: a 1024-byte transfer now completes within ~32 tight
+  polls with `received=1024`.
+- Milestone 4 (blocking, 1024-byte calls): 3.8 MB/s of real data (79% of
+  target, just under its own 80% gate -- the gate's "largest reliable
+  size is 1024" message is stale).
+- Milestone 9's "MISMATCH" is still printed: it remains a false alarm of
+  the diagnostic itself (read/write byte-order asymmetry on the *demod*
+  registers, which are packed correctly).
+
+**Consequences for `!RTLSDRView`:**
+- A latent buffer overflow was exposed and fixed: `Null_spectrum()`
+  extracted one 512-byte frame per 16 KB chunk and kept appending, which
+  would overrun `accum_buf_g` by ~15 KB on the second read. Reads only
+  ever returned 2 bytes before, so it never fired. The loop now drains
+  every complete frame per chunk, only reads when the accumulator has room
+  for a whole chunk, yields to the Wimp when nothing is buffered, and has
+  a wall-clock budget per idle tick.
+- The `short` stream flag was dropped; `nopad;size131072` kept.
+- Real-time FM audio is now a DSP problem, not a USB one: at the true
+  rate the app must demodulate ~2.4 M samples/s. The current
+  `demodulate_frame()` runs `atan2` on every wideband sample and
+  decimates by dropping samples (aliasing all the out-of-channel noise
+  into the audio band); it needs a channel filter / decimation before
+  the discriminator, and a per-frame first-sample continuity fix.
+
