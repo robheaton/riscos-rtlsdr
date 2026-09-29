@@ -2254,3 +2254,67 @@ probe -- all irrelevant to bulk transfers.)
   into the audio band); it needs a channel filter / decimation before
   the discriminator, and a per-frame first-sample continuity fix.
 
+## Phase 2, follow-on: real audio output, milestone 6 -- the CPU was the next bottleneck; integer-only FM demodulation
+
+**First run of `!RTLSDRView` on real full-rate data** (after milestone 5's
+fix): spectrum clean and correct, but the DEM/STREAM readout showed
+`r=36k` and STREAM was "a burst of static every 3 seconds". `r` then
+counted FFT frames processed per second x 256, i.e. ~141 frames/s -- about
+1.5% of the 9,375 frames/s the dongle delivers. USB was no longer the
+limit; the processing was.
+
+**Cause:** `plan.json` compiles with `cc -c -za1 -Otime -apcs 3/32bit` and
+no `-fpu` option, so every `double` operation is emulated floating point
+(FPEmulator), roughly 100x slower than integer maths. Each frame ran a
+256-point FFT plus (with DEM/STREAM on) 255 `atan2` calls: ~7 ms per
+frame. STREAM therefore produced ~1.5% of the audio it needed.
+
+**A second, independent audio bug:** `audio_stream_feed()` kept writing at
+the write head even when the estimated play head had overtaken it. Those
+samples were behind the play head, so they were only heard a full loop of
+the 2 s ring later -- the "burst every few seconds". The write head must be
+held a fixed lead ahead of the play head and re-synced (silencing the gap)
+after an underrun.
+
+**Fix (all integer on the per-sample path):**
+- `Dsp.c` / `Dsp.h`: 3rd-order CIC decimate-by-10 (2.4 MSPS -> 240 kSPS,
+  also the channel filter: its nulls fall on the neighbouring 200 kHz
+  channels), integer polar discriminator using an integer atan2 (Q14
+  radians, octant reduction + the Rajan approximation, max error ~0.09
+  degrees), 50 us de-emphasis (`DEEMPH_US`; 75 for the Americas), and an
+  integrate-and-dump resampler that handles any mixer rate. Floating point
+  is touched only a few times per call, for statistics.
+- `SpecView.c`: every chunk goes through the demodulator (it must see the
+  whole stream); the FFT display takes only ~8 frames per 200 ms update
+  (`AVG_ALPHA` retuned 0.005 -> 0.02 to keep a ~1 s time constant); DEM's
+  peak/RMS deviation now comes from the integer demodulator, so it is
+  finally the deviation of the *channel*, not of 2.4 MHz of everything; `r=`
+  now reports the true USB read rate in kilo-samples/s (should sit near
+  2400k). The retune handler no longer calls `rtlsdr_reset_buffer()`
+  mid-stream -- since milestone 5 that call genuinely stalls and resets the
+  endpoint, which must not happen with a transfer in flight -- and drains
+  the DeviceFS buffer instead.
+- `Audio.c`: the ring logic above (200 ms target lead, resync below 60 ms,
+  drop above 600 ms).
+
+**Validated off-hardware before it ever reached the Pi** (the Linux dev
+machine can compile `Dsp.c` unchanged): synthetic FM at 2.4 MSPS (1 kHz
+tone, +-50 kHz deviation, 12 kHz carrier offset, noise, neighbours at
++200 kHz and -400 kHz), quantised to unsigned 8-bit. The demodulated tone
+came out at exactly 1000 Hz with amplitude within 0.08% of theory, 61 dB
+SNR (48.7 dB at 44.1 kHz, where the non-integer resampling ratio costs
+some), neighbours at -75 to -80 dB, exact output sample counts, and
+identical results for chunk sizes 16384 and 12346 (so state carries across
+calls correctly). `Dsp.c` is clean under `-std=c89 -pedantic -Wall -Wextra`
+and under ASan+UBSan, including clipped, silent, noise-only and
+alternating-extreme inputs. A Python port of the ring logic confirmed a
+single start-up sync, bounded latency and no stale replay under bursty
+production with injected stalls.
+
+**Known limitations / next steps:** mono only (no stereo decode, no RDS);
+no squelch (weak signals give loud hiss); the station must be at the
+centre of the 2.4 MHz capture (tune with F-/F+); the FFT is still emulated
+floating point (enabling VFP in the build would speed it up a great deal
+but needs the VFP context set up and care with the soft-float C library
+ABI); volume is fixed (`dsp_fm_set_gain()` exists, no UI yet).
+
