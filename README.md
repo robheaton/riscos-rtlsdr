@@ -8,104 +8,69 @@ and milestones — start there.
 
 ## Status
 
-**Phase 1 (milestones 1-4): enumeration through control transfers and
-baseband/tuner bring-up are confirmed on real hardware.** An
-**RTL-SDR Blog V4** dongle (R828D tuner + upconverter), VID `0BDA` /
-PID `2838`, found via `*USBDevices` → `DeviceFS_CallDevice` control
-transfers → baseband init → tuner identified and locked → sample rate
-configured. No libusb, no existing driver to build on; this talks to
-the dongle entirely through RISC OS's own native USB interface.
+**Working on real hardware: a native RISC OS software-defined radio that
+plays live broadcast FM.** Everything below is confirmed on a Raspberry Pi
+Compute Module 4 running RISC OS 5.30 with an RTL-SDR Blog V4 (R828D tuner
++ upconverter, VID `0BDA` / PID `2838`), talking to the dongle only through
+RISC OS's own DeviceFS USB interface — no libusb, no existing driver to
+build on.
 
-⚠️ **Milestone 4's original "25.6 MB/s sustained throughput" result was
-wrong and should not be treated as settled** — it only ever verified
-byte *counts* returned by `OS_GBPB`, never actual byte *content*. A
-phase 2 diagnostic (see `docs/PLAN.md`'s milestone 5) proved via a
-sentinel-fill test that `OS_GBPB` reason 4 against this bulk endpoint,
-in its default blocking mode, reports a full transfer while genuinely
-writing only ~2 real bytes per call, zero-padding the rest — a
-documented, ~20-year-old RISC OS DeviceFS characteristic (short reads
-get silently padded, with no reliable way to learn the true transfer
-size from the public API), not a bug introduced by this project. **Now
-fixed**: a second, public SWI (`OS_Args` reason 9, IOCtl group `0xFF`
-reason 1) enables non-blocking mode on the stream, after which
-`OS_GBPB` reports honest short-read counts — confirmed on real hardware
-and wired into both `!RTLSDR` (a new milestone 5) and `!RTLSDRView`.
-Milestone 4's actual throughput number has not yet been re-measured
-with this fix; treat the old number as void until it is.
+- **Device bring-up** (`!RTLSDR`, milestones 1-3): enumeration via
+  `*USBDevices`, vendor control transfers through `DeviceFS_CallDevice`,
+  baseband init, tuner identification, PLL lock at a real frequency,
+  sample-rate configuration.
+- **Sustained bulk streaming** (`!RTLSDR`, milestones 4-11): **~4.7 MB/s,
+  98% of the 2.4 MSPS stream**, tight-loop, no GUI.
+- **`!RTLSDRView`**, a Wimp app: live spectrum (hand-written FFT,
+  power-domain averaging), AGC/manual gain, frequency tuning (F-/F+), an FM
+  deviation readout (DEM), a TimPlayer test tone (TONE), and **real-time
+  wideband-FM audio (STREAM)** — the whole 2.4 MSPS stream is demodulated
+  live and played through RISC OS's standard **TimPlayer** module.
 
-**Phase 2, milestone 1 (`!RTLSDRView`, a live spectrum display) is
-done, confirmed on real hardware: a real, multi-peak spectrum showing
-genuine broadcast stations, live gain control (AGC/manual), live
-frequency tuning, an FM demodulator (numeric readout only — no
-streamed audio yet), and a working audio test tone via the standard
-TimPlayer module.** A real Wimp GUI app: continuous idle-driven honest
-USB reads, a hand-written FFT, power-domain frame averaging, and a
-live-updating bar-graph redraw, all running inside the Wimp event loop
-without freezing the desktop. A long list of real bugs was found and
-fixed getting here (see `docs/PLAN.md`'s "Phase 2" section for the full
-history) — most notably a genuine analog/digital IF mismatch (this
-port never called the real upstream bandwidth-configuration step,
-leaving the tuner's actual analog IF and the demod's digital
-downconversion offset by ~1.75MHz, comparable to the capture's own
-Nyquist limit) and, the actual root cause of the long-standing flat/
-noisy spectrum: DeviceFS's non-blocking short-read mechanism, for
-larger request sizes, returns a buffer where only the very first
-sample is genuinely fresh and the rest is padding-by-repetition of an
-earlier byte — invisible to the zero-padding-only sentinel test used
-to validate the original milestone-5 fix, and worse the larger the
-request. Shrinking the read size down to 8 bytes (4 samples) fixed it:
-`nElev` (samples per frame carrying real energy, out of 256) jumped
-from 1-2 to 256, and the rendered spectrum finally shows real,
-distinct station peaks instead of noise. (Update: that DeviceFS/padding
-explanation described the symptoms accurately but not the cause — every
-read only ever contained one genuinely fresh I/Q sample because the
-dongle's bulk endpoint was mis-programmed to 2-byte packets; see below.)
+**How the audio works.** Audio output uses TimPlayer (already resident on
+most RISC OS 5 systems, or loaded from
+`System:Modules.Audio.Trackers.TimPlayer`), which does all interrupt-driven
+DMA/mixing itself; the app never touches assembler. The demodulator
+(`Dsp.c`) is **integer-only** — this build has no `-fpu` option, so every
+`double` is emulated floating point, roughly 100x slower per operation —
+and runs on every sample: a 3rd-order CIC decimate-by-10 (2.4 MSPS → 240
+kSPS, which also acts as the channel filter), an integer polar
+discriminator, 50 µs de-emphasis, and a resampler to whatever rate the
+mixer runs at. It was validated against synthetic FM on a Linux machine
+before it ever ran on the Pi. Only the FFT display uses (emulated) floating
+point, and it is budgeted to a few frames per update.
 
-**Real audio output: the USB throughput blocker is fixed; FM demodulation
-for audio is the remaining work.** RISC OS's actual streaming-audio
-mechanism was researched from real, working source (DigitalCD's own
-`!PlayTone` example, user-supplied) rather than guessed at — it goes
-through the standard **TimPlayer** module (already resident on most
-RISC OS 5 systems, or auto-loaded from
-`System:Modules.Audio.Trackers.TimPlayer`), which handles all
-interrupt-driven DMA/mixing internally; the app itself never touches
-assembler. A "TONE" button in `!RTLSDRView` plays a generated test tone
-through it — confirmed working on real hardware, first try.
+**Known limitations.**
+- **Audio pauses when other tasks use the CPU.** RISC OS multitasks
+  cooperatively: while another task holds the CPU this app isn't polled, so
+  nothing drains the USB buffer or refills the audio ring. Mitigated with
+  bigger, tunable buffers (see Testing); the readout shows the longest gap
+  between polls (`g`, ms) and the count of audible underruns (`u`).
+- Mono only (no stereo decode, no RDS); no squelch, so weak stations hiss;
+  no volume control yet; the station must be at the centre of the 2.4 MHz
+  capture (tune with F-/F+).
 
-Streaming the actual FM-demodulated audio was blocked for a long time by
-a throughput ceiling of ~10-30 KB/s against the ~4.8 MB/s a 2.4 MSPS
-capture needs. After an exhaustive investigation (a two-session effort
-that eliminated the application, `USBDriver` and `DWCDriver` layers, and
-even read the DWC2 hardware registers directly), the cause turned out to
-be a single byte-order bug in this project's own `rtlsdr_write_reg()`:
-2-byte values were packed low-byte-first instead of high-byte-first, so
-the dongle's bulk endpoint max packet size was programmed as **2 bytes**
-instead of 512. Every packet was 2 bytes, every transfer ended after 2
-bytes. Fixed 2026-09-29 — sustained reads now run at **~4.7 MB/s (98% of
-the 2.4 MSPS rate)** and throughput tracks the configured sample rate.
-The same bug was behind the earlier "flat spectrum" / "padding" mystery.
-See `docs/PLAN.md`'s "milestone 5" for the full story (and milestones
-3-4 for the honest record of the wrong turns).
-
-What remains for audio is DSP: at the true data rate the app needs a
-channel filter and decimation ahead of the FM discriminator, rather than
-running `atan2` on every wideband sample. `!RTLSDRView` currently offers
-the test tone and a numeric FM-deviation readout.
-
-Getting here was a real diagnostic journey — full blow-by-blow in
-`docs/PLAN.md`, including several real bugs only found by actually
-running this on hardware: an I2C-write chunking limit, a hardware
-bit-reversal quirk on I2C reads, TaskWindow execution implicated in
-repeated full-machine freezes (fixed by running directly instead — now
-the operational rule), `fread()` never working against this DeviceFS
-stream at any size for reasons never fully root-caused (worked around
-with raw `OS_Find`/`OS_GBPB` instead), a hand-built Wimp window
-definition block crashing `Wimp_CreateWindow` with a data abort because
-Norcroft can pad a mixed char/bitfield struct past its intended size, a
-disabled GPIO call (the V4's antenna-vs-upconverter RF switch) that
-turned out safe to re-enable once TaskWindow was ruled out as the real
-freeze cause, DeviceFS's read-padding described above, and the
-degenerate zero-height rendering bug.
+**How it got here — the short version** (the full, honest history including
+the wrong turns is in [`docs/PLAN.md`](docs/PLAN.md)). Streaming was blocked
+for a long time by a ceiling of ~10-30 KB/s against the ~4.8 MB/s a 2.4 MSPS
+capture needs, and by a "flat spectrum" mystery. A long investigation —
+eventually a two-session effort that eliminated the application,
+`USBDriver` and `DWCDriver` layers and even read the DWC2 hardware
+registers — turned out to have a single cause in this project's own code:
+`rtlsdr_write_reg()` packed 2-byte values low-byte-first instead of
+high-byte-first, so the dongle's bulk endpoint max packet size was
+programmed as **2 bytes** instead of 512. Every packet, and so every
+transfer, was 2 bytes. It was found by diffing the *raw wire bytes* of the
+control transfers against a real Linux capture of the same dongle — earlier
+comparisons of register *values* and transaction *counts* could not see a
+byte-order difference. The next bottleneck was the CPU (emulated floating
+point), then the desktop's cooperative scheduling. Along the way: an I2C
+write chunking limit, a hardware bit-reversal quirk on I2C reads,
+TaskWindow execution implicated in repeated full-machine freezes (the
+operational rule is now to run directly, never in a TaskWindow), `fread()`
+never working against this DeviceFS stream (raw `OS_Find`/`OS_GBPB` instead),
+an analog/digital IF mismatch, and a hand-built Wimp window block that
+Norcroft padded past its intended size.
 
 ## Layout
 
@@ -120,7 +85,12 @@ degenerate zero-height rendering bug.
   stream I/O), used by both `!RTLSDR` and `!RTLSDRView`.
 - `app/!RTLSDR/c/R82XX.c`, `h/R82XX.h` — the R820T/R828D tuner driver
   (PLL, filter calibration, V4-specific band-switching), also shared.
-- `app/!RTLSDRView/c/SpecView.c` — the live spectrum display Wimp app.
+- `app/!RTLSDRView/c/SpecView.c` — the Wimp app: spectrum, gain/tuning UI,
+  the USB read loop.
+- `app/!RTLSDRView/c/Dsp.c`, `h/Dsp.h` — the integer-only real-time FM
+  demodulator (CIC decimator, discriminator, de-emphasis, resampler).
+- `app/!RTLSDRView/c/Audio.c`, `h/Audio.h` — TimPlayer audio output: the
+  test tone and the streaming ring buffer.
 - `build/plan.json` — compile/link plan for `build.riscos.online`.
 
 ## Building
@@ -169,7 +139,24 @@ across many runs). `!RTLSDR` is a `printf`-based diagnostic tool, not a
 Wimp app; running it directly opens a text output window and shows
 "Press SPACE or click mouse to continue" when done, rather than closing
 immediately. It runs every milestone in sequence and stops at the first
-failure. `!RTLSDRView` is a real Wimp app — it opens a window showing a
-live spectrum trace (fixed at 97.4MHz for now, no tuning UI yet); watch
+failure. `!RTLSDRView` is a real Wimp app: it opens a window with the live spectrum
+(default 97.4 MHz; F-/F+ retune in 100 kHz steps, AGC and +/- for gain).
+Press **DEM** for the FM deviation readout and **STREAM** to listen. Watch
 desktop responsiveness while it's running (move another window, click
-elsewhere) as the main regression risk to check for.
+elsewhere) — that, and audio pauses, are the main things to check.
+
+The readout under the buttons shows `pk`/`rms` (FM deviation, kHz), `r`
+(USB read rate in kilo-samples/s; close to 2400k when healthy), `g` (longest gap
+between polls, ms) and `u` (audio underruns). Two system variables tune how
+much desktop stall the audio can ride out, at the cost of latency; set
+them before launching:
+
+```
+*Set RTLSDRView$BufKB 512     USB stream buffer, KB   (default 512)
+*Set RTLSDRView$LeadMS 350    audio lead, ms          (default 350)
+```
+
+The driver sizes each USB transfer to the buffer's free space, so a bigger
+buffer means bigger bursts as well as more tolerance. If a very large
+`BufKB` delivers no data, the app falls back to a 128 KB buffer after 3
+seconds and says so.
