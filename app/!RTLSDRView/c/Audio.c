@@ -64,11 +64,15 @@ static int playing_g = 0;
                                   (audio you hear reflects input from
                                   up to this long ago) stays reasonable
                                   for a live radio receiver */
-#define STREAM_SAFETY_MS    200 /* don't write within this many ms
-                                    "ahead of" the estimated play
-                                    position -- guards against our
-                                    wall-clock position estimate (see
-                                    Audio.h) being slightly off */
+/* The write head is kept this far ahead of the (estimated) play head.
+   Real-time production arrives in bursts -- a USB transfer of tens of
+   KB completes every ~20-45 ms -- plus the app occasionally stalls for
+   a redraw, so the lead has to absorb both. Too little and every burst
+   boundary underruns; too much just adds latency (a live radio only
+   needs to be "not obviously delayed"). */
+#define STREAM_LEAD_TARGET_MS 200 /* where a (re)sync places the write head */
+#define STREAM_LEAD_MIN_MS     60 /* below this we treat it as an underrun */
+#define STREAM_LEAD_MAX_MS    600 /* above this we drop incoming samples */
 
 static short *stream_buf_g = 0;
 static int stream_capacity_g = 0;  /* samples */
@@ -425,10 +429,11 @@ void audio_stream_play(int play)
 int audio_stream_feed(const short *samples, int n)
 {
     unsigned int elapsed_cs;
-    unsigned long expected_consumed;
-    long ahead;
-    long safety;
+    unsigned long played;      /* samples the play head has consumed (est.) */
+    long ahead;                /* write head minus play head, in samples */
+    long lead_min, lead_target, lead_max;
     long room;
+    unsigned long p;
     int written;
     int pos;
     int i;
@@ -437,41 +442,54 @@ int audio_stream_feed(const short *samples, int n)
         return 0;
     }
 
-    /* elapsed_cs wraps the same way OS_ReadMonotonicTime's own counter
-       does (roughly every 497 days) -- unsigned subtraction handles
-       that correctly regardless of which side of a wrap
-       stream_start_time_g and "now" fall on. */
+    /* Estimated play-head position: TimPlayer's real position isn't
+       queryable, so it's derived from elapsed wall-clock time since
+       playback started, assuming a steady consumption of stream_rate_g
+       samples per second. elapsed_cs wraps like OS_ReadMonotonicTime
+       itself; unsigned subtraction handles either side of a wrap. */
     elapsed_cs = monotonic_cs() - stream_start_time_g;
-    expected_consumed = ((unsigned long)elapsed_cs *
-                          (unsigned long)stream_rate_g) / 100UL;
+    played = ((unsigned long)elapsed_cs * (unsigned long)stream_rate_g) /
+             100UL;
 
-    /* How far ahead of actual real-time consumption our writes
-       currently are. Comfortably positive and less than the buffer's
-       own capacity is the healthy steady state (some safe margin of
-       already-written-but-not-yet-played audio queued up). */
-    ahead = (long)(stream_total_written_g - expected_consumed);
-    safety = (long)((stream_rate_g * STREAM_SAFETY_MS) / 1000);
+    lead_min = (long)(((long)stream_rate_g * STREAM_LEAD_MIN_MS) / 1000);
+    lead_target = (long)(((long)stream_rate_g * STREAM_LEAD_TARGET_MS) /
+                         1000);
+    lead_max = (long)(((long)stream_rate_g * STREAM_LEAD_MAX_MS) / 1000);
 
-    if (ahead <= safety) {
-        /* At or behind the estimated play position (production has
-           been struggling to keep up with real time) -- accept
-           everything rather than continuing to hold back. A fresh
-           sample landing right at (or even slightly behind) the play
-           head is a normal, recoverable hiccup; refusing to write
-           because we're "not far enough ahead" is what got this stuck
-           in the original version of this function -- see the
-           stream_total_written_g comment above. */
-        written = n;
-    } else {
-        /* Comfortably ahead already -- cap how much more so writes
-           never lap all the way around and overwrite audio that's
-           genuinely still queued up, not yet played. */
-        room = (long)stream_capacity_g - ahead;
-        if (room <= 0) {
-            written = 0;
-        } else {
-            written = (n < room) ? n : (int)room;
+    ahead = (long)(stream_total_written_g - played);
+
+    if (ahead < lead_min) {
+        /* Start-up, or an underrun: the play head has caught up with (or
+           passed) the write head. The old version of this function just
+           kept writing at the write head anyway -- but that position is
+           now BEHIND the play head, so those samples weren't heard until
+           the looped buffer came all the way round again (a full 2
+           seconds later), which is exactly the "burst of static every
+           couple of seconds" symptom. Instead, jump the write head to a
+           fixed lead ahead of the play head, and silence everything in
+           between: the play head is about to sweep through that region,
+           and it still holds audio from the previous lap of the loop.
+           (When ahead is negative the gap starts at the play head, not
+           at the stale write head.) */
+        p = (ahead > 0) ? stream_total_written_g : played;
+        while (p < played + (unsigned long)lead_target) {
+            stream_buf_g[(int)(p % (unsigned long)stream_capacity_g)] = 0;
+            p++;
         }
+        stream_total_written_g = played + (unsigned long)lead_target;
+        ahead = lead_target;
+    }
+
+    /* Don't let the write head run further ahead than lead_max: that
+       would mean production is outpacing playback (clock drift), and
+       writing on would eventually lap the play head and overwrite audio
+       that hasn't been heard yet. Dropping the excess keeps latency
+       bounded. */
+    room = lead_max - ahead;
+    if (room <= 0) {
+        written = 0;
+    } else {
+        written = (n < room) ? n : (int)room;
     }
 
     pos = (int)(stream_total_written_g % (unsigned long)stream_capacity_g);

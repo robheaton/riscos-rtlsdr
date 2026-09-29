@@ -48,6 +48,7 @@
 #include "R82XX.h"
 #include "Driver.h"
 #include "Audio.h"
+#include "Dsp.h"
 
 /* ---- FFT / spectrum geometry ----
    256-point complex FFT. Reading exactly one frame (256 complex I,Q byte
@@ -279,8 +280,6 @@ static const double twiddle_sin[FFT_SIZE / 2] = {
 static char device_name_g[16];
 static int stream_handle_g = 0;
 static unsigned char iq_frame_g[IQ_BYTES];
-static unsigned char accum_buf_g[IQ_BYTES + FIXED_CHUNK_SIZE];
-static int accum_fill_g = 0;
 static int bin_height_g[NUM_BINS];
 static unsigned int next_update_time_g;
 static window_handle spectrum_window_g;
@@ -352,7 +351,7 @@ static icon_handle icon_frequp_g = 0;
 #define DEMOD_SAMPLE_RATE_HZ  2400000.0 /* matches rtlsdr_set_sample_rate()
                                             in main() */
 #define DEMOD_PI              3.14159265358979323846
-#define DEMOD_ALPHA           0.1   /* faster than the spectrum's
+#define DEMOD_ALPHA           0.3   /* applied once per display update now; faster than the spectrum's
                                         AVG_ALPHA -- a responsive
                                         VU-meter feel, not a slow trace */
 static int demod_enabled_g = 0;
@@ -373,8 +372,8 @@ static int tone_playing_g = 0;
 static icon_handle icon_tone_g = 0;
 
 /* ---- audio streaming (see Audio.h) ----
-   Real FM-demodulated audio, decimated down from demodulate_frame()'s
-   full 2.4MHz-rate deviation output to whatever rate the mixer/
+   Real FM-demodulated audio (Dsp.c: CIC channel filter, integer
+   discriminator, de-emphasis) resampled to whatever rate the mixer/
    TimPlayer actually runs at, and fed continuously into a looping ring
    buffer. stream_ok_g mirrors audio_ok_g's role -- tracks whether
    audio_stream_init() succeeded, since it depends on
@@ -397,6 +396,20 @@ static icon_handle icon_stream_g = 0;
    Left these counters in place -- still useful to see the pipeline is
    alive at a glance. */
 static unsigned long debug_reads_ok_g = 0;
+/* Total raw bytes read from the dongle, as a double so it can't wrap
+   (4.8 MB/s overflows an unsigned long in ~15 minutes). Drives the r=
+   readout: real USB read rate in kilo-complex-samples per second, which
+   should sit near 2400k now that reads return real data. */
+static double usb_bytes_d_g = 0.0;
+/* FFT frames folded into the running average since the last display
+   update, and a chunk counter used to spread them out over the update
+   interval. The FFT is the only floating-point-heavy part of the
+   per-tick work now, so it is budgeted rather than run on every frame. */
+#define FFT_FRAMES_PER_UPDATE 8
+#define FFT_CHUNK_STRIDE      6
+#define PCM_BUF_SAMPLES       1024
+static int fft_frames_g = 0;
+static unsigned long chunk_seq_g = 0;
 /* Set once in main(), right after Event_Initialise() -- used to
    compute an ACHIEVED throughput figure (debug_reads_ok_g * FFT_SIZE
    samples, divided by real elapsed wall-clock time) for the
@@ -412,20 +425,9 @@ static unsigned long debug_reads_bad_g = 0;
 static double debug_db_min_g = 0.0;
 static double debug_db_max_g = 0.0;
 static double debug_db_dc_g = 0.0;
-static unsigned char debug_first_bytes_g[12];
-static unsigned char debug_byte_min_g = 255;
-static unsigned char debug_byte_max_g = 0;
 static int debug_max_offset_g = 0;
 static double debug_raw_min_g = 0.0;
 static double debug_raw_max_g = 0.0;
-/* idx@0/nElev=1 has been rock-solid across gain settings, ruling out
-   ADC overload -- next check is the ACTUAL raw bytes at a few spread-
-   out positions in the frame, not derived statistics, to see directly
-   whether the buffer's tail is genuinely varying or frozen. Sample 0
-   is bytes[0]/[1] (already in debug_first_bytes_g); these add sample
-   ~125 (buffer middle) and sample 255 (buffer end). */
-static unsigned char debug_mid_i_g = 0, debug_mid_q_g = 0;
-static unsigned char debug_end_i_g = 0, debug_end_q_g = 0;
 
 /* Four different fixes to HOW reads are issued (fixed chunk size,
    4-byte alignment, offset-0 scratch buffer) all failed to move
@@ -520,7 +522,13 @@ static void fft256(double *re, double *im)
    per-bin noise so a persistent real signal stands out. Frames
    complete fast enough now (many per second) that 200 frames is still
    only a couple of seconds of real time, not an unusably slow response. */
-#define AVG_ALPHA 0.005
+#define AVG_ALPHA 0.02
+/* (Retuned from 0.005 when the FFT stopped being run on every frame:
+   with real full-rate data the display takes only ~8 frames per 200 ms
+   update (~40/s) so the DSP can have the CPU, and 0.005's 200-frame
+   window would have meant a ~5 s lag after every retune or gain
+   change. 0.02 is a ~50-frame window, ~1.2 s -- about what the old
+   ~140 frames/s at 0.005 gave.) */
 
 static double avg_power_g[NUM_BINS]; /* zero-initialized; power domain */
 
@@ -541,174 +549,41 @@ static void reset_averaging(void)
     }
 }
 
-/* min=max=identical raw power at every bin, even after the resource
-   fix, rules out both log compression AND noise-averaging statistics
-   (independent per-bin noise averaged over even a short window should
-   still differ by double-digit percentages, not match to 4 sig figs) --
-   this is the signature of a near-impulse (mostly-constant, one or two
-   real values) TIME-domain frame: the DFT of a delta function is a flat
-   constant-magnitude spectrum by definition. Tracking the time-domain
-   per-sample power (post-DC-removal, pre-FFT) for the latest frame
-   checks that directly, before assuming the bug is in fft256() itself
-   (already re-verified as textbook-correct radix-2 DIT). */
-static double debug_sample_pow_min_g = 0.0;
-static double debug_sample_pow_max_g = 0.0;
-/* Where the dominant sample sits in the 256-sample frame, and how many
-   samples carry non-negligible energy relative to it. A fixed idx
-   (same every frame) would point at a specific copy/offset bug; an idx
-   that moves around but n_elevated stays ~1 would point at the frame
-   genuinely being "mostly dead air, one big blip" rather than a
-   healthy captured RF signal. */
-static int debug_max_sample_idx_g = 0;
-static int debug_n_elevated_g = 0;
 
-/* Standard complex-baseband FM phase discriminator: for each pair of
-   consecutive samples, the instantaneous frequency is proportional to
-   the phase of x[n]*conj(x[n-1]) -- atan2 of that product's
-   imaginary/real parts, scaled from radians-per-sample to Hz via the
-   real sample rate. Must run on re[]/im[] BEFORE fft256() overwrites
-   them in place (called from accumulate_frame(), right before that
-   call). Tracks RMS and peak deviation over the frame, folded into a
-   running EMA -- real FM broadcast should show these settle to
-   something on the order of the format's actual deviation (up to
-   ~75kHz for wideband FM), not near-zero (no real modulation) or wildly
-   erratic/clipped-looking (pure noise / no real signal). */
-/* Decimation counter for the audio-streaming path below -- persists
-   across calls (many frames contribute to one audio chunk), reset
-   whenever streaming starts (see Click_spectrum) so a stale count
-   from a previous session at a different mixer rate can't leave the
-   first chunk misaligned. */
-static int stream_decim_counter_g = 0;
-
-static void demodulate_frame(const double *re, const double *im)
-{
-    static short audio_chunk[FFT_SIZE]; /* worst case one sample per
-                                            input sample (divisor==1);
-                                            always enough room */
-    int audio_chunk_len;
-    int decim_divisor;
-    int stream_rate;
-    int k;
-    double prod_re, prod_im, dev_hz, sum_sq, peak_abs, rms_hz;
-
-    /* +-75kHz is standard wideband FM's full-scale deviation --
-       scaling that range to +-32767 gives a normally-loud PCM signal
-       for a properly-tuned station without needing per-station gain
-       adjustment. audio_stream_rate() reflects the mixer's REAL
-       configured rate (queried once at audio_stream_init()), not an
-       assumed constant -- 2.4MHz/rate rounds to the nearest whole
-       divisor so decimation stays close to exact even for
-       non-round mixer rates. */
-    stream_rate = 0;
-    decim_divisor = 1;
-    audio_chunk_len = 0;
-    if (stream_enabled_g) {
-        stream_rate = audio_stream_rate();
-        if (stream_rate > 0) {
-            decim_divisor =
-                (int)(DEMOD_SAMPLE_RATE_HZ / (double)stream_rate + 0.5);
-            if (decim_divisor < 1) {
-                decim_divisor = 1;
-            }
-        }
-    }
-
-    sum_sq = 0.0;
-    peak_abs = 0.0;
-    for (k = 1; k < FFT_SIZE; k++) {
-        prod_re = re[k] * re[k - 1] + im[k] * im[k - 1];
-        prod_im = im[k] * re[k - 1] - re[k] * im[k - 1];
-        dev_hz = atan2(prod_im, prod_re) *
-                 (DEMOD_SAMPLE_RATE_HZ / (2.0 * DEMOD_PI));
-        sum_sq += dev_hz * dev_hz;
-        if (fabs(dev_hz) > peak_abs) {
-            peak_abs = fabs(dev_hz);
-        }
-
-        if (stream_enabled_g && stream_rate > 0) {
-            stream_decim_counter_g++;
-            if (stream_decim_counter_g >= decim_divisor) {
-                double pcm;
-                stream_decim_counter_g = 0;
-                pcm = dev_hz / 75000.0 * 32767.0;
-                if (pcm > 32767.0) {
-                    pcm = 32767.0;
-                }
-                if (pcm < -32768.0) {
-                    pcm = -32768.0;
-                }
-                if (audio_chunk_len < FFT_SIZE) {
-                    audio_chunk[audio_chunk_len++] = (short)pcm;
-                }
-            }
-        }
-    }
-    rms_hz = sqrt(sum_sq / (double)(FFT_SIZE - 1));
-
-    demod_dev_rms_g = demod_dev_rms_g * (1.0 - DEMOD_ALPHA) +
-                       rms_hz * DEMOD_ALPHA;
-    demod_dev_peak_g = demod_dev_peak_g * (1.0 - DEMOD_ALPHA) +
-                        peak_abs * DEMOD_ALPHA;
-
-    if (audio_chunk_len > 0) {
-        /* Return value (samples actually accepted) is deliberately
-           ignored -- this is a real-time stream, not a queue with
-           backpressure; audio_stream_feed() already drops whatever it
-           can't safely fit, which is the correct behaviour under a
-           production hiccup, not an error to handle here. */
-        audio_stream_feed(audio_chunk, audio_chunk_len);
-    }
-}
+/* FM demodulation and audio decimation live in Dsp.c now (integer-only:
+   this project's floating point is compiled as emulated FP, ~100x slower
+   per operation, which made the old per-sample float atan2 discriminator
+   here manage only ~1.5% of real time). This file only feeds it raw
+   I/Q from Null_spectrum() and reads back its peak/RMS deviation
+   statistics for the DEM readout. */
 
 static void accumulate_frame(void)
 {
     static double re[FFT_SIZE];
     static double im[FFT_SIZE];
     int i, src;
-    double sum_re, sum_im, mean_re, mean_im, power;
-    double sample_pow;
-    static double sample_pow_arr[FFT_SIZE];
+    long isum_re, isum_im;
+    double mean_re, mean_im, power;
 
     /* DC removal: subtract this FRAME'S OWN measured mean, not just the
        fixed assumed centre (127.5) -- see docs/PLAN.md for why a real
        hardware DC bias needs removing at the source (it spectrally
        leaks into nearby bins too, not just the exact centre one), not
-       just excluded from the display-scale calculation. */
-    sum_re = 0.0;
-    sum_im = 0.0;
+       just excluded from the display-scale calculation. Sums are taken
+       in integers and converted once: floating point is emulated on
+       this platform, so every avoidable FP operation per sample costs
+       real time. */
+    isum_re = 0;
+    isum_im = 0;
     for (i = 0; i < FFT_SIZE; i++) {
-        sum_re += (double)iq_frame_g[2 * i] - 127.5;
-        sum_im += (double)iq_frame_g[2 * i + 1] - 127.5;
+        isum_re += (long)iq_frame_g[2 * i];
+        isum_im += (long)iq_frame_g[2 * i + 1];
     }
-    mean_re = sum_re / (double)FFT_SIZE;
-    mean_im = sum_im / (double)FFT_SIZE;
-    debug_sample_pow_min_g = -1.0; /* sentinel: recomputed below, -1 means "not set yet" */
-    debug_max_sample_idx_g = 0;
+    mean_re = (double)isum_re / (double)FFT_SIZE;
+    mean_im = (double)isum_im / (double)FFT_SIZE;
     for (i = 0; i < FFT_SIZE; i++) {
-        re[i] = ((double)iq_frame_g[2 * i] - 127.5) - mean_re;
-        im[i] = ((double)iq_frame_g[2 * i + 1] - 127.5) - mean_im;
-        sample_pow = re[i] * re[i] + im[i] * im[i];
-        sample_pow_arr[i] = sample_pow;
-        if (debug_sample_pow_min_g < 0.0 || sample_pow < debug_sample_pow_min_g) {
-            debug_sample_pow_min_g = sample_pow;
-        }
-        if (i == 0 || sample_pow > debug_sample_pow_max_g) {
-            debug_sample_pow_max_g = sample_pow;
-            debug_max_sample_idx_g = i;
-        }
-    }
-    /* "Elevated" = at least 1% of the frame's peak sample power -- a
-       loose bar, so a healthy multi-sample signal would still clear it
-       for far more than a couple of samples out of 256. */
-    debug_n_elevated_g = 0;
-    for (i = 0; i < FFT_SIZE; i++) {
-        if (sample_pow_arr[i] > 0.01 * debug_sample_pow_max_g) {
-            debug_n_elevated_g++;
-        }
-    }
-
-    if (demod_enabled_g || stream_enabled_g) {
-        demodulate_frame(re, im);
+        re[i] = (double)iq_frame_g[2 * i] - mean_re;
+        im[i] = (double)iq_frame_g[2 * i + 1] - mean_im;
     }
 
     fft256(re, im);
@@ -841,8 +716,7 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
 {
     int i;
     int got;
-    int any_ok;
-    int n_frames;
+    int dsp_active;
     unsigned int tick_start_cs;
 
     UNUSED_ARG(event);
@@ -920,107 +794,81 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
    very first MAX_FRAMES_PER_TICK cap fixed), so raised by 8x, not
    removed outright, to test the throughput hypothesis while watching
    for that regression. */
-#define MAX_FRAMES_PER_TICK 512
 /* Wall-clock budget per idle tick, in centiseconds (Time_Monotonic()
    resolution): stop processing frames once this much time has elapsed
    even if frames remain, so the Wimp always gets control back promptly. */
 #define TICK_BUDGET_CS 2
-    any_ok = 0;
-    n_frames = 0;
     tick_start_cs = Time_Monotonic();
+    dsp_active = (demod_enabled_g || stream_enabled_g);
     for (i = 0; i < MAX_READ_ATTEMPTS; i++) {
         static unsigned char read_tmp_g[FIXED_CHUNK_SIZE];
-        int off;
+        static short pcm_g[PCM_BUF_SAMPLES];
 
-        /* Rewritten once the real root cause of the long-running
-           "2 bytes per read" behaviour was found and fixed (Driver.c's
-           rtlsdr_write_reg() packed 2-byte values low-byte-first, so
-           USB_EPA_MAXPKT went out as 2 instead of 512). Reads now
-           return real, full-size chunks at the true ~4.8 MB/s, which
-           exposed that the old loop -- built around reads that were
-           only ever a few bytes -- extracted just ONE frame per chunk
-           and kept appending: with a 16 KB chunk that overran
-           accum_buf_g by ~15 KB on the second read.
+        /* Real full-rate data now flows (see Driver.c's rtlsdr_write_reg()
+           for the byte-order bug that used to cap every read at 2
+           bytes), so the shape here is: read a chunk; if the demodulator
+           is wanted, run EVERY sample of it through Dsp.c (integer-only,
+           cheap, and it must see the whole stream or the audio would
+           have gaps); and take at most a few chunks' first frames for
+           the FFT display, which is emulated floating point and the only
+           expensive part. got==0 means nothing is buffered right now:
+           yield to Wimp_Poll. A wall-clock budget bounds the work per
+           idle tick so the desktop stays responsive. */
+        got = os_gbpb_read4(stream_handle_g, read_tmp_g, FIXED_CHUNK_SIZE);
+        debug_last_gots_g[0] = debug_last_gots_g[1];
+        debug_last_gots_g[1] = debug_last_gots_g[2];
+        debug_last_gots_g[2] = got;
+        if (got < 0) {
+            debug_reads_bad_g++;
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
+        got &= ~1;   /* whole I/Q pairs only */
+        usb_bytes_d_g += (double)got;
 
-           New shape: only read when the accumulator has room for a
-           whole chunk (so it can never overflow), then drain EVERY
-           complete frame from it, then compact the remainder once.
-           got==0 now simply means "nothing buffered right now" and
-           yields back to Wimp_Poll (the busy-retry that used to sit
-           here only made sense while every transfer was 2 bytes and
-           the buffer was always empty). A wall-clock budget bounds the
-           work per idle tick so the desktop stays responsive whatever
-           the FPU speed turns out to be. */
-        if (accum_fill_g <= (int)sizeof(accum_buf_g) - FIXED_CHUNK_SIZE) {
-            got = os_gbpb_read4(stream_handle_g, read_tmp_g,
-                                FIXED_CHUNK_SIZE);
-            debug_last_gots_g[0] = debug_last_gots_g[1];
-            debug_last_gots_g[1] = debug_last_gots_g[2];
-            debug_last_gots_g[2] = got;
-            if (got < 0) {
-                debug_reads_bad_g++;
-                break;
+        if (dsp_active) {
+            int npcm;
+            npcm = dsp_fm_process(read_tmp_g, got, pcm_g, PCM_BUF_SAMPLES);
+            if (stream_enabled_g && npcm > 0) {
+                /* Return value (samples accepted) deliberately ignored:
+                   a real-time stream, not a queue -- audio_stream_feed()
+                   drops what it can't safely fit. */
+                audio_stream_feed(pcm_g, npcm);
             }
-            if (got == 0) {
-                break;
-            }
-            memcpy(accum_buf_g + accum_fill_g, read_tmp_g, (size_t)got);
-            /* Whole I/Q pairs only: a lone trailing byte would shift the
-               I/Q pairing of everything after it. */
-            accum_fill_g += got & ~1;
         }
 
-        off = 0;
-        while (accum_fill_g - off >= IQ_BYTES &&
-               n_frames < MAX_FRAMES_PER_TICK) {
-            memcpy(iq_frame_g, accum_buf_g + off, IQ_BYTES);
-            off += IQ_BYTES;
-            any_ok = 1;
-            debug_reads_ok_g++;
+        chunk_seq_g++;
+        if (got >= IQ_BYTES && fft_frames_g < FFT_FRAMES_PER_UPDATE &&
+            (chunk_seq_g % FFT_CHUNK_STRIDE) == 0) {
+            memcpy(iq_frame_g, read_tmp_g, IQ_BYTES);
             accumulate_frame();
-            n_frames++;
-            if (Time_Monotonic() - tick_start_cs >= TICK_BUDGET_CS) {
-                break;
-            }
+            fft_frames_g++;
+            debug_reads_ok_g++;
         }
-        if (off > 0) {
-            accum_fill_g -= off;
-            if (accum_fill_g > 0) {
-                memmove(accum_buf_g, accum_buf_g + off,
-                        (size_t)accum_fill_g);
-            }
-        }
-        if (n_frames >= MAX_FRAMES_PER_TICK ||
-            Time_Monotonic() - tick_start_cs >= TICK_BUDGET_CS) {
+
+        if (Time_Monotonic() - tick_start_cs >= TICK_BUDGET_CS) {
             break;
         }
     }
 
-    if (any_ok) {
-        /* Cheap per-tick debug snapshots of the LAST frame processed
-           (these used to run on every single frame). */
-        int j;
-        memcpy(debug_first_bytes_g, iq_frame_g, sizeof(debug_first_bytes_g));
-        debug_mid_i_g = iq_frame_g[250];
-        debug_mid_q_g = iq_frame_g[251];
-        debug_end_i_g = iq_frame_g[IQ_BYTES - 2];
-        debug_end_q_g = iq_frame_g[IQ_BYTES - 1];
-        debug_byte_min_g = 255;
-        debug_byte_max_g = 0;
-        for (j = 0; j < IQ_BYTES; j++) {
-            if (iq_frame_g[j] < debug_byte_min_g) {
-                debug_byte_min_g = iq_frame_g[j];
-            }
-            if (iq_frame_g[j] > debug_byte_max_g) {
-                debug_byte_max_g = iq_frame_g[j];
+    if (fft_frames_g > 0 && Time_Monotonic() >= next_update_time_g) {
+        if (dsp_active) {
+            /* Once per display update rather than per tick: this does a
+               square root in emulated floating point. */
+            double pk_hz, rms_hz;
+            if (dsp_fm_take_stats(&pk_hz, &rms_hz)) {
+                demod_dev_rms_g = demod_dev_rms_g * (1.0 - DEMOD_ALPHA) +
+                                   rms_hz * DEMOD_ALPHA;
+                demod_dev_peak_g = demod_dev_peak_g * (1.0 - DEMOD_ALPHA) +
+                                    pk_hz * DEMOD_ALPHA;
             }
         }
-    }
-
-    if (any_ok && Time_Monotonic() >= next_update_time_g) {
         finalize_display();
         Window_ForceRedraw(spectrum_window_g, 0, -WORK_HEIGHT, WORK_WIDTH, 0);
         next_update_time_g = Time_Monotonic() + UPDATE_INTERVAL_CS;
+        fft_frames_g = 0;
     }
 
     return FALSE;
@@ -1142,7 +990,7 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
             GFX_Write0(line1);
             GFX_VDU(4);
 
-            /* Demod readout (see demodulate_frame/DEMOD_* above) --
+            /* Demod readout (see Dsp.c and DEMOD_* above) --
                only meaningful once DEM has been on for a moment (the
                EMA needs a few frames to settle from its zero start).
                Real FM broadcast should settle to deviation on the
@@ -1167,8 +1015,7 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                 elapsed_s = (double)(Time_Monotonic() - app_start_time_g) /
                             100.0;
                 achieved_ksps = (elapsed_s > 0.0)
-                    ? ((double)debug_reads_ok_g * (double)FFT_SIZE /
-                       elapsed_s / 1000.0)
+                    ? (usb_bytes_d_g / 2.0 / elapsed_s / 1000.0)
                     : 0.0;
 
                 /* Shortened after this line was reported clipped off
@@ -1239,6 +1086,21 @@ static void update_stream_icon(void)
     set_icon_selected(icon_stream_g, stream_enabled_g);
 }
 
+/* Reads and discards whatever the DeviceFS stream has buffered right
+   now (bounded, non-blocking): after a retune, everything queued was
+   captured at the old frequency. */
+static void discard_buffered_stream_data(void)
+{
+    static unsigned char scratch_g[FIXED_CHUNK_SIZE];
+    int n;
+
+    for (n = 0; n < 64; n++) {
+        if (os_gbpb_read4(stream_handle_g, scratch_g, FIXED_CHUNK_SIZE) <= 0) {
+            break;
+        }
+    }
+}
+
 /* All three gain buttons need the I2C repeater enabled around the
    register write, same as main()'s own init/tune bracket -- the
    repeater is disabled the rest of the time, and this handler runs
@@ -1260,6 +1122,9 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
         /* Pure software toggle -- no I2C repeater bracket needed,
            unlike every gain/freq control below. */
         demod_enabled_g = !demod_enabled_g;
+        if (demod_enabled_g) {
+            dsp_fm_reset();
+        }
         update_demod_icon();
         return TRUE;
     }
@@ -1289,7 +1154,7 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
             if (stream_enabled_g) {
                 demod_enabled_g = 1;
                 update_demod_icon();
-                stream_decim_counter_g = 0;
+                dsp_fm_reset();
             }
             audio_stream_play(stream_enabled_g);
             update_stream_icon();
@@ -1349,13 +1214,19 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
             if (r82xx_set_freq(&tuner_g, new_freq) == 0 &&
                 tuner_g.has_lock) {
                 tuned_freq_hz_g = new_freq;
-                /* Flush stale, pre-retune samples still sitting in the
-                   device/host buffer (same call main() makes before
-                   the first-ever tune), and discard any partially-
-                   accumulated frame that might otherwise splice
-                   pre-retune bytes with post-retune ones. */
-                rtlsdr_reset_buffer(device_name_g);
-                accum_fill_g = 0;
+                /* Throw away the stale, pre-retune samples still sitting
+                   in the DeviceFS buffer, and restart the demodulator so
+                   its filters don't blend the two frequencies.
+
+                   This deliberately does NOT call rtlsdr_reset_buffer()
+                   (which main() uses once, before the stream is opened):
+                   that now genuinely stalls and resets the dongle's
+                   endpoint (10 02 -- see Driver.c's rtlsdr_write_reg()
+                   for the byte-order bug that used to make it a no-op),
+                   and doing that while a bulk transfer is in flight
+                   would leave the host pipe halted under the driver. */
+                discard_buffered_stream_data();
+                dsp_fm_reset();
                 reset_averaging();
             }
         }
@@ -1713,6 +1584,12 @@ int main(void)
                             "(including TONE) is unaffected.");
         }
     }
+
+    /* The demodulator runs whether or not audio output is available
+       (the DEM readout uses it too), so configure it either way: the
+       mixer's real rate if audio came up, else a nominal 48 kHz. */
+    dsp_fm_init((stream_ok_g && audio_stream_rate() > 0)
+                    ? audio_stream_rate() : 48000);
 
     Window_Show(spectrum_window_g, open_CENTERED);
 
