@@ -81,8 +81,49 @@ int rtlsdr_write_reg(const char *dev, int block, int addr, int val,
     int w_index;
 
     w_index = (block << 8) | 0x10;
-    data[0] = (unsigned char)(val & 0xFF);
-    data[1] = (unsigned char)((val >> 8) & 0xFF);
+
+    /* THE ROOT CAUSE of this project's long-running bulk-IN throughput
+       mystery (found 2026-09-29 by comparing raw wire bytes for the very
+       first USB-block writes against a real Linux capture, after every
+       host-side/driver-side hypothesis had been eliminated).
+
+       A 2-byte write must put the HIGH byte in data[0] and the LOW byte
+       in data[1] -- exactly what upstream librtlsdr does:
+           if (len == 1) data[0] = val & 0xff; else data[0] = val >> 8;
+           data[1] = val & 0xff;
+       This function used to pack them the other way round
+       (data[0] = low byte, data[1] = high byte), which is the reverse
+       of what the RTL2832U expects on the write path. (rtlsdr_demod_
+       write_reg() below always packed correctly, which is why every
+       demod/tuner register worked and this went unnoticed -- only the
+       USB-block registers were affected, and only when len == 2.)
+
+       Effect of the bug on the wire, both confirmed against a real Linux
+       capture of the same device:
+         USB_EPA_MAXPKT (0x2158) <- 0x0002:
+             Linux: 00 02 (= 512, the High-Speed bulk max packet size)
+             here:  02 00 (= 2!) -- the bulk-IN endpoint was told its max
+                    packet size is TWO BYTES, so every bulk packet the
+                    device sent was exactly 2 bytes, i.e. a "short"
+                    packet from the host's point of view (512-byte
+                    endpoint descriptor), ending each transfer after 2
+                    bytes. That single fact explains: actual_len==2 with
+                    zero variance across 500 DWC2 completions,
+                    independence from chunk size / DeviceFS buffer size /
+                    sample rate, the ~30,000x bytes-per-transfer gap vs.
+                    Linux, and the original "padding" saga (every read
+                    only ever had ~2 genuinely fresh bytes).
+         USB_EPA_CTL (0x2148) <- 0x1002:
+             Linux: 10 02 (stall + reset EPA)
+             here:  02 10 (different, unintended bits set)
+       (Values 0x0000 are byte-symmetric, so the FIFO-release write was
+       never affected -- which is part of why streaming "worked" at all.) */
+    if (len == 1) {
+        data[0] = (unsigned char)(val & 0xFF);
+    } else {
+        data[0] = (unsigned char)((val >> 8) & 0xFF);
+    }
+    data[1] = (unsigned char)(val & 0xFF);
     return usb_ctrl_transfer(dev, CTRL_BMREQ_VENDOR_OUT, 0, addr, w_index,
                               len, data);
 }
