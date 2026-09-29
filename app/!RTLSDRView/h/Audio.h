@@ -81,6 +81,17 @@ int audio_stream_feed(const short *samples, int n);
    audio_stream_init() hasn't succeeded. */
 int audio_stream_rate(void);
 
+/* How far ahead of the estimated play position the write head is held
+   (milliseconds), i.e. how long a stall in the caller the audio can ride
+   out before it runs dry. Bigger rides out longer desktop stalls but adds
+   that much latency. Takes effect from the next audio_stream_play(1) (or
+   the next re-sync). Clamped to a sane range. Default 350. */
+void audio_stream_set_lead_ms(int ms);
+
+/* Number of genuine underruns (re-syncs after playback had already
+   started) since audio_stream_init(). Each one is an audible pause. */
+int audio_stream_underruns(void);
+
 /* Releases the streaming buffer specifically (stops playback if
    running, releases its sample slot and RMA buffer) -- does NOT touch
    the FX/song handles or the test-tone buffer, since those are shared

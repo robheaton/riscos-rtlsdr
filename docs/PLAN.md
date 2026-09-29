@@ -2318,3 +2318,42 @@ floating point (enabling VFP in the build would speed it up a great deal
 but needs the VFP context set up and care with the soft-float C library
 ABI); volume is fixed (`dsp_fm_set_gain()` exists, no UI yet).
 
+### Follow-up: audio pauses whenever anything else uses the CPU
+
+First real-hardware result of the integer demodulator: **audio is good**, and
+`r=2246k` shows the app now consumes the full-rate stream in real time (the
+shortfall against 2400k was the timer including ~2.5 s of tuner set-up).
+Remaining problem: any CPU activity elsewhere makes the audio pause and
+resume.
+
+**Why:** RISC OS multitasks cooperatively. While another task holds the CPU
+this app isn't polled, so nothing drains the USB buffer or refills the
+audio ring. Two buffers absorb that, and both were small: the DeviceFS
+stream buffer (128 KB = ~27 ms of data at 4.8 MB/s -- beyond that the
+dongle's FIFO overflows and samples are simply lost) and the audio lead
+(200 ms). A third weakness: the ring re-synced -- inserting a silent hole
+up to the full lead -- whenever the lead dipped below 60 ms, even though
+the ring hadn't actually run dry.
+
+**Constraint found in the driver source** (`USBDriver` `start_read()`): each
+bulk transfer is sized to the stream buffer's *free space*, so a bigger
+buffer gives bigger, less frequent bursts as well as more stall tolerance
+(latency and tolerance trade off).
+
+**Changes:** `RTLSDRView$BufKB` (default 512) and `RTLSDRView$LeadMS`
+(default 350) system variables, read at start-up, so settings can be tried
+with `*Set` and no rebuild; a watchdog that reopens the stream with the
+proven 128 KB buffer if the configured size delivers no data within 3 s
+(large DMA allocations are unproven); the re-sync now triggers only below
+30 ms of lead; the readout gains `g<ms>` (longest gap between polls,
+peak-held ~5 s) and `u<n>` (audio underruns = audible pauses), and `r=` now
+counts from the first data read.
+
+**Modelled before shipping** (Python simulation of USB buffer with real
+overflow loss, transfer-sized bursts, and the ring's resync policy, against
+lognormal stall patterns, 300 s each): versus the old 27 ms / 200 ms
+settings, 110 ms / 350 ms cut underruns roughly 4x (e.g. 96 -> 23 in a
+light-activity pattern) and lost audio roughly 2x; a 220 ms buffer cut them
+further (-> 4 underruns). The model is crude -- treat it as direction, not
+prediction; `g` and `u` on real hardware are the measurement.
+

@@ -65,14 +65,22 @@ static int playing_g = 0;
                                   up to this long ago) stays reasonable
                                   for a live radio receiver */
 /* The write head is kept this far ahead of the (estimated) play head.
-   Real-time production arrives in bursts -- a USB transfer of tens of
-   KB completes every ~20-45 ms -- plus the app occasionally stalls for
-   a redraw, so the lead has to absorb both. Too little and every burst
-   boundary underruns; too much just adds latency (a live radio only
-   needs to be "not obviously delayed"). */
-#define STREAM_LEAD_TARGET_MS 200 /* where a (re)sync places the write head */
-#define STREAM_LEAD_MIN_MS     60 /* below this we treat it as an underrun */
-#define STREAM_LEAD_MAX_MS    600 /* above this we drop incoming samples */
+   Real-time production arrives in bursts -- the USB driver sizes each
+   transfer to the stream buffer's free space, so with a 512 KB buffer a
+   transfer is ~75-110 ms of data -- plus the desktop can stall this app
+   for hundreds of milliseconds (RISC OS multitasks cooperatively: while
+   another task holds the CPU we are not polled and cannot feed the
+   ring). The lead has to absorb both. Too little and every stall is an
+   audible pause; too much just adds latency. Adjustable at run time
+   (audio_stream_set_lead_ms). */
+#define STREAM_LEAD_DEFAULT_MS 350
+#define STREAM_LEAD_MIN_MS      30 /* below this: treat as an underrun --
+                                      only slack for our play-position
+                                      estimate, since real underruns are
+                                      what matter */
+static int stream_lead_target_ms_g = STREAM_LEAD_DEFAULT_MS;
+static int stream_synced_g = 0;      /* has the first sync happened yet? */
+static int stream_underruns_g = 0;
 
 static short *stream_buf_g = 0;
 static int stream_capacity_g = 0;  /* samples */
@@ -407,6 +415,7 @@ void audio_stream_play(int play)
            buffer position 0, so there's no stale leftover content
            from a previous run audible before real data catches up. */
         stream_total_written_g = 0;
+        stream_synced_g = 0;
         stream_start_time_g = monotonic_cs();
 
         regs.r[0] = fx_handle_g;
@@ -452,13 +461,20 @@ int audio_stream_feed(const short *samples, int n)
              100UL;
 
     lead_min = (long)(((long)stream_rate_g * STREAM_LEAD_MIN_MS) / 1000);
-    lead_target = (long)(((long)stream_rate_g * STREAM_LEAD_TARGET_MS) /
+    lead_target = (long)(((long)stream_rate_g * stream_lead_target_ms_g) /
                          1000);
-    lead_max = (long)(((long)stream_rate_g * STREAM_LEAD_MAX_MS) / 1000);
+    lead_max = lead_target + (long)(((long)stream_rate_g * 400L) / 1000);
+    if (lead_max > (long)stream_capacity_g - lead_target / 8) {
+        lead_max = (long)stream_capacity_g - lead_target / 8;
+    }
 
     ahead = (long)(stream_total_written_g - played);
 
     if (ahead < lead_min) {
+        if (stream_synced_g) {
+            stream_underruns_g++;
+        }
+        stream_synced_g = 1;
         /* Start-up, or an underrun: the play head has caught up with (or
            passed) the write head. The old version of this function just
            kept writing at the write head anyway -- but that position is
@@ -503,6 +519,22 @@ int audio_stream_feed(const short *samples, int n)
     stream_total_written_g += (unsigned long)written;
 
     return written;
+}
+
+void audio_stream_set_lead_ms(int ms)
+{
+    if (ms < 100) {
+        ms = 100;
+    }
+    if (ms > 1200) {
+        ms = 1200;
+    }
+    stream_lead_target_ms_g = ms;
+}
+
+int audio_stream_underruns(void)
+{
+    return stream_underruns_g;
 }
 
 int audio_stream_rate(void)
