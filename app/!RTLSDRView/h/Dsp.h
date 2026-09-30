@@ -63,6 +63,24 @@ void dsp_fm_set_gain(int gain_q12);
 int dsp_fm_process(const unsigned char *iq, int nbytes, short *out,
                    int max_out);
 
+/* The front end on its own, for the narrow-band modes (Rx.c): recentres
+   raw unsigned-8-bit I/Q, CIC-decimates it to 240 kSPS if the input rate is
+   higher, and scales it into +-16384. Writes up to max complex samples to
+   zi/zq and returns how many. It shares its CIC state with
+   dsp_fm_process(), so use one or the other on a stream (and call
+   dsp_fm_reset() when switching). Feed it at most 16 KB at a time. */
+int dsp_front_end(const unsigned char *iq, int nbytes, short *zi, short *zq,
+                  int max);
+
+/* The integer phase-step function the discriminators use: atan2 of
+   (y, x) in Q14 radians (16384 = 1 rad). Inputs up to ~5e8. */
+int dsp_atan2_q14(int y, int x);
+
+/* Smoothed |z|^2 of the channel-rate samples seen by dsp_fm_process(),
+   in the same units as the +-16384 full scale (2.68e8 = a full-scale
+   I-only signal). */
+long dsp_fm_level_power(void);
+
 /* Peak and RMS instantaneous frequency deviation (Hz) since the last
    call. Returns 1 and fills the outputs if any demodulated samples
    arrived since then, otherwise returns 0 and leaves them untouched. */

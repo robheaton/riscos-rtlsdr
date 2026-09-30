@@ -59,6 +59,7 @@ static int o_n;
 static unsigned long b_sumsq;
 static unsigned long b_n;
 static int b_peak;
+static long lvl_ema;               /* smoothed |z|^2 at the channel rate */
 static double stat_sumsq_d;        /* sum over samples of (|d| >> 5)^2 */
 static double stat_n_d;
 static int stat_peak;              /* max |d| since last take_stats */
@@ -69,7 +70,7 @@ static int stat_peak;              /* max |d| since last take_stats */
        atan(t) ~ (pi/4) t + t (1 - t) (0.2447 + 0.0663 t)
    (Rajan et al. 2006, max error ~0.0015 rad = 0.09 degrees), then undo
    the octant reduction. */
-static int atan2_q14(int y, int x)
+int dsp_atan2_q14(int y, int x)
 {
     int ax, ay, num, den, t, a;
 
@@ -118,6 +119,7 @@ void dsp_fm_reset(void)
     b_sumsq = 0;
     b_n = 0;
     b_peak = 0;
+    lvl_ema = 0;
     stat_sumsq_d = 0.0;
     stat_n_d = 0.0;
     stat_peak = 0;
@@ -193,13 +195,15 @@ static void demod_sample(int zi, int zq)
 {
     int cross, dot, d, ad, v;
 
+    lvl_ema += (((long)zi * zi + (long)zq * zq) - lvl_ema) >> 12;
+
     /* arg( z[n] * conj(z[n-1]) ): positive frequency deviation gives a
        positive phase step. */
     cross = zq * prev_i - zi * prev_q;
     dot = zi * prev_i + zq * prev_q;
     prev_i = zi;
     prev_q = zq;
-    d = atan2_q14(cross, dot);
+    d = dsp_atan2_q14(cross, dot);
 
     ad = (d < 0) ? -d : d;
     if (ad > b_peak) {
@@ -245,32 +249,39 @@ static void demod_sample(int zi, int zq)
     }
 }
 
-int dsp_fm_process(const unsigned char *iq, int nbytes, short *out,
-                   int max_out)
+/* Advances the front end until it has produced one complex sample at the
+   channel rate (recentred, CIC-decimated if the input rate is above
+   240 kSPS, scaled into the discriminator's +-16384 range) or has run out
+   of input. Returns 1 with the sample in *pzi and *pzq, or 0 when the input is
+   exhausted (a partly filled CIC block is carried to the next call).
+   *ppiq and *pnsamp are advanced past the consumed input. */
+static int cic_next(const unsigned char **ppiq, int *pnsamp, int *pzi,
+                    int *pzq)
 {
+    const unsigned char *iq;
     int nsamp;
 
-    nsamp = nbytes >> 1;
-    o_buf = out;
-    o_max = max_out;
-    o_n = 0;
+    iq = *ppiq;
+    nsamp = *pnsamp;
 
     if (cic_r == 1) {
         /* The dongle is already delivering the channel rate: no
            decimation, just recentre and scale. */
-        int k;
-        for (k = 0; k < nsamp; k++) {
-            demod_sample(((int)iq[0] - 128) * cic_mul,
-                         ((int)iq[1] - 128) * cic_mul);
-            iq += 2;
+        if (nsamp <= 0) {
+            return 0;
         }
-        nsamp = 0;
+        *pzi = ((int)iq[0] - 128) * cic_mul;
+        *pzq = ((int)iq[1] - 128) * cic_mul;
+        *ppiq = iq + 2;
+        *pnsamp = nsamp - 1;
+        return 1;
     }
 
-    while (nsamp > 0) {
+    {
         int take;
         int k;
         unsigned long i1, i2, i3, q1, q2, q3;
+        unsigned long y, d1, d2, d3;
 
         take = cic_r - blk_pos;
         if (take > nsamp) {
@@ -294,34 +305,46 @@ int dsp_fm_process(const unsigned char *iq, int nbytes, short *out,
 
         blk_pos += take;
         nsamp -= take;
+        *ppiq = iq;
+        *pnsamp = nsamp;
         if (blk_pos < cic_r) {
-            break;                   /* block incomplete; carry to next call */
+            return 0;                /* block incomplete; carry to next call */
         }
         blk_pos = 0;
 
-        {
-            unsigned long y, d1, d2, d3;
-            int zi, zq;
+        /* Comb section at the decimated rate. */
+        y = a3i;
+        d1 = y - c1i; c1i = y;
+        d2 = d1 - c2i; c2i = d1;
+        d3 = d2 - c3i; c3i = d2;
+        /* d3 holds a small signed value modulo 2^32; recover it without
+           an implementation-defined out-of-range cast. */
+        *pzi = (((int)(d3 + 0x40000000UL) - 0x40000000) >> cic_shr) *
+               cic_mul;
 
-            /* Comb section at the decimated rate. */
-            y = a3i;
-            d1 = y - c1i; c1i = y;
-            d2 = d1 - c2i; c2i = d1;
-            d3 = d2 - c3i; c3i = d2;
-            /* d3 holds a small signed value modulo 2^32; recover it
-               without an implementation-defined out-of-range cast. */
-            zi = ((int)(d3 + 0x40000000UL) - 0x40000000);
-            zi = (zi >> cic_shr) * cic_mul;
+        y = a3q;
+        d1 = y - c1q; c1q = y;
+        d2 = d1 - c2q; c2q = d1;
+        d3 = d2 - c3q; c3q = d2;
+        *pzq = (((int)(d3 + 0x40000000UL) - 0x40000000) >> cic_shr) *
+               cic_mul;
+        return 1;
+    }
+}
 
-            y = a3q;
-            d1 = y - c1q; c1q = y;
-            d2 = d1 - c2q; c2q = d1;
-            d3 = d2 - c3q; c3q = d2;
-            zq = ((int)(d3 + 0x40000000UL) - 0x40000000);
-            zq = (zq >> cic_shr) * cic_mul;
+int dsp_fm_process(const unsigned char *iq, int nbytes, short *out,
+                   int max_out)
+{
+    int nsamp;
+    int zi, zq;
 
-            demod_sample(zi, zq);
-        }
+    nsamp = nbytes >> 1;
+    o_buf = out;
+    o_max = max_out;
+    o_n = 0;
+
+    while (cic_next(&iq, &nsamp, &zi, &zq)) {
+        demod_sample(zi, zq);
     }
 
     if (b_n > 0) {
@@ -335,6 +358,28 @@ int dsp_fm_process(const unsigned char *iq, int nbytes, short *out,
     }
     b_peak = 0;
     return o_n;
+}
+
+int dsp_front_end(const unsigned char *iq, int nbytes, short *zi, short *zq,
+                  int max)
+{
+    int nsamp;
+    int n;
+    int i, q;
+
+    nsamp = nbytes >> 1;
+    n = 0;
+    while (n < max && cic_next(&iq, &nsamp, &i, &q)) {
+        zi[n] = (short)i;
+        zq[n] = (short)q;
+        n++;
+    }
+    return n;
+}
+
+long dsp_fm_level_power(void)
+{
+    return lvl_ema;
 }
 
 int dsp_fm_take_stats(double *peak_hz, double *rms_hz)

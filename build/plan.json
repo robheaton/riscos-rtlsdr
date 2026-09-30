@@ -38,11 +38,26 @@
    "cmd": "cc -c -za1 -Otime -apcs 3/32bit -throwback -I,C: c.Trace -o o.Trace",
    "out": "o.Trace",
    "src": "c.Trace"
+  },
+  {
+   "cmd": "cc -c -za1 -Otime -apcs 3/32bit -throwback -I,C: c.Rx -o o.Rx",
+   "out": "o.Rx",
+   "src": "c.Rx"
+  },
+  {
+   "cmd": "cc -c -za1 -Otime -apcs 3/32bit -throwback -I,C: c.Receiver -o o.Receiver",
+   "out": "o.Receiver",
+   "src": "c.Receiver"
+  },
+  {
+   "cmd": "cc -c -za1 -Otime -apcs 3/32bit -throwback -I,C: c.Ui -o o.Ui",
+   "out": "o.Ui",
+   "src": "c.Ui"
   }
  ],
  "finals": [
   "link -o RTLSDR o.RTLSDR o.R82XX o.Driver C:o.stubs-32",
-  "link -o RTLSDRView o.SpecView o.Driver o.R82XX o.Audio o.Dsp o.Trace DeskLib:o.DeskLib C:o.stubs-32",
+  "link -o RTLSDRView o.SpecView o.Driver o.R82XX o.Audio o.Dsp o.Trace o.Rx o.Receiver o.Ui DeskLib:o.DeskLib C:o.stubs-32",
   "CDir out",
   "Copy RTLSDR out.RTLSDR ~C~V",
   "Copy RTLSDRView out.RTLSDRView ~C~V"

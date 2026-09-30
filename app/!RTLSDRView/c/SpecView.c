@@ -49,6 +49,9 @@
 #include "Driver.h"
 #include "Audio.h"
 #include "Dsp.h"
+#include "Rx.h"
+#include "Receiver.h"
+#include "Ui.h"
 #include "Trace.h"
 
 /* ---- FFT / spectrum geometry ----
@@ -66,7 +69,8 @@
 
 #define BIN_WIDTH_OS  2
 #define WORK_WIDTH    (NUM_BINS * BIN_WIDTH_OS)  /* 512 OS units */
-#define WORK_HEIGHT   360                        /* OS units -- grown from
+#define WORK_HEIGHT   520                        /* OS units -- grown from 360 for the
+                                                     control panel, and from
                                                      300 to fit a 6th
                                                      diagnostic text line
                                                      without crowding the
@@ -88,7 +92,11 @@
    Grown again to 180 to fit a second icon row (create_tone_icon) plus
    the demod readout text below it, now that row 1 (AGC through DEM)
    is full. */
-#define RESERVED_TOP    180
+#define RESERVED_TOP    320   /* was 180 before the receiver control panel
+                                 (Ui.c) added three more rows, a level meter
+                                 and a wider readout */
+#define REDRAW_TOP      (-258) /* the part of the window that changes at the
+                                 display rate: meter, readout, spectrum */
 #define BAR_MAX_HEIGHT  (WORK_HEIGHT - RESERVED_TOP)
 
 /* Redraw throttle, separate from how aggressively Null_spectrum drains
@@ -359,6 +367,8 @@ static int demod_enabled_g = 0;
 static icon_handle icon_demod_g = 0;
 static double demod_dev_rms_g = 0.0;  /* Hz, EMA-smoothed */
 static double demod_dev_peak_g = 0.0; /* Hz, EMA-smoothed */
+static int level_db10_g = -999;       /* channel level, dBFS x 10 */
+static int squelch_open_g = 1;
 
 /* ---- audio test tone (see Audio.h) ----
    First-pass proof that RISC OS audio output works at all from this
@@ -720,6 +730,8 @@ static void report_warning(const char *msg);
 static void cleanup_and_exit(void)
 {
     trace_event(Time_Monotonic(), "exit");
+    receiver_save();          /* quietly does nothing if Choices$Write is
+                                  not set */
     audio_stream_close();     /* must precede audio_test_tone_close() --
                                   see Audio.h */
     audio_test_tone_close();
@@ -823,7 +835,7 @@ static void fallback_stream(const char *why)
         report_and_die("Could not reopen the bulk stream with the "
                         "fallback settings.");
     }
-    dsp_fm_reset();
+    rx_reset();
     rx_recoveries_g++;
     rx_errors_g = 0;
     usb_last_data_cs_g = Time_Monotonic();
@@ -948,7 +960,7 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
                 n = FIXED_CHUNK_SIZE;
             }
             if (dsp_active) {
-                npcm = dsp_fm_process(rx_buf_g + off, n, pcm_g,
+                npcm = rx_process(rx_buf_g + off, n, pcm_g,
                                       PCM_BUF_SAMPLES);
                 if (stream_enabled_g && npcm > 0) {
                     /* Tell the ring how much audio is ready right now
@@ -991,16 +1003,24 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
         if (dsp_active) {
             /* Once per display update rather than per tick: this does a
                square root in emulated floating point. */
-            double pk_hz, rms_hz;
-            if (dsp_fm_take_stats(&pk_hz, &rms_hz)) {
-                demod_dev_rms_g = demod_dev_rms_g * (1.0 - DEMOD_ALPHA) +
-                                   rms_hz * DEMOD_ALPHA;
-                demod_dev_peak_g = demod_dev_peak_g * (1.0 - DEMOD_ALPHA) +
-                                    pk_hz * DEMOD_ALPHA;
+            rx_stats rxs;
+            if (rx_take_stats(&rxs)) {
+                if (rxs.have_dev) {
+                    demod_dev_rms_g = demod_dev_rms_g * (1.0 - DEMOD_ALPHA) +
+                                       rxs.rms_hz * DEMOD_ALPHA;
+                    demod_dev_peak_g = demod_dev_peak_g * (1.0 - DEMOD_ALPHA) +
+                                        rxs.peak_hz * DEMOD_ALPHA;
+                } else {
+                    demod_dev_rms_g = 0.0;
+                    demod_dev_peak_g = 0.0;
+                }
+                level_db10_g = rxs.level_db10;
+                squelch_open_g = rxs.squelch_open;
             }
         }
         finalize_display();
-        Window_ForceRedraw(spectrum_window_g, 0, -WORK_HEIGHT, WORK_WIDTH, 0);
+        Window_ForceRedraw(spectrum_window_g, 0, -WORK_HEIGHT, WORK_WIDTH,
+                           REDRAW_TOP);
         next_update_time_g = Time_Monotonic() + UPDATE_INTERVAL_CS;
         fft_frames_g = 0;
         t_now = Time_Monotonic();
@@ -1058,108 +1078,106 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
             }
         }
 
-        /* Diagnostic text was 5 lines tall (added while chasing the
-           DeviceFS padding bug, see docs/PLAN.md milestone 5) -- with
-           ~56 units needed per line to avoid overlap, that filled the
-           ENTIRE window height, leaving no room for the bars it was
-           supposed to help debug (confirmed: a real run showed nothing
-           but text, "that is the entire window"). The read pipeline is
-           now confirmed fixed and working, so this is back to a single
-           compact line -- just enough to glance at, not covering the
-           actual spectrum. VDU 5 switches text output to plot at the
-           graphics cursor (GFX_Move'd position) instead of the text
-           cursor; VDU 4 reverts. */
+        /* The channel the demodulator is listening to: two red lines
+           either side of the centre bin, bandwidth wide (the dongle is
+           tuned to the centre). */
         {
-            char line1[48];
-            /* dc/h dropped: after DC removal, db[centre] is trivially
-               ALWAYS exactly 0 (subtracting the mean and then summing
-               the result is 0 by definition, regardless of any real
-               signal) -- it was never meaningful new information, a
-               diagnosis mistake caught after a wasted round-trip. What
-               actually matters: WHERE the frame's strongest (non-DC)
-               bin sits relative to the tuned frequency (dead centre).
-               Landing consistently within roughly +-10 of centre (the
-               ~21-bin span a 200kHz FM signal should occupy at our
-               ~9.4kHz/bin resolution) would mean a real station peak IS
-               being captured; scattering randomly across all 251
-               non-DC bins would mean noise-floor-driven behaviour with
-               no real peak found yet. */
-            /* pk@ dropped (already confirmed solid at +3 across many
-               runs) to make room for real decimal precision -- %.0f
-               rounds to the nearest whole dB, which could easily be
-               hiding a real but modest gap (e.g. 44.6 vs 45.4) behind
-               two identical-looking rounded integers. Getting the true
-               numbers beats guessing at another architectural change
-               blind. */
-            /* Gain state appended compactly (G:AGC / G:M08) rather than
-               a separate live-updating indirected icon -- keeps the new
-               gain control UI simple (three static-label button icons,
-               no icon text buffer/validstring plumbing needed) while
-               still showing current state at a glance. Frequency
-               (F-/F+, see create_freq_icons/Click_spectrum) shown the
-               same way. */
-            if (gain_mode_g == GAIN_MODE_AGC) {
-                sprintf(line1, "min=%.1f max=%.1f G:AGC %.1fMHz",
-                        debug_db_min_g, debug_db_max_g,
-                        (double)tuned_freq_hz_g / 1.0e6);
-            } else {
-                sprintf(line1, "min=%.1f max=%.1f G:M%02d %.1fMHz",
-                        debug_db_min_g, debug_db_max_g, gain_index_g,
-                        (double)tuned_freq_hz_g / 1.0e6);
+            long bin_hz;
+            int bw, half_bins, cx;
+
+            bin_hz = rate_hz_g / NUM_BINS;
+            bw = (rcv.mode == RX_MODE_WFM) ? 150000 : rcv.bw_hz[rcv.mode];
+            half_bins = (int)(((long)bw / 2L) / bin_hz);
+            if (half_bins < 1) {
+                half_bins = 1;
             }
-            /* Stripped lines 2-6 (raw power, byte/sample range, idx/
-               nElev, chunk-boundary bytes, got/touched pairs) back out
-               of the DRAWN display -- this is the exact same mistake
-               already documented and fixed once before ("Diagnostic
-               text was 5 lines tall... filled the ENTIRE window
-               height, leaving no room for the bars"), reintroduced by
-               accumulating byte-level diagnostics one at a time while
-               chasing a single stuck-at-zero artifact. The user
-               confirmed the window has no scrollbar and the
-               "barcode"/"doesn't change" pattern they were seeing WAS
-               the entire visible window -- almost certainly six dense
-               text lines plus bars that, now that real dB contrast
-               finally exists, are tall enough to overlap right through
-               that text. The underlying debug_*_g captures higher up in
-               this function stay in place -- cheap, and still handy to
-               inspect or re-enable a line temporarily -- just not drawn
-               every redraw any more. */
+            if (half_bins > NUM_BINS / 2 - 1) {
+                half_bins = NUM_BINS / 2 - 1;
+            }
+            cx = ox + (NUM_BINS / 2) * BIN_WIDTH_OS;
+            Wimp_SetColour((int)colour_RED);
+            GFX_RectangleFill(cx - half_bins * BIN_WIDTH_OS,
+                               oy - WORK_HEIGHT, 1, BAR_MAX_HEIGHT);
+            GFX_RectangleFill(cx + half_bins * BIN_WIDTH_OS,
+                               oy - WORK_HEIGHT, 1, BAR_MAX_HEIGHT);
+            Wimp_SetColour((int)colour_BLACK);
+        }
+
+        /* Status text. VDU 5 switches text output to plot at the graphics
+           cursor (GFX_Move'd position) instead of the text cursor; VDU 4
+           reverts. Lines must stay short (~32 characters fit the window
+           width). */
+        {
+            char line1[64];
+            char bwtxt[12];
+
+            if (rcv.mode == RX_MODE_WFM) {
+                strcpy(bwtxt, "wide");
+            } else {
+                receiver_fmt_hz(bwtxt, (int)sizeof(bwtxt), rcv.bw_hz[rcv.mode]);
+            }
+            if (gain_mode_g == GAIN_MODE_AGC) {
+                sprintf(line1, "%s %s  G:AGC  %ldk", receiver_mode_name(rcv.mode),
+                        bwtxt, rate_hz_g / 1000L);
+            } else {
+                sprintf(line1, "%s %s  G:M%02d  %ldk", receiver_mode_name(rcv.mode),
+                        bwtxt, gain_index_g, rate_hz_g / 1000L);
+            }
             GFX_VDU(5);
             GFX_Move(ox + 4, oy - 20);
             GFX_Write0(line1);
             GFX_VDU(4);
+        }
 
-            /* Demod readout (see Dsp.c and DEMOD_* above) --
-               only meaningful once DEM has been on for a moment (the
-               EMA needs a few frames to settle from its zero start).
-               Real FM broadcast should settle to deviation on the
-               order of the format's actual swing (up to ~75kHz for
-               wideband FM), not near-zero (no real modulation
-               detected) or wildly pegged near the Nyquist-limited max
-               (clipping/no real signal, just noise). */
-            if (demod_enabled_g) {
-                char line2[64];
-                double rate_ksps;
-                unsigned int gap_ms;
+        /* Signal level meter: -100 dBFS at the left to 0 at the right. The
+           bar is green while the audio passes and red while the squelch has
+           it muted. */
+        {
+            int full_w, w;
 
-                /* r = complex samples/s actually read over the last few
-                   seconds, in thousands: should sit at the dongle's
-                   configured rate (2400 or 240). Below that, samples
-                   are being lost -- and no amount of ring-buffer
-                   cleverness can make continuous audio out of a stream
-                   with holes in it. g = the longest time the rest of
-                   the desktop held the CPU between two polls of this
-                   app over the same window (ms); G = the longest ever;
-                   u = audible audio underruns so far. */
-                trace_recent(&rate_ksps, &gap_ms);
+            full_w = 496;
+            w = ((level_db10_g + 1000) * full_w) / 1000;
+            if (w < 0) {
+                w = 0;
+            }
+            if (w > full_w) {
+                w = full_w;
+            }
+            Wimp_SetColour((int)colour_GREY1);
+            GFX_RectangleFill(ox + 8, oy - 282, full_w, 16);
+            if (w > 0) {
+                Wimp_SetColour(squelch_open_g ? (int)colour_GREEN
+                                              : (int)colour_RED);
+                GFX_RectangleFill(ox + 8, oy - 282, w, 16);
+            }
+            Wimp_SetColour((int)colour_BLACK);
+        }
+
+        /* The readout: r = complex samples/s actually read over the last
+           few seconds, in thousands -- it should sit at the dongle's rate
+           (240 or 2400); below that, samples are being lost. g / G = the
+           longest time the rest of the desktop held the CPU between two
+           polls of this app (recent window / ever), ms; u = audible audio
+           underruns; pk = FM peak deviation. */
+        if (demod_enabled_g) {
+            char line2[64];
+            double rate_ksps;
+            unsigned int gap_ms;
+
+            trace_recent(&rate_ksps, &gap_ms);
+            if (rcv.mode == RX_MODE_AM) {
+                sprintf(line2, "%.0f dB r=%.0fk g%u G%u u%d",
+                        level_db10_g / 10.0, rate_ksps, gap_ms,
+                        trace_gap_all_ms(), audio_stream_underruns());
+            } else {
                 sprintf(line2, "pk=%.0fk r=%.0fk g%u G%u u%d",
                         demod_dev_peak_g / 1000.0, rate_ksps, gap_ms,
                         trace_gap_all_ms(), audio_stream_underruns());
-                GFX_VDU(5);
-                GFX_Move(ox + 4, oy - 158); /* below icon row 2 now */
-                GFX_Write0(line2);
-                GFX_VDU(4);
             }
+            GFX_VDU(5);
+            GFX_Move(ox + 4, oy - 302);
+            GFX_Write0(line2);
+            GFX_VDU(4);
         }
 
         Wimp_GetRectangle(&r, &more);
@@ -1230,6 +1248,53 @@ static void discard_buffered_stream_data(void)
     }
 }
 
+/* Retunes the dongle to new_freq (clamped to the tuning limits). Returns
+   non-zero if the tuner locked, in which case the new frequency is
+   committed everywhere (tuned_freq_hz_g and rcv.freq_hz); on a failed lock
+   nothing changes, so the displayed frequency never disagrees with what
+   the tuner is really doing. Also the callback the control panel uses. */
+static int app_tune(unsigned long new_freq)
+{
+    unsigned int retune_t0;
+    char evmsg[TRACE_EVENT_TEXT];
+    int ok;
+
+    new_freq = receiver_clamp_freq(new_freq);
+    if (new_freq == tuned_freq_hz_g) {
+        return 1;
+    }
+    ok = 0;
+    rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x18, 1); /* I2C repeater on */
+    retune_t0 = Time_Monotonic();
+    if (r82xx_set_freq(&tuner_g, new_freq) == 0 && tuner_g.has_lock) {
+        tuned_freq_hz_g = new_freq;
+        rcv.freq_hz = new_freq;
+        /* Throw away the stale, pre-retune samples still sitting in the
+           DeviceFS buffer, and restart the demodulator so its filters
+           don't blend the two frequencies.
+
+           This deliberately does NOT call rtlsdr_reset_buffer() (which
+           main() uses once, before the stream is opened): that now
+           genuinely stalls and resets the dongle's endpoint (10 02 -- see
+           Driver.c's rtlsdr_write_reg() for the byte-order bug that used
+           to make it a no-op), and doing that while a bulk transfer is in
+           flight would leave the host pipe halted under the driver. */
+        discard_buffered_stream_data();
+        rx_reset();
+        reset_averaging();
+        /* The retune kept the app busy and the buffered audio was thrown
+           away: rebuild the audio lead (with a moment of silence) rather
+           than carry on with a thin one. */
+        audio_stream_relead();
+        ok = 1;
+    }
+    rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x10, 1); /* I2C repeater off */
+    sprintf(evmsg, "retune to %lu Hz took %u cs%s", new_freq,
+            Time_Monotonic() - retune_t0, ok ? "" : " FAILED");
+    trace_event(Time_Monotonic(), evmsg);
+    return ok;
+}
+
 /* All three gain buttons need the I2C repeater enabled around the
    register write, same as main()'s own init/tune bracket -- the
    repeater is disabled the rest of the time, and this handler runs
@@ -1237,15 +1302,43 @@ static void discard_buffered_stream_data(void)
 static BOOL Click_spectrum(event_pollblock *event, void *reference)
 {
     icon_handle icon;
-    int is_gain_icon, is_freq_icon;
+    int is_gain_icon;
+
+    int adjust;
 
     UNUSED_ARG(reference);
 
-    if (!event->data.mouse.button.data.select) {
-        return FALSE; /* only Select clicks drive these buttons */
+    icon = event->data.mouse.icon;
+    adjust = event->data.mouse.button.data.adjust ? 1 : 0;
+
+    /* The control panel (Ui.c) takes Select and Adjust. */
+    if ((event->data.mouse.button.data.select || adjust) &&
+        ui_click(icon, event->data.mouse.button.data.select ? 1 : 0,
+                 adjust)) {
+        /* mode, bandwidth and so on appear in the status line at the top */
+        Window_ForceRedraw(spectrum_window_g, 0, -40, WORK_WIDTH, 0);
+        return TRUE;
     }
 
-    icon = event->data.mouse.icon;
+    /* F- / F+: tune by the current mode's step (Adjust: ten steps). */
+    if ((icon == icon_freqdown_g || icon == icon_frequp_g) &&
+        (event->data.mouse.button.data.select || adjust)) {
+        unsigned long step, hz;
+
+        step = (unsigned long)receiver_step_hz() * (adjust ? 10UL : 1UL);
+        if (icon == icon_frequp_g) {
+            hz = tuned_freq_hz_g + step;
+        } else {
+            hz = (tuned_freq_hz_g > step) ? tuned_freq_hz_g - step : 0UL;
+        }
+        app_tune(hz);
+        ui_refresh();
+        return TRUE;
+    }
+
+    if (!event->data.mouse.button.data.select) {
+        return FALSE; /* only Select clicks drive the older buttons */
+    }
 
     if (icon < 0) {
         /* A click on the spectrum itself (not a button): a marker in the
@@ -1259,7 +1352,7 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
            unlike every gain/freq control below. */
         demod_enabled_g = !demod_enabled_g;
         if (demod_enabled_g) {
-            dsp_fm_reset();
+            rx_reset();
         }
         update_demod_icon();
         trace_event(Time_Monotonic(), demod_enabled_g ? "DEM on" : "DEM off");
@@ -1291,7 +1384,7 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
             if (stream_enabled_g) {
                 demod_enabled_g = 1;
                 update_demod_icon();
-                dsp_fm_reset();
+                rx_reset();
             }
             audio_stream_play(stream_enabled_g);
             update_stream_icon();
@@ -1303,8 +1396,7 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
 
     is_gain_icon = (icon == icon_agc_g || icon == icon_gaindown_g ||
                      icon == icon_gainup_g);
-    is_freq_icon = (icon == icon_freqdown_g || icon == icon_frequp_g);
-    if (!is_gain_icon && !is_freq_icon) {
+    if (!is_gain_icon) {
         return FALSE;
     }
 
@@ -1335,56 +1427,26 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
             r82xx_set_gain_manual(&tuner_g, gain_index_g);
         }
         update_agc_icon();
-    } else {
-        unsigned long new_freq;
-
-        new_freq = tuned_freq_hz_g;
-        if (icon == icon_freqdown_g && new_freq > FREQ_MIN_HZ) {
-            new_freq -= FREQ_STEP_HZ;
-        } else if (icon == icon_frequp_g && new_freq < FREQ_MAX_HZ) {
-            new_freq += FREQ_STEP_HZ;
-        }
-
-        if (new_freq != tuned_freq_hz_g) {
-            unsigned int retune_t0;
-            char evmsg[TRACE_EVENT_TEXT];
-
-            retune_t0 = Time_Monotonic();
-            /* Only commit the new frequency if the tune actually
-               locked -- an attempted retune that failed shouldn't
-               leave the displayed/tracked frequency out of sync with
-               what the tuner is really doing. */
-            if (r82xx_set_freq(&tuner_g, new_freq) == 0 &&
-                tuner_g.has_lock) {
-                tuned_freq_hz_g = new_freq;
-                /* Throw away the stale, pre-retune samples still sitting
-                   in the DeviceFS buffer, and restart the demodulator so
-                   its filters don't blend the two frequencies.
-
-                   This deliberately does NOT call rtlsdr_reset_buffer()
-                   (which main() uses once, before the stream is opened):
-                   that now genuinely stalls and resets the dongle's
-                   endpoint (10 02 -- see Driver.c's rtlsdr_write_reg()
-                   for the byte-order bug that used to make it a no-op),
-                   and doing that while a bulk transfer is in flight
-                   would leave the host pipe halted under the driver. */
-                discard_buffered_stream_data();
-                dsp_fm_reset();
-                reset_averaging();
-                /* The retune kept the app busy for a couple of hundred
-                   ms and the buffered audio was thrown away: rebuild the
-                   audio lead (with a moment of silence) rather than carry
-                   on with a thin one. */
-                audio_stream_relead();
-            }
-            sprintf(evmsg, "retune to %lu Hz took %u cs", new_freq,
-                    Time_Monotonic() - retune_t0);
-            trace_event(Time_Monotonic(), evmsg);
-        }
     }
 
     rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x10, 1); /* disable I2C repeater */
 
+    return TRUE;
+}
+
+/* Key presses with the caret in our window: the frequency field (Return
+   tunes, Up/Down step, Escape reverts). Anything the panel doesn't take
+   goes to the Wimp, which does the editing in a writable icon. */
+static BOOL Key_spectrum(event_pollblock *event, void *reference)
+{
+    int code;
+
+    UNUSED_ARG(reference);
+
+    code = (int)event->data.key.code;
+    if (!ui_key(code, event->data.key.caret.icon)) {
+        Wimp_ProcessKey(code);
+    }
     return TRUE;
 }
 
@@ -1592,6 +1654,12 @@ int main(void)
     app_start_time_g = Time_Monotonic();
     os_set_quiet(1);    /* no stderr in a Wimp task */
 
+    /* What was tuned, and how, last time (defaults if there is nothing
+       saved). The frequency is applied by the tuner set-up below; mode,
+       bandwidth, squelch and volume once the demodulator exists. */
+    receiver_load();
+    tuned_freq_hz_g = rcv.freq_hz;
+
     /* Run-time settings (see the comment above SAFE_BUF_KB). */
     rate_k = env_int("RTLSDRView$RateK", 240, 240, 2880);
     if ((rate_k % 240) != 0 || (rate_k > 300 && rate_k <= 900)) {
@@ -1791,6 +1859,7 @@ int main(void)
     create_demod_icon(spectrum_window_g);
     create_tone_icon(spectrum_window_g);
     create_stream_icon(spectrum_window_g);
+    ui_create(spectrum_window_g, app_tune);
     update_agc_icon();    /* reflect gain_mode_g's initial AGC state */
     update_demod_icon();  /* reflect demod_enabled_g's initial OFF state */
     update_tone_icon();   /* reflect tone_playing_g's initial OFF state */
@@ -1830,8 +1899,9 @@ int main(void)
         audio_stream_set_lead_ms(lead_ms);
         audio_stream_set_burst_ms(burst_ms);
     }
-    dsp_fm_init((stream_ok_g && audio_stream_rate() > 0)
+    rx_init((stream_ok_g && audio_stream_rate() > 0)
                     ? audio_stream_rate() : 48000, rate_hz_g);
+    receiver_apply_mode();
 
     sprintf(cfg, "rate=%ld xfer_kb=%d buf_kb=%d burst_ms=%d lead_ms=%d "
                  "fft_frames=%d fft_stride=%d budget_cs=%d audio_rate=%d",
@@ -1856,6 +1926,7 @@ int main(void)
     Event_Claim(event_REDRAW, spectrum_window_g, event_ANY, Redraw_spectrum, NULL);
     Event_Claim(event_CLOSE, spectrum_window_g, event_ANY, Close_spectrum, NULL);
     Event_Claim(event_CLICK, spectrum_window_g, event_ANY, Click_spectrum, NULL);
+    Event_Claim(event_KEY, spectrum_window_g, event_ANY, Key_spectrum, NULL);
     Event_Claim(event_USERMESSAGE, event_ANY, event_ANY, Quit_message, NULL);
     Event_Claim(event_NULL, event_ANY, event_ANY, Null_spectrum, NULL);
 

@@ -1,7 +1,7 @@
 # RTLSDRView roadmap: from spectrum-and-audio demo to a usable SDR receiver
 
-Status: proposal, 2026-09-30. Nothing here is built yet. It is meant to be
-cut up, reordered and argued with.
+Status: decisions taken 2026-09-30 (see section 1); Phase 1 under way. It is
+meant to be cut up, reordered and argued with.
 
 **Why now.** The hard part is done: the USB pipe is lossless, real-time FM
 audio runs at ~5% CPU and rides out desktop stalls ([`PLAN.md`](PLAN.md)
@@ -17,29 +17,32 @@ Dec 2022), the [SDR++ README](https://github.com/AlexandreRouma/SDRPlusPlus)
 and its screenshot. SDR++ is GPL-3.0; this plan borrows *ideas* (what the
 controls are and how they behave), not code.
 
-## 1. Recommendation in one screen
+## 1. Decisions taken (2026-09-30) and the resulting order
 
-1. **Do a small foundation step first** (Phase 0): split the 1,900-line
-   `SpecView.c` so UI, receiver state and USB/stream control are separate,
-   add a Choices file so settings persist, give the app a proper skeleton
-   (iconbar icon and menu, `Messages`, generated `Templates`), and add a
-   **file source** that plays recorded I/Q through the same pipeline. The
-   last one matters more than it looks: it lets us develop and test every
-   later feature, including DSP and UI, without the dongle or antenna.
-2. **Then make it a radio you can drive** (Phase 1): typed / per-digit /
-   keyboard frequency entry, step sizes, volume and mute, squelch, an
-   SNR/S-meter, gain in dB, bookmarks, and two cheap new modes (NFM and AM)
-   which unlock airband, marine and PMR.
-3. **Then the signature SDR++ feature, the waterfall** (Phase 2), with a
-   bigger FFT, axes, a draggable VFO band and click-to-tune, zoom/min/max.
-4. **Then more modes** (Phase 3: SSB/CW for HF through the V4's built-in
-   up-converter, WFM stereo, RDS), **then tools** (Phase 4: recorder,
-   scanner, band plans, frequency manager), **then stretch goals** (Phase 5:
-   listen inside a wide view, an `rtl_tcp` server so a PC can use the
-   dongle over the network).
+* **New modes come before the waterfall.** NFM and AM first (airband,
+  marine, PMR, amateur VHF/UHF), then SSB/CW/DSB with AGC (HF and amateur
+  bands through the V4's up-converter), then the waterfall.
+* **Windows: a table-driven UI builder in C on DeskLib**, not a generated
+  `Templates` file and not hand-drawn windows. Controls are described in
+  one declarative table (kind, position, label, action) and a small
+  builder creates the icons; sliders use DeskLib's `Slider`. Reasons: it is
+  the approach already proven on the Pi (a hand-built window block is how
+  the first window was made, and binary template generation would add a
+  format risk that costs hardware round trips), it keeps the layout in
+  version-controlled source, and it can be converted to a `Templates` file
+  later if packaging or translation ever matters.
+* **Two span modes stay:** *listen* (240 kSPS, lossless, stall-proof) and
+  *browse* (960 k-2.4 MSPS, wide view, audio best-effort).
+* **Bias-T stays on the roadmap, deferred.** It touches the GPIO code path
+  of the old hangs; not now.
+* **Audience: just the author, for now.** So no investment yet in
+  packaging, the manual, interactive help or translation; revisit if that
+  changes (Phase 6).
 
-Phases 2 and 3 are independent; swap them if airband/HF matters more to you
-than the waterfall. Decisions I need from you are in section 8.
+Order: Phase 1 (NFM, AM + the controls to drive them) -> Phase 2 (SSB, CW,
+DSB, AGC) -> Phase 3 (drive it well: bookmarks, step list, meters) ->
+Phase 4 (waterfall and real spectrum) -> Phase 5 (WFM stereo/RDS, recorder,
+file source, scanner) -> Phase 6 (stretch).
 
 ## 2. Where we are (measured, not guessed)
 
@@ -128,7 +131,7 @@ one of our build/test/read-the-log rounds.
 * **No hardware floating point.** Audio path, filters, AGC, NCO and the
   FFT go integer. Filter coefficients can still be *designed* with `double`
   at start-up (once). Whether VFP is available with the current toolchain
-  is Phase 0's first experiment (section 6).
+  is an open experiment (section 7).
 * **The Wimp redraws on demand, not every frame.** The waterfall is a
   sprite we update and invalidate; we control the redraw rate. Sliders
   (DeskLib `Slider`) are drawn in the redraw loop, so the plot window needs
@@ -137,7 +140,7 @@ one of our build/test/read-the-log rounds.
   mode (lossless, stall-proof, 0.9 s latency). 960 k-2.4 MSPS are *browse*
   modes (wide view; ~27-100 ms per transfer, so audio is best-effort,
   measured in `docs/logs`). The UI should say which one you are in.
-  Listening *inside* a wide view is Phase 5.
+  Listening *inside* a wide view is Phase 6.
 * **Tuning latency.** The audio lead makes a retune take ~1 s to be heard.
   Moving the VFO inside the current span needs no retune at all (an NCO
   shift), which is another reason to want a VFO rather than only "tune the
@@ -145,11 +148,10 @@ one of our build/test/read-the-log rounds.
 * **Memory.** WimpSlot is 640 KB; big buffers already live in the RMA. A
   1024-2048-bin waterfall history and recording buffers may want a dynamic
   area.
-* **No Templates editor in this environment.** Options: keep building
-  windows in code (works today), or write the windows as a small text spec
-  and have a repo script emit a `Templates` file (reviewable, repeatable;
-  [MenuGen](https://github.com/steve-fryatt/menugen) does the same for
-  menus), or draw them with FormEd/WinEd on the Pi. I suggest the script.
+* **No Templates editor in this environment.** So windows are built by a
+  table-driven builder in C (decision log, section 8): layout lives in one
+  declarative table in source, which is reviewable and needs no binary
+  resource format. A generated `Templates` file stays possible later.
 * **RISC OS conventions to follow:** Select = do it, Adjust = do the
   opposite or keep the window, Menu = context menu; iconbar icon with
   Info/Choices/Quit; Choices via `<Choices$Write>`; interactive help;
@@ -194,81 +196,87 @@ Main window (resizable; top bar is a Wimp pane, plot area fills the rest):
 ## 6. Phased plan
 
 Every phase ends with something runnable on the Pi and a check against the
-trace log, in the way the USB/audio work was done.
+trace log, in the way the USB/audio work was done. DSP is written and
+tested on the host first (synthetic signals, as `Dsp.c` was), then run on
+the Pi.
 
-### Phase 0 - foundation (2-3 sessions, mostly invisible)
+### Phase 0 - foundation (folded into Phase 1 as needed)
 
-* **0.1 Experiments that decide the toolchain.** (a) Does the build
-  service's Norcroft accept `-fpu vfp`, and does a VFP benchmark run on
-  the CM4? (b) A host-tested integer (Q15) FFT microbenchmark on the Pi.
-  If VFP works without extra modules, float DSP/FFT becomes practical;
-  otherwise integer it is (my expectation: a 1024-point integer FFT at
-  ~0.1-0.3 ms, to be measured). GCCSDK's hard-float path exists (see
-  `~/Development/hello`) but needs the SharedLibs and ARMEABISupport
-  modules on the target, so it is a last resort for a program meant to be
-  shared.
-* **0.2 Split `SpecView.c`** into: receiver state (frequency, mode, width,
-  gain, volume, squelch), source/stream control (open, retune, watchdog),
-  spectrum (FFT and display data), and UI (windows, icons, events).
-  *Done when* the trace of a fixed I/Q replay is identical before and after.
-* **0.3 App skeleton:** `!Sprites`, iconbar icon and menu, `Messages`,
-  Choices read/write (frequency, mode, width, gain, volume, squelch,
-  window position), generated `Templates` (or the code-built equivalent),
-  fix the TONE label.
-* **0.4 File source + baseband recorder stub:** play a `.iq` file through
-  the same read path; record the raw stream to one. *Done when* a recorded
-  FM station plays identically from file.
+* A **receiver state** module (frequency, mode, per-mode bandwidth and
+  step, squelch, volume) so the window code stops owning it.
+* A table-driven control builder and the first **Choices** persistence
+  (last frequency, mode, bandwidth, step, squelch, volume).
+* Still to do before the waterfall: the `SpecView.c` split, a **file
+  source**, and the floating-point/VFP experiment (section 7).
 
-### Phase 1 - a radio you can drive (3-4 sessions)
+### Phase 1 - NFM and AM, and the controls to drive them (in progress)
 
-* Frequency entry: per-digit click/keys, typed entry, step menu, per-mode
-  snap interval.
-* Volume slider, mute; squelch slider; SNR/S-meter; gain slider with dB;
-  status bar (mode, span, lead, underruns, CPU from the trace counters).
-* **NFM and AM demodulators** with NCO + FIR channel filter and per-mode
-  default widths; host-tested with synthetic signals first, as `Dsp.c` was.
-* Bookmarks: a Bookmarks menu over a text list in Choices; add/remove.
-* *Done when:* you can type 118.300 and hear AM airband with squelch, tune
-  PMR/marine NFM, and the settings come back after a restart.
+* DSP: a shared front end (recentre, optional CIC, FIR decimate to
+  48 kSPS), a mode-specific channel filter, NFM discriminator, AM envelope
+  with carrier-normalised AGC, audio high/low-pass, squelch (noise-based
+  for FM, carrier-level for AM), volume; signal level for a meter.
+* Controls: mode buttons, a typed frequency field (MHz) with Up/Down key
+  stepping, F-/F+ and a step cycle button, bandwidth -/+, squelch -/+,
+  volume -/+ and mute, a signal meter.
+* *Done when:* you can type 118.300 and hear AM with squelch, tune NFM
+  (PMR/marine/amateur), switch back to WFM, and the trace shows no
+  underruns.
 
-### Phase 2 - waterfall and a real spectrum (3-4 sessions)
+**Status (2026-09-30): first build written and on the NAS, not yet run on
+the Pi.** Built: `Rx.c` (mode dispatcher and the NFM/AM path),
+`Receiver.c` (state, per-mode bandwidth/step, Choices persistence),
+`Ui.c` (table-driven control panel), and `Dsp.c` refactored so the WFM
+path and the new front end share one CIC (verified bit-identical to the
+old WFM output on five reference runs). Host-tested on synthetic signals
+at 240 kSPS and 2.4 MSPS: AM tone level within ~8% of ideal whatever the
+carrier strength or a +-3 kHz offset, AM audio response 200 Hz-3 kHz flat
+within 1 dB (-3 dB at ~4.5 kHz, cut off by the 10 kHz channel), adjacent
+AM channel at +9 kHz rejected by 63 dB; NFM tone level within 4% with
+adjacent 12.5/25 kHz channels down 32 dB (5x stronger interferer, the FM
+capture effect doing part of the work); noise squelch muting pure noise
+and opening within ~70 ms of a signal; output identical for any input
+chunk size (16384 down to 2 bytes) and for 44.1/48/96 kHz audio.
+The per-sample cost estimate on the Pi is ~3% CPU (to be measured with the
+trace). Squelch thresholds are calibrated on synthetic noise and will need
+adjusting by ear on real signals.
 
-* Integer FFT with 512/1024/2048 points, Nuttall or Blackman-Harris
-  window, log-magnitude by table, averaging and peak hold; FFT frame rate
-  setting.
-* Waterfall sprite + colour maps; plot with translation tables so any
-  screen depth works; update only as fast as the budget allows.
-* Axes: frequency labels, dB scale; zoom/min/max sliders; resizable window.
-* VFO band overlay; click/drag to tune and to set bandwidth; bookmark
-  labels above the plot; centre vs normal tuning.
+### Phase 2 - SSB, CW, DSB (and the HF path)
+
+* NCO mixer and offset tuning (keeps the signal away from the dongle's DC
+  spike and puts a CW tone at a chosen pitch), USB/LSB/DSB/CW channel
+  filters, AGC attack/decay, optional noise blanker.
+* **Prove the HF path** on hardware: lower the UI's 24 MHz limit and look
+  for a known AM broadcast or time-signal station through the V4's
+  up-converter (that code exists but has never been exercised).
+* Persist settings per mode.
+
+### Phase 3 - drive it well
+
+* Bookmarks (list in Choices, Bookmarks menu), a proper step list, gain in
+  dB, better meters, status bar, keyboard shortcuts, sliders for volume,
+  squelch and gain (DeskLib `Slider`).
+
+### Phase 4 - waterfall and a real spectrum
+
+* Integer FFT 512-2048 points, window functions, log-magnitude by table,
+  averaging and peak hold; a scrolling sprite waterfall with colour maps;
+  axes; zoom/min/max; resizable window; a draggable VFO band with click- and
+  drag-to-tune; bookmark labels on the plot; centre vs normal tuning.
 * *Done when:* a 1024-bin waterfall runs at >=10 fps at <=15% total CPU
-  with zero underruns (trace), and clicking a FM station tunes it.
+  with zero underruns (trace), and clicking a station tunes it.
 
-### Phase 3 - more radio (3-5 sessions, in this order)
+### Phase 5 - more radio and tools
 
-1. SSB/CW/DSB (HF and amateur bands, through the V4's up-converter --
-   first prove the HF path at all: lower the UI's 24 MHz limit and look
-   for a known AM broadcast or time-signal station), AGC attack/decay,
-   noise blanker.
-2. WFM stereo and de-emphasis options.
-3. RDS: station name and radio text in the window.
-4. IF noise reduction, IQ correction, low-pass options.
+* WFM stereo, RDS; IQ file source and baseband/audio recorder; frequency
+  manager with lists; scanner; band plans; IF noise reduction, IQ
+  correction.
 
-### Phase 4 - tools (3-4 sessions)
+### Phase 6 - stretch
 
-* Recorder (audio WAV; baseband), frequency manager with lists and
-  import/export, scanner (range, interval, level, linger), band-plan
-  files (UK FM/air/marine/amateur first), full keyboard shortcuts.
-
-### Phase 5 - stretch
-
-* **Listen inside a wide view:** channel extraction from a 1.2-2.4 MSPS
-  stream with the NCO path, bigger reads (the DMA allocation limit above
-  192 KB is untested) and/or a mode that drops to 240 kSPS for listening.
-* **`rtl_tcp`-compatible server** so a PC (SDR++, GQRX) can use the dongle
-  over the network; or an audio network sink.
-* Packaging (RiscPkg via PackTools), a manual (StrongHelp/HTML via XMLMan),
-  a second VFO.
+* Listen inside a wide view (channel extraction from a 1.2-2.4 MSPS stream;
+  bigger reads; or drop to 240 kSPS for listening); an `rtl_tcp` server;
+  bias-T (GPIO, hang-risk path); packaging, manual and help if the audience
+  ever grows; a second VFO.
 
 ## 7. Risks and things to verify early
 
@@ -277,29 +285,21 @@ trace log, in the way the USB/audio work was done.
 | Mouse wheel may not reach a plain window under the Wimp | a 20-line test on the Pi in Phase 0; fall back to keys + click digits |
 | Waterfall plot cost under each screen depth | Phase 2 prototype, measured with the trace's `disp_cs` |
 | Integer FFT precision/scaling for 8-bit input | host test against a double FFT first |
-| VFP unavailable or needs extra modules | Phase 0.1 |
+| VFP unavailable or needs extra modules | the open VFP experiment (section 7 preamble); integer DSP works without it |
 | DMA allocation for reads above 192 KB (Phase 5) | try 256/384/512 KB launchers, watch for the 3-second fallback |
 | Stalls from the network file system (NAS) during recording | record into a RAM buffer, write in chunks; trace will show it |
 | Audio latency makes tuning/scanning feel slow | adaptive lead (idea in `PLAN.md`), and VFO moves inside the span without retuning |
 | Scope creep | each phase is shippable; stop after any of them |
 
-## 8. Decisions for you
+## 8. Decisions log
 
-1. **Order:** is the waterfall (Phase 2) or new modes (Phase 3: airband,
-   HF) what you want first after Phase 1? Do you care about FM stereo/RDS?
-2. **Templates:** generated from a text spec by a repo script (my
-   suggestion), or build the windows in code as now, or draw them on the Pi?
-3. **Span:** are you happy with "240 kSPS = listen, 2.4 MSPS = browse" as
-   two explicit modes for now?
-4. **Hang-risk items:** bias-T (GPIO) is the one thing here that touches
-   the code path of the old hangs. Want it at all?
-5. **Sharing:** is this for you only, or will other people run it (affects
-   how much we invest in packaging, help and the manual)?
+| date | decision |
+|---|---|
+| 2026-09-30 | Modes before waterfall |
+| 2026-09-30 | Windows built by a table-driven C builder on DeskLib; `Templates` later if ever needed |
+| 2026-09-30 | Listen (240 kSPS) and browse (wide) as two explicit span modes |
+| 2026-09-30 | Bias-T stays on the roadmap, deferred |
+| 2026-09-30 | Personal tool for now: no packaging/manual/help work yet |
 
-## 9. Suggested first milestone ("usable radio", ~6 sessions)
-
-Phase 0.2 + 0.3 + the Phase 1 list: new top pane and layout, typed and
-per-digit frequency, volume/mute, squelch, meter, NFM + AM, bookmarks,
-Choices persistence, iconbar. No waterfall yet; the existing spectrum moves
-into the new window unchanged. That is the smallest step that makes the
-program feel like a receiver rather than a test harness.
+Open: lower the UI's 24 MHz limit for HF (Phase 2); whether the waterfall
+should wait for a VFP answer.
