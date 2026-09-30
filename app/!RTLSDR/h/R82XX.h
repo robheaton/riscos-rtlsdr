@@ -91,4 +91,8 @@ int r82xx_set_gain_manual(r82xx_t *t, int index);
    function's addition fixes. Call with the I2C repeater enabled. */
 int r82xx_set_bandwidth(r82xx_t *t, int bw_hz);
 
+/* The busy-wait pause after every I2C transfer (a leftover from the
+   hang hunt in docs/PLAN.md): 10 ms by default, 0 disables it. */
+void r82xx_set_pace_ms(int ms);
+
 #endif /* R82XX_H */

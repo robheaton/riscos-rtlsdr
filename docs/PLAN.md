@@ -2340,6 +2340,11 @@ bulk transfer is sized to the stream buffer's *free space*, so a bigger
 buffer gives bigger, less frequent bursts as well as more stall tolerance
 (latency and tolerance trade off).
 
+> **WRONG -- corrected under "milestone 7" below.** `start_read()` sizes a
+> transfer to `min(free space, the read request)`, and the read request was
+> 16 KB, so the buffer size never came into play. Four hardware runs at
+> 128/256/512/1024 KB behaved identically for exactly that reason.
+
 **Changes:** `RTLSDRView$BufKB` (default 512) and `RTLSDRView$LeadMS`
 (default 350) system variables, read at start-up, so settings can be tried
 with `*Set` and no rebuild; a watchdog that reopens the stream with the
@@ -2356,4 +2361,137 @@ settings, 110 ms / 350 ms cut underruns roughly 4x (e.g. 96 -> 23 in a
 light-activity pattern) and lost audio roughly 2x; a 220 ms buffer cut them
 further (-> 4 underruns). The model is crude -- treat it as direction, not
 prediction; `g` and `u` on real hardware are the measurement.
+
+## Phase 2, follow-on: real audio output, milestone 7 -- the USB pipe is only armed by read calls, and the read size is the stall tolerance
+
+### The puzzle: four buffer sizes, one behaviour
+
+The "ride out desktop stalls" build (`RTLSDRView$BufKB` 128/256/512/1024 KB,
+`RTLSDRView$LeadMS` 250-500) was tried on the Pi, with a stress step (drag a
+Filer window) and an F+ retune. The readout afterwards (`r` = average
+samples/s since first data, `g` = peak-held worst poll gap, `u` = audible
+underruns):
+
+| launcher | r | g (ms) | u |
+|---|---|---|---|
+| Buf128 | 2076k | 10 | 12 |
+| Buf256 | 2071k | 10 | 12 |
+| Buf512 | 2311k | 20 | 17 |
+| Buf1024 | 2028k | 10 | 8 |
+
+`u` did not fall as the buffer grew; `r` was 84-96% of the 2400k the dongle
+produces in every run; and the audio after F+ changed "instantly" even with
+a 500 ms lead. (The `g` figures turned out to be clock quantisation -- see
+below -- so they said nothing.)
+
+### Root cause, from the sources
+
+Read from `USBDriver` (`~/Development/riscos-usb-investigation/USBDriver/build/c/usbmodule`:
+`start_read`, `read_cb`, `DeviceCall_WakeUpRX`) and DeviceFS
+(`RiscOS/Sources/HWSupport/DeviceFS/s/FSystem`: `gbpb_get`):
+
+1. Every `OS_GBPB` read on the stream makes DeviceFS call the device's
+   `DeviceCall_WakeUpRX` with **R3 = the number of bytes requested**.
+   USBDriver stores that as `nextcount` and sets `delayed_read`.
+2. `start_read()` starts a transfer only if none is in flight, and sizes it
+   `min(BM_FreeSpace, totalcount)` -- the **read request**, not the buffer.
+3. On completion (`nopad`), `read_cb()` arms a follow-up only if
+   `delayed_read` is set, i.e. only if the app made *another read call*
+   while the transfer was running.
+
+So there is at most one transfer in flight plus one queued, each the size of
+our read request. With 16 KB requests that is ~7 ms of data at 2.4 MSPS: any
+gap in this app's polling longer than that leaves the pipe unarmed, and the
+dongle's FIFO overflows -- samples are simply lost, whatever the stream
+buffer size. Everything measured above follows. A second consequence: data
+only becomes visible when a *whole* transfer completes, so the transfer size
+is also the burst size (latency granularity).
+
+Two further facts from the same sources: each transfer allocates its own
+physically contiguous DMA buffer (`PCI_RAMAlloc` + `memset`, in
+`DWCDriver/c/port`), and DWC splits big URBs at `max_transfer_size` 65535.
+`DeviceFS_CallDevice` hands any reason code straight to the driver, so an
+explicit `WakeUpRX` would also work; it was not needed.
+
+### The fix
+
+* **Big read requests** (`RTLSDRView$XferKB`, default ~200 ms of data,
+  16-128 KB) into an RMA buffer, processed in 16 KB slices with the same
+  time budget per poll. A fall-back watchdog re-opens the stream with 16 KB
+  reads and a 128 KB buffer if the driver delivers nothing (an allocation
+  failure would otherwise be a silent, permanent stall).
+* **240 kSPS mode** (`RTLSDRView$RateK 240`): the dongle decimates, `Dsp.c`
+  skips its CIC stage (`dsp_fm_init(audio_rate, input_rate)` takes any
+  multiple of 240 kSPS), USB traffic and CPU drop ~10x, and one MB of buffer
+  is ten times as many seconds. `r82xx_set_bandwidth(240000)` selects the
+  tuner's narrowest filter (IF 2.125 MHz). Validated off-hardware on
+  synthetic FM: tone amplitude identical to the 2.4 MSPS path, SNR 64 dB vs
+  67 dB on a strong signal, exact output counts, identical for chunk sizes
+  777 to 98304 (so state carries correctly). The spectrum in this mode spans
+  240 kHz, not 2.4 MHz.
+* **`Trace.c`**: per-second buckets (bytes, reads, polls, time in USB reads /
+  demodulator / FFT / redraw, worst desktop gap, audio lead range, dropped
+  audio, underruns), timestamped events (STREAM, retune + how long it took,
+  markers -- click the graph), a gap histogram, written on exit to the file
+  named by `RTLSDRView$Log` (written only then: a file write to a network
+  share can itself stall the desktop). The NAS launchers `T1`-`T6` write
+  `Log1`-`Log6` next to themselves, so results can be read without
+  screenshots. The on-screen `r`/`g` are now a recent-window average/max.
+
+### Hardware results (logs in `docs/logs/`)
+
+**First run, 240 kSPS with 96 KB reads**
+([log](logs/2026-09-30-T1-240k-96K-first-run.txt)): exactly the nominal
+480 KB/s (5 reads of 96 KB a second) for every idle second -- where the old
+configuration lost 4-16% even idle -- and zero underruns outside the stress
+step. The audio lead sat steady at 294-298 ms minimum (lead target 300) for
+24 s: the dongle and audio clocks do not drift measurably. The three
+underruns were all in the stress step, whose stalls of 390, 480 and 950 ms
+(one whole second without a single poll) exceeded the 300 ms lead; data was
+lost only where a stall outlasted the two-transfer coverage. It also showed
+that, after the 950 ms stall, the lead stayed at 510-705 ms instead of
+300-490: the re-sync inserted the full lead in silence *on top of* the
+backlog that had piled up (`audio_stream_feed()` now counts a backlog
+beyond one burst towards the lead; `DeviceCall_USB_BufferSpace`, reason
+`0x80000002`, says how much is waiting).
+
+**Second run, same settings, polling politely** ([log](logs/2026-09-30-T1-240k-96K-second-run.txt)):
+the main loop now sleeps between polls (`Event_PollIdle`, up to 20 ms; the
+first log showed ~70,000 empty polls a second, ~15% of the CPU in read
+calls plus whatever the Wimp spent on each poll). Result: idle CPU ~6%
+(almost all of it the FFT; the demodulator is below the clock's resolution),
+both stress steps (a local Filer window, then the NAS folder window) produced
+worst gaps of only 80-110 ms, **no data loss and no underruns**, lead never
+below 228 ms. Why the stalls were so much shorter than in the first run is
+not proven; the likeliest reason is that an app spinning at 70,000 polls a
+second slows the whole desktop. The one underrun was the F+ retune, which
+blocked the app for 600 ms; afterwards the lead was back at its normal
+283-497 ms (the re-sync fix and `audio_stream_relead()`).
+
+### Smaller findings
+
+* **The gap measure was quantisation noise below ~30 ms.** The clock ticks
+  every 10 ms and polls can be microseconds apart, so any two polls either
+  side of a tick boundary differ by one tick. Every `g10`/`g20` ever shown
+  was that. `Trace.c` ignores one-tick gaps and subtracts its own idle
+  sleep.
+* **`audio_stream_feed()` would have broken after ~15 minutes**: the play
+  position was `elapsed_cs * rate / 100` in 32 bits, which wraps at
+  89,478 cs at 48 kHz. It is now advanced incrementally.
+* **An underrun used to replay old audio** until the next feed: the ring
+  loops, and the region past the write head still held what was written a
+  lap ago. The ring is now zeroed behind the play head.
+* **A retune blocks the app for 200-600 ms**, and the cause is
+  `r82xx_pace()` in `R82XX.c`: a busy-wait (to the next clock tick, 0-10 ms)
+  after every I2C transfer, left over from the hang hunt ("remove if it
+  doesn't help" -- the freezes stopped for another reason, see above) and
+  ~40 transfers per retune. `RTLSDRView$PaceMS 0` disables it after tuner
+  bring-up (launcher `T6`); not yet tried on hardware, and it touches the
+  code path of the historical hangs, so it is opt-in.
+
+### Status
+
+Pending on hardware: `T3` (2.4 MSPS, 128 KB reads -- the wide-spectrum mode
+can at best cover ~27-54 ms of stall), `T5` (192 KB reads, 500 ms lead), `T6`
+(no pacing), and a subjective listening report for 240 kSPS audio.
 

@@ -30,9 +30,26 @@
    the hangs -- a real hypothesis, not proven, but a different class of
    fix than chasing individual call sites has been. Remove if it doesn't
    help. */
+static int r82xx_pace_ms_g = 10;
+
+/* 0 switches the pacing off. (The wait below only has centisecond
+   resolution, so any non-zero value behaves as "until the next clock
+   tick", 0-10 ms.) !RTLSDRView leaves it on for tuner bring-up, where
+   the hangs were seen, and lets RTLSDRView$PaceMS change it afterwards:
+   a retune is ~40 paced I2C transfers, i.e. the desktop AND the USB
+   stream stood still for 200-600 ms on every F+/F-. */
+void r82xx_set_pace_ms(int ms)
+{
+    r82xx_pace_ms_g = (ms < 0) ? 0 : ms;
+}
+
 static void r82xx_pace(void)
 {
     clock_t start;
+
+    if (r82xx_pace_ms_g <= 0) {
+        return;
+    }
     start = clock();
     while (((double)(clock() - start) / CLOCKS_PER_SEC) < 0.01) {
         /* busy-wait ~10ms */

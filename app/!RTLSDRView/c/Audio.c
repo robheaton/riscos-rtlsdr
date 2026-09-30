@@ -563,7 +563,9 @@ int audio_stream_feed(const short *samples, int n)
     if (ahead < lead_min) {
         long backlog, fill;
 
-        if (stream_synced_g) {
+        if (stream_synced_g && !stream_relead_g) {
+            /* (A re-sync right after audio_stream_relead() -- a retune --
+               is an expected gap, not an underrun to be alarmed by.) */
             stream_underruns_g++;
             iv_underruns_g++;
         }

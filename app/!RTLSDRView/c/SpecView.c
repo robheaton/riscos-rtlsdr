@@ -1571,7 +1571,7 @@ int main(void)
 {
     int n;
     int rc;
-    int xfer_kb, buf_kb, lead_ms, burst_ms, rate_k;
+    int xfer_kb, buf_kb, lead_ms, burst_ms, rate_k, pace_ms;
     char cfg[240];
 
     Event_Initialise("RTLSDRView");
@@ -1661,6 +1661,13 @@ int main(void)
                             "docs/PLAN.md.");
         }
     }
+
+    /* Tuner bring-up is done (it stays paced: that is where the hangs
+       were). Pacing after every I2C transfer is what made a retune take
+       200-600 ms; RTLSDRView$PaceMS 0 turns it off for runtime retunes
+       and gain changes. */
+    pace_ms = env_int("RTLSDRView$PaceMS", 10, 0, 100);
+    r82xx_set_pace_ms(pace_ms);
 
     rtlsdr_reset_buffer(device_name_g);
 
@@ -1807,13 +1814,15 @@ int main(void)
             rate_hz_g, xfer_kb, stream_buf_kb_g, burst_ms, lead_ms,
             fft_per_update_g, fft_stride_g, TICK_BUDGET_CS,
             stream_ok_g ? audio_stream_rate() : 0);
-    /* Sleep between polls for up to 20 ms when a transfer lasts long
-       enough that it makes no difference (see poll_idle_cs_g). */
-    poll_idle_cs_g = (unsigned int)(burst_ms / 40);
+    /* Sleep between polls (up to 20 ms) when a transfer lasts long enough
+       that it makes no difference: the pipe needs at least one read call
+       per transfer, so keep the sleep under half a transfer. */
+    poll_idle_cs_g = (unsigned int)(burst_ms / 20);
     if (poll_idle_cs_g > 2) {
         poll_idle_cs_g = 2;
     }
-    sprintf(cfg + strlen(cfg), " poll_idle_cs=%u", poll_idle_cs_g);
+    sprintf(cfg + strlen(cfg), " poll_idle_cs=%u pace_ms=%d", poll_idle_cs_g,
+            pace_ms);
     trace_init(getenv("RTLSDRView$Log"), cfg);
     trace_set_idle_cs(poll_idle_cs_g);
     trace_event(Time_Monotonic(), "started");

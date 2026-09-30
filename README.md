@@ -24,31 +24,44 @@ build on.
 - **`!RTLSDRView`**, a Wimp app: live spectrum (hand-written FFT,
   power-domain averaging), AGC/manual gain, frequency tuning (F-/F+), an FM
   deviation readout (DEM), a TimPlayer test tone (TONE), and **real-time
-  wideband-FM audio (STREAM)** — the whole 2.4 MSPS stream is demodulated
-  live and played through RISC OS's standard **TimPlayer** module.
+  wideband-FM audio (STREAM)** — the stream (240 kSPS for audio, or the
+  full 2.4 MSPS) is demodulated live and played through RISC OS's standard
+  **TimPlayer** module.
 
 **How the audio works.** Audio output uses TimPlayer (already resident on
 most RISC OS 5 systems, or loaded from
-`System:Modules.Audio.Trackers.TimPlayer`), which does all interrupt-driven
-DMA/mixing itself; the app never touches assembler. The demodulator
-(`Dsp.c`) is **integer-only** — this build has no `-fpu` option, so every
-`double` is emulated floating point, roughly 100x slower per operation —
-and runs on every sample: a 3rd-order CIC decimate-by-10 (2.4 MSPS → 240
-kSPS, which also acts as the channel filter), an integer polar
-discriminator, 50 µs de-emphasis, and a resampler to whatever rate the
-mixer runs at. It was validated against synthetic FM on a Linux machine
-before it ever ran on the Pi. Only the FFT display uses (emulated) floating
-point, and it is budgeted to a few frames per update.
+`System:Modules.Audio.Trackers.TimPlayer`), which does all the
+interrupt-driven DMA/mixing itself; the app never touches assembler. The
+demodulator (`Dsp.c`) is **integer-only** -- this build has no `-fpu`
+option, so every `double` is emulated floating point, roughly 100x slower
+per operation -- and runs on every sample: an optional 3rd-order CIC
+decimator (2.4 MSPS -> 240 kSPS; skipped when the dongle itself is run at
+240 kSPS), an integer polar discriminator, 50 us de-emphasis, and a
+resampler to whatever rate the mixer runs at. It was validated against
+synthetic FM on a Linux machine before it ever ran on the Pi. Only the FFT
+display uses (emulated) floating point, and it is budgeted to a few frames
+per update.
+
+RISC OS multitasks cooperatively, so any other task can stall this app for
+tens or hundreds of milliseconds. The USB side rides that out by asking the
+driver for big transfers: USBDriver keeps one bulk transfer in flight plus
+one queued, arms the next only when the app makes a read call, and sizes
+each to the *read request* -- so the read size (not the stream buffer) is
+the stall tolerance. The audio side keeps a lead of a few hundred
+milliseconds in its ring. See `docs/PLAN.md` "milestone 7" for the evidence.
 
 **Known limitations.**
-- **Audio pauses when other tasks use the CPU.** RISC OS multitasks
-  cooperatively: while another task holds the CPU this app isn't polled, so
-  nothing drains the USB buffer or refills the audio ring. Mitigated with
-  bigger, tunable buffers (see Testing); the readout shows the longest gap
-  between polls (`g`, ms) and the count of audible underruns (`u`).
+- **A stall longer than the audio lead is an audible pause** (RISC OS
+  cooperative multitasking; the lead is `RTLSDRView$LeadMS`, default 350 ms
+  -- more lead, more latency). Desktop drags measured 80-110 ms worst gaps
+  and were absorbed completely at 240 kSPS.
+- **A retune (F+/F-) mutes the audio for 0.2-0.6 s** while the tuner's I2C
+  transfers run (see `RTLSDRView$PaceMS`).
+- At the full 2.4 MSPS a transfer is only ~27 ms of data, so that mode
+  cannot ride out stalls the way the 240 kSPS audio mode does.
 - Mono only (no stereo decode, no RDS); no squelch, so weak stations hiss;
-  no volume control yet; the station must be at the centre of the 2.4 MHz
-  capture (tune with F-/F+).
+  no volume control yet; the station must be at the centre of the capture
+  (tune with F-/F+).
 
 **How it got here — the short version** (the full, honest history including
 the wrong turns is in [`docs/PLAN.md`](docs/PLAN.md)). Streaming was blocked
@@ -64,7 +77,9 @@ transfer, was 2 bytes. It was found by diffing the *raw wire bytes* of the
 control transfers against a real Linux capture of the same dongle — earlier
 comparisons of register *values* and transaction *counts* could not see a
 byte-order difference. The next bottleneck was the CPU (emulated floating
-point), then the desktop's cooperative scheduling. Along the way: an I2C
+point), then the desktop's cooperative scheduling -- where buffer-size tuning
+did nothing until the driver's source showed that it only arms a USB transfer
+per read call, sized to the read request (see `docs/PLAN.md` milestone 7). Along the way: an I2C
 write chunking limit, a hardware bit-reversal quirk on I2C reads,
 TaskWindow execution implicated in repeated full-machine freezes (the
 operational rule is now to run directly, never in a TaskWindow), `fread()`
@@ -91,6 +106,8 @@ Norcroft padded past its intended size.
   demodulator (CIC decimator, discriminator, de-emphasis, resampler).
 - `app/!RTLSDRView/c/Audio.c`, `h/Audio.h` — TimPlayer audio output: the
   test tone and the streaming ring buffer.
+- `app/!RTLSDRView/c/Trace.c`, `h/Trace.h` — per-second statistics and the
+  optional log file (`RTLSDRView$Log`) used to diagnose stalls and USB loss.
 - `build/plan.json` — compile/link plan for `build.riscos.online`.
 
 ## Building
@@ -145,18 +162,30 @@ Press **DEM** for the FM deviation readout and **STREAM** to listen. Watch
 desktop responsiveness while it's running (move another window, click
 elsewhere) — that, and audio pauses, are the main things to check.
 
-The readout under the buttons shows `pk`/`rms` (FM deviation, kHz), `r`
-(USB read rate in kilo-samples/s; close to 2400k when healthy), `g` (longest gap
-between polls, ms) and `u` (audio underruns). Two system variables tune how
-much desktop stall the audio can ride out, at the cost of latency; set
-them before launching:
+The readout under the buttons shows `pk` (FM peak deviation, kHz), `r`
+(complex samples/s actually read over the last few seconds, thousands --
+should sit at the dongle's rate, 240k or 2400k), `g`/`G` (longest time the
+rest of the desktop held the CPU between two polls, in the last few seconds
+/ ever, ms) and `u` (audible audio underruns). Settings are RISC OS system
+variables read at start-up (an Obey launcher just `*Set`s them first):
 
 ```
-*Set RTLSDRView$BufKB 512     USB stream buffer, KB   (default 512)
-*Set RTLSDRView$LeadMS 350    audio lead, ms          (default 350)
+*Set RTLSDRView$RateK 240     dongle sample rate, kSPS: 2400 (default) or 240
+*Set RTLSDRView$XferKB 96     read request = USB transfer size, KB
+                              (default: ~200 ms of data, 16-128 KB)
+*Set RTLSDRView$BufKB 512     DeviceFS stream buffer, KB (default 4x XferKB)
+*Set RTLSDRView$LeadMS 300    audio lead, ms (default 350)
+*Set RTLSDRView$FFTFrames 4   spectrum frames per display update (default 4)
+*Set RTLSDRView$PaceMS 0      0 = no pause after each tuner I2C transfer once
+                              running (default 10; 0 untested -- the pause is
+                              a leftover from the hang hunt)
+*Set RTLSDRView$Log <Obey$Dir>.Log1    write a per-second trace here on exit
 ```
 
-The driver sizes each USB transfer to the buffer's free space, so a bigger
-buffer means bigger bursts as well as more tolerance. If a very large
-`BufKB` delivers no data, the app falls back to a 128 KB buffer after 3
-seconds and says so.
+If the driver can't service the configured transfer size (no data for 3 s),
+the app falls back to 16 KB reads and a 128 KB buffer and says so.
+`RTLSDRView$Log` is the way to see what really happened: one row per second
+(bytes read, polls, where the time went, the audio lead's range, underruns),
+timestamped events (STREAM, each retune and how long it took, and a marker
+whenever the graph is clicked), and a histogram of desktop stalls. Examples
+from real runs are in [`docs/logs/`](docs/logs/).
