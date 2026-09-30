@@ -13,13 +13,21 @@
 
 #include "Rx.h"
 
-/* Tuning limits. The lower limit is the UI's: the tuner code already
-   up-converts below 28.8 MHz, but that path is untested (docs/ROADMAP.md,
-   Phase 2). */
-#define RCV_FREQ_MIN_HZ   24000000UL
+/* Tuning limits. Below 28.8 MHz the V4's up-converter is used (the tuner is
+   set 28.8 MHz higher); that path was written but had never been run on
+   hardware when the SSB modes were added (docs/ROADMAP.md, Phase 2). */
+#define RCV_FREQ_MIN_HZ   100000UL
 #define RCV_FREQ_MAX_HZ   1700000000UL
 
-#define RCV_NSTEPS        16
+#define RCV_NSTEPS        18
+
+/* SSB and CW tune the dongle this far below the dial frequency (so the
+   signal sits off the DC spike) and then move the dial about inside the
+   dongle's span without retuning, for as long as the dial stays between
+   the two limits above the dongle's frequency. */
+#define RCV_OFF_HOME_HZ   45000L
+#define RCV_OFF_MIN_HZ    10000L
+#define RCV_OFF_MAX_HZ    80000L
 
 typedef struct {
     unsigned long freq_hz;
@@ -58,7 +66,16 @@ int receiver_bw_inc(int mode);
 
 unsigned long receiver_clamp_freq(unsigned long hz);
 
-/* Formats a value for the window: "12.5k", "150k", "100 Hz"... */
+/* The frequency the dongle has to be tuned to for this dial frequency and
+   mode, given where it is tuned now (0 if it is not tuned yet). The dial
+   itself for the modes that sit in the centre; for USB, LSB and CW, the
+   current tuning again if the dial is inside the allowed window above it
+   (so moving the dial needs no retune), otherwise a new tuning that puts
+   the dial RCV_OFF_HOME_HZ above the dongle's frequency. */
+unsigned long receiver_hw_target(unsigned long dial, int mode,
+                                 unsigned long current_hw);
+
+/* Formats a value for the window: "12.5k", "150k", "400Hz"... */
 void receiver_fmt_hz(char *buf, int buflen, long hz);
 
 /* Pushes the state into the demodulator. apply_mode also resets its

@@ -16,7 +16,7 @@
 receiver_t rcv;
 
 const int receiver_steps[RCV_NSTEPS] = {
-    100, 500, 1000, 2500, 5000, 6250, 8330, 9000,
+    10, 50, 100, 500, 1000, 2500, 5000, 6250, 8330, 9000,
     10000, 12500, 25000, 50000, 100000, 200000, 500000, 1000000
 };
 
@@ -36,14 +36,20 @@ static int step_index_of(int hz)
 
 void receiver_defaults(void)
 {
+    int m, def;
+
     rcv.freq_hz = DEFAULT_FREQ_HZ;
     rcv.mode = RX_MODE_WFM;
-    rcv.bw_hz[RX_MODE_NFM] = 12500;
-    rcv.bw_hz[RX_MODE_WFM] = 150000;
-    rcv.bw_hz[RX_MODE_AM] = 10000;
+    for (m = 0; m < RX_NMODES; m++) {
+        rx_bw_limits(m, NULL, NULL, &def);
+        rcv.bw_hz[m] = (m == RX_MODE_WFM) ? 150000 : def;
+    }
     rcv.step_idx[RX_MODE_NFM] = step_index_of(12500);
     rcv.step_idx[RX_MODE_WFM] = step_index_of(100000);
     rcv.step_idx[RX_MODE_AM] = step_index_of(5000);
+    rcv.step_idx[RX_MODE_USB] = step_index_of(100);
+    rcv.step_idx[RX_MODE_LSB] = step_index_of(100);
+    rcv.step_idx[RX_MODE_CW] = step_index_of(50);
     rcv.squelch = 0;
     rcv.volume = 70;
     rcv.muted = 0;
@@ -58,6 +64,12 @@ const char *receiver_mode_name(int mode)
         return "WFM";
     case RX_MODE_AM:
         return "AM";
+    case RX_MODE_USB:
+        return "USB";
+    case RX_MODE_LSB:
+        return "LSB";
+    case RX_MODE_CW:
+        return "CW";
     }
     return "?";
 }
@@ -88,24 +100,18 @@ int receiver_bw_hz(void)
 
 int receiver_bw_min(int mode)
 {
-    switch (mode) {
-    case RX_MODE_NFM:
-        return 4000;
-    case RX_MODE_AM:
-        return 2000;
-    }
-    return 0;
+    int lo;
+
+    rx_bw_limits(mode, &lo, NULL, NULL);
+    return lo;
 }
 
 int receiver_bw_max(int mode)
 {
-    switch (mode) {
-    case RX_MODE_NFM:
-        return 40000;
-    case RX_MODE_AM:
-        return 20000;
-    }
-    return 0;
+    int hi;
+
+    rx_bw_limits(mode, NULL, &hi, NULL);
+    return hi;
 }
 
 int receiver_bw_inc(int mode)
@@ -115,6 +121,11 @@ int receiver_bw_inc(int mode)
         return 2500;
     case RX_MODE_AM:
         return 1000;
+    case RX_MODE_USB:
+    case RX_MODE_LSB:
+        return 100;
+    case RX_MODE_CW:
+        return 50;
     }
     return 0;
 }
@@ -128,6 +139,25 @@ unsigned long receiver_clamp_freq(unsigned long hz)
         return RCV_FREQ_MAX_HZ;
     }
     return hz;
+}
+
+unsigned long receiver_hw_target(unsigned long dial, int mode,
+                                 unsigned long current_hw)
+{
+    long d;
+
+    if (!RX_MODE_IS_SSB(mode)) {
+        return dial;
+    }
+    if (current_hw != 0UL) {
+        d = (long)dial - (long)current_hw;
+        if (d >= RCV_OFF_MIN_HZ && d <= RCV_OFF_MAX_HZ) {
+            return current_hw;
+        }
+    }
+    return (dial > (unsigned long)RCV_OFF_HOME_HZ)
+               ? dial - (unsigned long)RCV_OFF_HOME_HZ
+               : dial;
 }
 
 void receiver_fmt_hz(char *buf, int buflen, long hz)
@@ -146,7 +176,7 @@ void receiver_fmt_hz(char *buf, int buflen, long hz)
             sprintf(buf, "%ld.%02ldk", k10 / 100L, k10 % 100L);
         }
     } else {
-        sprintf(buf, "%ld", hz);
+        sprintf(buf, "%ldHz", hz);
     }
     buf[buflen - 1] = '\0';
 }
@@ -231,11 +261,12 @@ void receiver_load(void)
                 in_range(v, receiver_bw_min(i), receiver_bw_max(i))) {
                 rcv.bw_hz[i] = (int)v;
             }
-        } else if (strncmp(key, "step", 4) == 0 && key[4] >= '0' &&
-                   key[4] < '0' + RX_NMODES && key[5] == '\0') {
-            i = key[4] - '0';
-            if (in_range(v, 0, RCV_NSTEPS - 1)) {
-                rcv.step_idx[i] = (int)v;
+        } else if (strncmp(key, "stephz", 6) == 0 && key[6] >= '0' &&
+                   key[6] < '0' + RX_NMODES && key[7] == '\0') {
+            i = key[6] - '0';
+            if (in_range(v, (long)receiver_steps[0],
+                         (long)receiver_steps[RCV_NSTEPS - 1])) {
+                rcv.step_idx[i] = step_index_of((int)v);
             }
         }
     }
@@ -273,7 +304,7 @@ int receiver_save(void)
     fprintf(f, "muted %d\n", rcv.muted);
     for (i = 0; i < RX_NMODES; i++) {
         fprintf(f, "bw%d %d\n", i, rcv.bw_hz[i]);
-        fprintf(f, "step%d %d\n", i, rcv.step_idx[i]);
+        fprintf(f, "stephz%d %d\n", i, receiver_steps[rcv.step_idx[i]]);
     }
     fclose(f);
     return 0;

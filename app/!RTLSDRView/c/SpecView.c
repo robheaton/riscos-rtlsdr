@@ -73,12 +73,9 @@
                                stretched to fit */
 /* x of the left edge of bin i, in work-area units. */
 #define BIN_X(i)      (((i) * WORK_WIDTH) / NUM_BINS)
-#define WORK_HEIGHT   480                        /* OS units -- grown from 360 for the
-                                                     control panel, and from
-                                                     300 to fit a 6th
-                                                     diagnostic text line
-                                                     without crowding the
-                                                     bars below it */
+#define WORK_HEIGHT   (RESERVED_TOP + 200)       /* OS units: the control panel
+                                                     (Ui.h) and the readouts
+                                                     above a 200-unit spectrum */
 
 /* Space reserved at the TOP of the window for the diagnostic text
    lines and the gain/freq/demod control icons (create_gain_icons/
@@ -96,11 +93,13 @@
    Grown again to 180 to fit a second icon row (create_tone_icon) plus
    the demod readout text below it, now that row 1 (AGC through DEM)
    is full. */
-#define RESERVED_TOP    280   /* was 180 before the receiver control panel
-                                 (Ui.c) added three more rows, a level meter
-                                 and a wider readout */
-#define REDRAW_TOP      (-208) /* the part of the window that changes at the
-                                 display rate: meter, readout, spectrum */
+#define RESERVED_TOP    (80 - UI_PANEL_BOTTOM)  /* the control panel, then the
+                                 level meter and the readout line below it */
+#define METER_Y         (UI_PANEL_BOTTOM - 32)  /* bottom of the level meter */
+#define READOUT_Y       (UI_PANEL_BOTTOM - 52)  /* top of the readout text */
+#define REDRAW_TOP      (UI_PANEL_BOTTOM - 8)  /* the part of the window that
+                                 changes at the display rate: meter,
+                                 readout, spectrum */
 #define BAR_MAX_HEIGHT  (WORK_HEIGHT - RESERVED_TOP)
 
 /* Redraw throttle, separate from how aggressively Null_spectrum drains
@@ -1079,27 +1078,30 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
             }
         }
 
-        /* The channel the demodulator is listening to: two red lines
-           either side of the centre bin, bandwidth wide (the dongle is
-           tuned to the centre). */
+        /* The channel the demodulator is listening to: two red lines at
+           its edges, as rx_channel() places them on this spectrum (the dongle
+           is tuned to the centre bin; the SSB modes sit off to one side). */
         {
-            long bin_hz;
-            int bw, half_bins;
+            long bin_hz, centre, width, lo, hi;
+            int bl, bh;
 
             bin_hz = rate_hz_g / NUM_BINS;
-            bw = (rcv.mode == RX_MODE_WFM) ? 150000 : rcv.bw_hz[rcv.mode];
-            half_bins = (int)(((long)bw / 2L) / bin_hz);
-            if (half_bins < 1) {
-                half_bins = 1;
-            }
-            if (half_bins > NUM_BINS / 2 - 1) {
-                half_bins = NUM_BINS / 2 - 1;
-            }
+            rx_channel(&centre, &width);
+            lo = centre - width / 2L;
+            hi = centre + width / 2L;
+            bl = NUM_BINS / 2 + (int)((lo >= 0 ? lo + bin_hz / 2L
+                                               : lo - bin_hz / 2L) / bin_hz);
+            bh = NUM_BINS / 2 + (int)((hi >= 0 ? hi + bin_hz / 2L
+                                               : hi - bin_hz / 2L) / bin_hz);
             Wimp_SetColour((int)colour_RED);
-            GFX_RectangleFill(ox + BIN_X(NUM_BINS / 2 - half_bins),
-                               oy - WORK_HEIGHT, 1, BAR_MAX_HEIGHT);
-            GFX_RectangleFill(ox + BIN_X(NUM_BINS / 2 + half_bins),
-                               oy - WORK_HEIGHT, 1, BAR_MAX_HEIGHT);
+            if (bl >= 0 && bl < NUM_BINS) {
+                GFX_RectangleFill(ox + BIN_X(bl), oy - WORK_HEIGHT, 1,
+                                   BAR_MAX_HEIGHT);
+            }
+            if (bh != bl && bh >= 0 && bh < NUM_BINS) {
+                GFX_RectangleFill(ox + BIN_X(bh), oy - WORK_HEIGHT, 1,
+                                   BAR_MAX_HEIGHT);
+            }
             Wimp_SetColour((int)colour_BLACK);
         }
 
@@ -1144,11 +1146,11 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                 w = full_w;
             }
             Wimp_SetColour((int)colour_GREY1);
-            GFX_RectangleFill(ox + 8, oy - 232, full_w, 16);
+            GFX_RectangleFill(ox + 8, oy + METER_Y, full_w, 16);
             if (w > 0) {
                 Wimp_SetColour(squelch_open_g ? (int)colour_GREEN
                                               : (int)colour_RED);
-                GFX_RectangleFill(ox + 8, oy - 232, w, 16);
+                GFX_RectangleFill(ox + 8, oy + METER_Y, w, 16);
             }
             Wimp_SetColour((int)colour_BLACK);
         }
@@ -1165,7 +1167,7 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
             unsigned int gap_ms;
 
             trace_recent(&rate_ksps, &gap_ms);
-            if (rcv.mode == RX_MODE_AM) {
+            if (rcv.mode == RX_MODE_AM || RX_MODE_IS_SSB(rcv.mode)) {
                 sprintf(line2, "%.0f dB r=%.0fk g%u G%u u%d",
                         level_db10_g / 10.0, rate_ksps, gap_ms,
                         trace_gap_all_ms(), audio_stream_underruns());
@@ -1175,7 +1177,7 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                         trace_gap_all_ms(), audio_stream_underruns());
             }
             GFX_VDU(5);
-            GFX_Move(ox + 4, oy - 252);
+            GFX_Move(ox + 4, oy + READOUT_Y);
             GFX_Write0(line2);
             GFX_VDU(4);
         }
@@ -1243,27 +1245,39 @@ static void discard_buffered_stream_data(void)
     }
 }
 
-/* Retunes the dongle to new_freq (clamped to the tuning limits). Returns
-   non-zero if the tuner locked, in which case the new frequency is
-   committed everywhere (tuned_freq_hz_g and rcv.freq_hz); on a failed lock
-   nothing changes, so the displayed frequency never disagrees with what
-   the tuner is really doing. Also the callback the control panel uses. */
-static int app_tune(unsigned long new_freq)
+/* Tunes to a dial frequency (clamped to the tuning limits). Returns non-zero
+   on success, in which case rcv.freq_hz is the new dial frequency and
+   tuned_freq_hz_g is the frequency the dongle is really on; on a failed lock
+   nothing changes, so the displayed frequency never disagrees with what the
+   tuner is really doing. Also the callback the control panel uses.
+
+   The SSB and CW modes keep the dongle a little below the dial frequency
+   (off its DC spike) and move the dial about inside the span by shifting
+   the receiver's oscillator: no retune, no audio gap, which is what makes
+   tuning in 10-100 Hz steps usable. A retune happens only when the dial
+   leaves that window, or when a change of mode changes where the dongle
+   should be (see receiver_hw_target()). */
+static int app_tune(unsigned long dial)
 {
+    unsigned long hw;
     unsigned int retune_t0;
     char evmsg[TRACE_EVENT_TEXT];
     int ok;
 
-    new_freq = receiver_clamp_freq(new_freq);
-    if (new_freq == tuned_freq_hz_g) {
+    dial = receiver_clamp_freq(dial);
+    hw = receiver_hw_target(dial, rcv.mode, tuned_freq_hz_g);
+    if (hw == tuned_freq_hz_g) {
+        rcv.freq_hz = dial;
+        rx_set_offset((long)dial - (long)hw);
         return 1;
     }
     ok = 0;
     rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x18, 1); /* I2C repeater on */
     retune_t0 = Time_Monotonic();
-    if (r82xx_set_freq(&tuner_g, new_freq) == 0 && tuner_g.has_lock) {
-        tuned_freq_hz_g = new_freq;
-        rcv.freq_hz = new_freq;
+    if (r82xx_set_freq(&tuner_g, hw) == 0 && tuner_g.has_lock) {
+        tuned_freq_hz_g = hw;
+        rcv.freq_hz = dial;
+        rx_set_offset((long)dial - (long)hw);
         /* Throw away the stale, pre-retune samples still sitting in the
            DeviceFS buffer, and restart the demodulator so its filters
            don't blend the two frequencies.
@@ -1284,7 +1298,7 @@ static int app_tune(unsigned long new_freq)
         ok = 1;
     }
     rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x10, 1); /* I2C repeater off */
-    sprintf(evmsg, "retune to %lu Hz took %u cs%s", new_freq,
+    sprintf(evmsg, "retune to %lu Hz (dial %lu) took %u cs%s", hw, dial,
             Time_Monotonic() - retune_t0, ok ? "" : " FAILED");
     trace_event(Time_Monotonic(), evmsg);
     return ok;
@@ -1322,9 +1336,9 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
 
         step = (unsigned long)receiver_step_hz() * (adjust ? 10UL : 1UL);
         if (icon == icon_frequp_g) {
-            hz = tuned_freq_hz_g + step;
+            hz = rcv.freq_hz + step;
         } else {
-            hz = (tuned_freq_hz_g > step) ? tuned_freq_hz_g - step : 0UL;
+            hz = (rcv.freq_hz > step) ? rcv.freq_hz - step : 0UL;
         }
         app_tune(hz);
         ui_refresh();
@@ -1548,7 +1562,7 @@ int main(void)
        saved). The frequency is applied by the tuner set-up below; mode,
        bandwidth, squelch and volume once the demodulator exists. */
     receiver_load();
-    tuned_freq_hz_g = rcv.freq_hz;
+    tuned_freq_hz_g = receiver_hw_target(rcv.freq_hz, rcv.mode, 0UL);
 
     /* Run-time settings (see the comment above SAFE_BUF_KB). */
     rate_k = env_int("RTLSDRView$RateK", 240, 240, 2880);
@@ -1792,6 +1806,8 @@ int main(void)
     rx_init((stream_ok_g && audio_stream_rate() > 0)
                     ? audio_stream_rate() : 48000, rate_hz_g);
     receiver_apply_mode();
+    rx_set_mirror(env_int("RTLSDRView$Mirror", 0, 0, 1));
+    rx_set_offset((long)rcv.freq_hz - (long)tuned_freq_hz_g);
 
     sprintf(cfg, "rate=%ld xfer_kb=%d buf_kb=%d burst_ms=%d lead_ms=%d "
                  "fft_frames=%d fft_stride=%d budget_cs=%d audio_rate=%d",

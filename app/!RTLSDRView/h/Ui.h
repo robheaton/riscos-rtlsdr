@@ -23,6 +23,7 @@ enum {
     UI_FDN, UI_FUP,
     UI_N_LEGACY,
     UI_MODE_NFM = UI_N_LEGACY, UI_MODE_WFM, UI_MODE_AM,
+    UI_MODE_USB, UI_MODE_LSB, UI_MODE_CW,      /* in RX_MODE_... order */
     UI_FREQ, UI_FREQ_UNIT,
     UI_STEP,
     UI_BW_DN, UI_BW_VAL, UI_BW_UP,
@@ -32,7 +33,7 @@ enum {
 };
 
 /* Work-area y of the bottom of the last row of controls (negative). */
-#define UI_PANEL_BOTTOM  (-200)
+#define UI_PANEL_BOTTOM  (-240)
 
 /* Creates all the controls in win. tune(hz) must retune the dongle and
    return non-zero if it locked (having updated rcv.freq_hz itself). */

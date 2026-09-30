@@ -1,6 +1,7 @@
 # RTLSDRView roadmap: from spectrum-and-audio demo to a usable SDR receiver
 
-Status: decisions taken 2026-09-30 (see section 1); Phase 1 under way. It is
+Status: decisions taken 2026-09-30 (see section 1); Phase 1 done and tagged
+`v0.5-nfm-am-ui`; Phase 2 (USB, LSB, CW and the HF path) first build written. It is
 meant to be cut up, reordered and argued with.
 
 **Why now.** The hard part is done: the USB pipe is lossless, real-time FM
@@ -250,6 +251,47 @@ adjusting by ear on real signals.
   up-converter (that code exists but has never been exercised).
 * Persist settings per mode.
 
+**Status (2026-09-30): USB, LSB and CW built, host-tested, on the NAS; not
+yet run on the Pi. DSB and the noise blanker are not done.** How it works:
+
+* The dongle is tuned 45 kHz *below* the dial frequency in these modes
+  (`receiver_hw_target()`), so the signal sits off the DC spike. Inside
+  `Rx.c` a 2048-entry sine-table oscillator at 240 kSPS shifts the wanted
+  passband to 0 Hz (USB: 300 Hz..300 Hz + bandwidth above the carrier; LSB:
+  the mirror image; CW: centred on the carrier), then the usual /5 stage,
+  a new /4 stage to 12 kSPS, and a real low-pass FIR of up to 511 taps
+  (transition 300 Hz for SSB, 150-160 Hz for narrow CW: Blackman, at 12
+  kSPS). A second oscillator at 12 kSPS shifts the result up to the audio
+  centre (USB/LSB: the middle of the passband; CW: 700 Hz pitch) and only the
+  real part is kept, which is what removes the unwanted sideband. Then an
+  AGC (fast attack ~1.3 ms, decay ~340 ms SSB / ~170 ms CW, gain limited to
+  ~36 dB so empty channels do not roar), a x4 polyphase interpolator back to
+  48 kSPS, and the common squelch/volume/resampler stage.
+* **Tuning is instant.** The dial moves inside the span (10..80 kHz above
+  the dongle's frequency) by changing the first oscillator's rate: no
+  retune, no audio gap, phase continuous. A retune only happens when the
+  dial leaves that window or the mode changes between "centred" (NFM, WFM,
+  AM) and "offset" (USB, LSB, CW). Step sizes now start at 10 Hz;
+  defaults USB/LSB 100 Hz, CW 50 Hz. Bandwidths: USB/LSB 1-4 kHz (2.4
+  default), CW 100-1000 Hz (400 default, see the limits in the source).
+* The red markers on the spectrum are now placed by `rx_channel()`, so they
+  show the real passband, off to one side of the centre in SSB/CW.
+* The HF path: the lower tuning limit is now 100 kHz (was 24 MHz), using the
+  up-converter code in `R82XX.c`. Whether the V4 actually delivers the right
+  sideband and signal strength below 28.8 MHz is the thing to check first on
+  the Pi. If USB and LSB sound swapped there (or everywhere), set the
+  environment variable `RTLSDRView$Mirror` to 1: it flips the I/Q sense in
+  the SSB/CW modes and the marker positions.
+* Host results (`Rx.c` built with 32-bit `long` and overflow trapping, 240
+  kSPS and 2.4 MSPS input): USB/LSB opposite sideband 80+ dB down, tones
+  above/below the passband 70+ dB down, CW neighbours 600 Hz away 74+ dB
+  down, AGC output within 0.1 dB from input amplitude 12 to 100, 100 Hz dial
+  moves produce no click, output bit-identical for any input chunking,
+  NFM/AM results unchanged.
+* Untested on real signals: how the AGC sounds on speech, the squelch
+  thresholds in the SSB modes (level based, -70..-10 dBFS), and the DC-spike
+  avoidance in practice.
+
 ### Phase 3 - drive it well
 
 * Bookmarks (list in Choices, Bookmarks menu), a proper step list, gain in
@@ -301,5 +343,7 @@ adjusting by ear on real signals.
 | 2026-09-30 | Bias-T stays on the roadmap, deferred |
 | 2026-09-30 | Personal tool for now: no packaging/manual/help work yet |
 
-Open: lower the UI's 24 MHz limit for HF (Phase 2); whether the waterfall
-should wait for a VFP answer.
+| 2026-09-30 | SSB/CW by shifting the passband to 0 Hz and using a real filter (not a phasing filter or FFT), tuned off-centre so fine tuning needs no retune; DSB left for later |
+
+Open: prove the HF path on hardware (Phase 2); whether the waterfall should
+wait for a VFP answer; DSB and a noise blanker.

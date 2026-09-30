@@ -61,23 +61,27 @@ static const ui_item ui_items[] = {
     { UI_MODE_NFM,  K_BUTTON,      8,  92, 1, "NFM" },
     { UI_MODE_WFM,  K_BUTTON,    100, 184, 1, "WFM" },
     { UI_MODE_AM,   K_BUTTON,    192, 256, 1, "AM" },
-    { UI_FREQ,      K_FIELD,     272, 456, 1, "97.400000" },
-    { UI_FREQ_UNIT, K_LABEL,     460, 524, 1, "MHz" },
-    { UI_FDN,       K_BUTTON,    532, 580, 1, "F-" },
-    { UI_FUP,       K_BUTTON,    584, 632, 1, "F+" },
+    { UI_MODE_USB,  K_BUTTON,    264, 348, 1, "USB" },
+    { UI_MODE_LSB,  K_BUTTON,    356, 440, 1, "LSB" },
+    { UI_MODE_CW,   K_BUTTON,    448, 512, 1, "CW" },
 
-    { UI_STEP,      K_BUTTON_IND,  8, 184, 2, "Step 100k" },
-    { UI_BW_DN,     K_BUTTON,    200, 240, 2, "-" },
-    { UI_BW_VAL,    K_VALUE,     240, 384, 2, "BW 150k" },
-    { UI_BW_UP,     K_BUTTON,    384, 424, 2, "+" },
+    { UI_FREQ,      K_FIELD,       8, 192, 2, "97.400000" },
+    { UI_FREQ_UNIT, K_LABEL,     196, 260, 2, "MHz" },
+    { UI_FDN,       K_BUTTON,    268, 316, 2, "F-" },
+    { UI_FUP,       K_BUTTON,    324, 372, 2, "F+" },
 
-    { UI_SQ_DN,     K_BUTTON,      8,  48, 3, "-" },
-    { UI_SQ_VAL,    K_VALUE,      48, 176, 3, "Sq off" },
-    { UI_SQ_UP,     K_BUTTON,    176, 216, 3, "+" },
-    { UI_VOL_DN,    K_BUTTON,    240, 280, 3, "-" },
-    { UI_VOL_VAL,   K_VALUE,     280, 424, 3, "Vol 100" },
-    { UI_VOL_UP,    K_BUTTON,    424, 464, 3, "+" },
-    { UI_MUTE,      K_BUTTON,    480, 576, 3, "Mute" }
+    { UI_STEP,      K_BUTTON_IND,  8, 184, 3, "Step 100k" },
+    { UI_BW_DN,     K_BUTTON,    200, 240, 3, "-" },
+    { UI_BW_VAL,    K_VALUE,     240, 384, 3, "BW 150k" },
+    { UI_BW_UP,     K_BUTTON,    384, 424, 3, "+" },
+
+    { UI_SQ_DN,     K_BUTTON,      8,  48, 4, "-" },
+    { UI_SQ_VAL,    K_VALUE,      48, 176, 4, "Sq off" },
+    { UI_SQ_UP,     K_BUTTON,    176, 216, 4, "+" },
+    { UI_VOL_DN,    K_BUTTON,    240, 280, 4, "-" },
+    { UI_VOL_VAL,   K_VALUE,     280, 424, 4, "Vol 100" },
+    { UI_VOL_UP,    K_BUTTON,    424, 464, 4, "+" },
+    { UI_MUTE,      K_BUTTON,    480, 576, 4, "Mute" }
 };
 
 #define N_ITEMS ((int)(sizeof(ui_items) / sizeof(ui_items[0])))
@@ -202,11 +206,11 @@ void ui_refresh(void)
 {
     char b[TXT_LEN];
     char v[12];
-    int wfm;
+    int wfm, m;
 
-    set_selected(UI_MODE_NFM, rcv.mode == RX_MODE_NFM);
-    set_selected(UI_MODE_WFM, rcv.mode == RX_MODE_WFM);
-    set_selected(UI_MODE_AM, rcv.mode == RX_MODE_AM);
+    for (m = 0; m < RX_NMODES; m++) {
+        set_selected(UI_MODE_NFM + m, rcv.mode == m);
+    }
 
     refresh_freq_text(0);
 
@@ -268,6 +272,11 @@ static void set_mode(int m)
     }
     rcv.mode = m;
     receiver_apply_mode();
+    /* The SSB modes want the dongle tuned a little off the dial frequency and
+       the others do not, so a change between the two kinds retunes. */
+    if (tune_g != NULL) {
+        tune_g(rcv.freq_hz);
+    }
     ui_refresh();
 }
 
@@ -327,13 +336,12 @@ int ui_click(icon_handle icon, int select, int adjust)
 
     switch (id) {
     case UI_MODE_NFM:
-        set_mode(RX_MODE_NFM);
-        break;
     case UI_MODE_WFM:
-        set_mode(RX_MODE_WFM);
-        break;
     case UI_MODE_AM:
-        set_mode(RX_MODE_AM);
+    case UI_MODE_USB:
+    case UI_MODE_LSB:
+    case UI_MODE_CW:
+        set_mode(id - UI_MODE_NFM);
         break;
     case UI_STEP:
         receiver_step_next(fine ? -1 : 1);
