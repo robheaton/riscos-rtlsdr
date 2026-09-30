@@ -2517,10 +2517,38 @@ The trade is latency: steady-state the audio lead swings between 500 and
 air-to-speaker delay is roughly 0.7-1 s. A retune now costs ~50 ms of
 blocking plus ~200 ms of lead that is rebuilt with silence.
 
+### The T5 and T3 logs
+
+**T5** ([log](logs/2026-09-30-T5-240k-192K-4min.txt)) -- 240 kSPS, 192 KB reads,
+1 MB buffer, 500 ms lead, run by the user for 252 s including window
+dragging at the start: **zero underruns, zero lost data** (every second is
+two or three whole 192 KB blocks; 479,724 B/s averaged over the full
+seconds against a nominal 480,000), steady audio lead of 486-498 ms just
+before each burst and 885-898 ms just after. The window drags made the
+worst desktop gaps of the whole run, 140-240 ms (seconds 3-7; one more at
+second 23), and pulled the lead's minimum down to 365 ms -- nowhere near the
+30 ms that counts as an underrun. Over the 252 s the desktop held the app
+up 12 times for 20-50 ms, 21 times for 50-100 ms and 8 times for
+100-250 ms, never longer. CPU 5%: demodulator ~2.5%, FFT ~2.6%, USB reads
+below the clock's resolution. The latency is the price: every sample waits
+in the ring for the lead plus one burst (500 + 409 ms), i.e. ~0.9 s from
+air to speaker.
+
+**T3** ([log](logs/2026-09-30-T3-2400k-128K.txt)) -- 2.4 MSPS with 128 KB
+reads: the big-read fix works at this rate too (4.72-4.85 MB/s at idle,
+98-101% of nominal, where 16 KB reads lost 4-16%), but with only ~27 ms per
+transfer a 90-270 ms disturbance halved the throughput for four seconds
+(2.2 MB/s) -- data lost, the lead eroded (lost data cannot be made up, so
+the lead never recovers) -- and gave five underruns. So the wide-spectrum
+mode is usable for watching, not for uninterrupted listening; the 240 kSPS
+mode is the audio mode. (Both logs were produced by the previous build --
+the header has no `pace_ms` -- from a local copy on the Pi rather than the
+NAS.)
+
 ### Status
 
-Pending: `Log5` (the `T5` profile's own trace -- written when its window is
-closed) to see what stalls the user's desktop actually produces against it;
-`T3` (2.4 MSPS, 128 KB reads). Not attempted: adapting the lead to the
-stalls actually seen (low latency in quiet periods, more lead after a long
-stall); squelch, volume control, stereo/RDS.
+Audio is in good shape: lossless USB, no underruns in a four-minute session
+on the defaults. Not attempted: adapting the lead to the stalls actually
+seen (low latency in quiet periods, more lead after a long stall), which is
+the obvious way to claw back some of the 0.9 s; squelch, volume control,
+stereo/RDS.

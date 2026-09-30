@@ -1,0 +1,32 @@
+# RTLSDRView trace v2
+# rate=2400000 xfer_kb=128 buf_kb=512 burst_ms=27 lead_ms=350 fft_frames=4 fft_stride=6 budget_cs=2 audio_rate=48000 poll_idle_cs=0
+# columns (one row per second): sec bytes reads empty ticks tick_cs usb_cs dsp_cs fft_cs disp_cs fft_frames fgap_max_cs maxread backlog ahead_min_ms ahead_max_ms dropped_ms feed_gap_ms underruns
+# (cs = centiseconds; fgap = longest time the rest of the desktop held the CPU between two polls of this app; ahead = how far the audio write head ran ahead of the estimated play position; -999 = no audio data that second)
+0 4718592 36 65535 65535 20 15 0 5 0 21 0 131072 131072 -999 -999 -999 0 0
+1 4718592 36 65535 65535 26 23 0 3 0 20 0 131072 131072 -999 -999 -999 0 0
+2 4849664 37 65535 65535 20 13 1 6 0 20 0 131072 131072 349 383 0 30 0
+3 4849664 37 65535 65535 31 17 2 12 0 20 0 131072 131072 348 384 0 30 0
+4 4718592 36 65535 65535 27 14 4 9 0 20 0 131072 131072 347 383 0 30 0
+5 4849664 37 64339 64339 30 19 3 8 0 20 3 131072 131072 339 382 0 30 0
+6 2228224 17 1419 1421 17 2 6 7 2 12 27 131072 262144 22 382 0 270 1
+7 2228224 17 322 323 6 0 1 5 0 16 23 131072 262144 19 377 0 230 2
+8 2097152 16 358 361 18 2 3 11 2 12 24 131072 262144 -147 368 0 240 1
+9 4325376 33 23046 23046 15 6 4 4 1 20 9 131072 262144 1 374 0 100 1
+10 4849664 37 65535 65535 27 15 5 7 0 20 0 131072 131072 322 359 0 30 0
+11 4718592 36 65535 65535 26 16 3 7 0 20 0 131072 131072 321 358 0 30 0
+12 4456448 34 65535 65535 27 19 3 5 0 19 0 131072 131072 -999 -999 -999 30 0
+# events (time in seconds since the first poll)
+E 0.00 started
+E 0.03 first data
+E 2.81 STREAM on
+E 12.91 exit
+# foreign-gap histogram: bucket count total_ms
+H <10ms 693223 0
+H 10-20ms 0 0
+H 20-50ms 9 240
+H 50-100ms 8 550
+H 100-250ms 11 1700
+H 250-500ms 1 270
+H 0.5-1s 0 0
+H >1s 0 0
+# totals: seconds=13 bytes=53608448 polls=693252 underruns=5 longest_foreign_gap_ms=270

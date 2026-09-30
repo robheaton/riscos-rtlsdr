@@ -55,9 +55,12 @@ milliseconds in its ring. See `docs/PLAN.md` "milestone 7" for the evidence.
   cooperative multitasking; the lead is `RTLSDRView$LeadMS`, default 500 ms
   -- more lead, more latency). The defaults (240 kSPS, 192 KB reads, 500 ms
   lead) are the profile that held up best against real desktop use
-  (window dragging, NAS folder windows); the price is ~0.7-1 s between the
-  air and the speaker, so tuning feedback is not instant. Stalls of 1 s or
-  more, which happen occasionally, still cause a pause with a shorter lead.
+  (window dragging, NAS folder windows): a four-minute session on them,
+  dragging windows around, had no underruns and lost no data (worst desktop
+  gap 240 ms). The price is ~0.9 s between the air and the speaker, so
+  tuning feedback is not instant. A stall longer than the lead, which does
+  happen occasionally (one log caught three of 1-1.3 s), is still an
+  audible pause.
 - The default 240 kSPS mode shows a 240 kHz-wide spectrum (one station);
   `RTLSDRView$RateK 2400` gives the whole 2.4 MHz, but a transfer is then
   only ~27 ms of data, so that mode cannot ride out stalls.
