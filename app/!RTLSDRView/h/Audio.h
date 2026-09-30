@@ -88,9 +88,27 @@ int audio_stream_rate(void);
    the next re-sync). Clamped to a sane range. Default 350. */
 void audio_stream_set_lead_ms(int ms);
 
+/* How long one burst of input covers, in milliseconds (0 = unknown).
+   The USB driver delivers samples in whole-transfer bursts, so the ring
+   is allowed to run further ahead of the target by (twice) this much
+   before excess audio is dropped. */
+void audio_stream_set_burst_ms(int ms);
+
 /* Number of genuine underruns (re-syncs after playback had already
    started) since audio_stream_init(). Each one is an audible pause. */
 int audio_stream_underruns(void);
+
+/* Statistics since the previous call (for the run-time trace, Trace.c),
+   then resets them. Fills: the lowest and highest lead (write head
+   minus estimated play head) seen, milliseconds of audio dropped
+   because the ring was already full enough, underruns, and the longest
+   wall-clock gap between two audio_stream_feed() calls. Returns 0 if
+   audio_stream_feed() hasn't been called (successfully synced) since
+   the last call, in which case only underruns/feed_gap_ms are
+   meaningful. */
+int audio_stream_take_interval(int *ahead_min_ms, int *ahead_max_ms,
+                               int *dropped_ms, int *underruns,
+                               int *feed_gap_ms);
 
 /* Releases the streaming buffer specifically (stops playback if
    running, releases its sample slot and RMA buffer) -- does NOT touch

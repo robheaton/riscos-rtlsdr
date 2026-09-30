@@ -64,6 +64,14 @@ int rtlsdr_set_if_freq(const char *dev, unsigned long freq);
 int os_find_open(const char *path);
 void os_find_close(int handle);
 int os_gbpb_read4(int handle, unsigned char *buf, int len);
+/* Silences os_gbpb_read4()'s stderr messages (for Wimp apps), and returns
+   the text of its most recent error. */
+void os_set_quiet(int quiet);
+const char *os_last_error(void);
+
+/* RMA block claim/release (OS_Module 6/7); NULL on failure. */
+unsigned char *os_rma_claim(int size);
+void os_rma_free(unsigned char *p);
 int os_args_set_nonblocking(int handle, int enable);
 
 #endif /* DRIVER_H */

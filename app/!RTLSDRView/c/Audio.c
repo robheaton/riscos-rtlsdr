@@ -79,8 +79,23 @@ static int playing_g = 0;
                                       estimate, since real underruns are
                                       what matter */
 static int stream_lead_target_ms_g = STREAM_LEAD_DEFAULT_MS;
+static int stream_burst_ms_g = 0;    /* how long a burst of input covers */
 static int stream_synced_g = 0;      /* has the first sync happened yet? */
 static int stream_underruns_g = 0;
+
+/* Interval statistics for the run-time trace (see Trace.c): the range the
+   lead swung through, how much audio had to be dropped because the ring
+   was already full enough, underruns, and the longest wall-clock gap
+   between two calls to audio_stream_feed() -- reset by
+   audio_stream_take_interval(). */
+static int iv_have_g = 0;
+static long iv_ahead_min_g = 0;
+static long iv_ahead_max_g = 0;
+static unsigned long iv_dropped_g = 0;
+static int iv_underruns_g = 0;
+static unsigned int iv_feed_gap_max_cs_g = 0;
+static unsigned int last_feed_cs_g = 0;
+static int last_feed_set_g = 0;
 
 static short *stream_buf_g = 0;
 static int stream_capacity_g = 0;  /* samples */
@@ -102,7 +117,18 @@ static int stream_rate_g = 0;      /* Hz */
    however far behind production ever falls. */
 static unsigned long stream_total_written_g = 0;
 static int stream_playing_g = 0;
-static unsigned int stream_start_time_g = 0; /* centiseconds */
+
+/* Estimated play-head position, in samples since playback started,
+   advanced incrementally from the centisecond clock. (It used to be
+   computed as elapsed_cs * rate / 100 in one 32-bit multiply, which
+   wraps after ~15 minutes at 48 kHz and would have wrecked the ring
+   logic mid-session.) played_frac_g carries the sub-sample remainder so
+   the estimate doesn't drift. */
+static unsigned long stream_played_g = 0;
+static unsigned long stream_played_frac_g = 0;
+static unsigned int stream_last_cs_g = 0;    /* clock at the last update */
+static unsigned long stream_cleared_g = 0;   /* ring zeroed up to here (total
+                                                sample index, behind play) */
 
 static unsigned int monotonic_cs(void)
 {
@@ -416,7 +442,15 @@ void audio_stream_play(int play)
            from a previous run audible before real data catches up. */
         stream_total_written_g = 0;
         stream_synced_g = 0;
-        stream_start_time_g = monotonic_cs();
+        stream_played_g = 0;
+        stream_played_frac_g = 0;
+        stream_cleared_g = 0;
+        stream_last_cs_g = monotonic_cs();
+        last_feed_set_g = 0;
+        iv_have_g = 0;
+        iv_dropped_g = 0;
+        iv_underruns_g = 0;
+        iv_feed_gap_max_cs_g = 0;
 
         regs.r[0] = fx_handle_g;
         regs.r[1] = 0;
@@ -437,11 +471,14 @@ void audio_stream_play(int play)
 
 int audio_stream_feed(const short *samples, int n)
 {
-    unsigned int elapsed_cs;
+    unsigned int now_cs;
+    unsigned int delta_cs;
     unsigned long played;      /* samples the play head has consumed (est.) */
+    unsigned long limit;
     long ahead;                /* write head minus play head, in samples */
-    long lead_min, lead_target, lead_max;
+    long lead_min, lead_target, lead_max, slack;
     long room;
+    long margin;
     unsigned long p;
     int written;
     int pos;
@@ -454,25 +491,71 @@ int audio_stream_feed(const short *samples, int n)
     /* Estimated play-head position: TimPlayer's real position isn't
        queryable, so it's derived from elapsed wall-clock time since
        playback started, assuming a steady consumption of stream_rate_g
-       samples per second. elapsed_cs wraps like OS_ReadMonotonicTime
-       itself; unsigned subtraction handles either side of a wrap. */
-    elapsed_cs = monotonic_cs() - stream_start_time_g;
-    played = ((unsigned long)elapsed_cs * (unsigned long)stream_rate_g) /
-             100UL;
+       samples per second. The clock is advanced incrementally (see
+       stream_played_g); unsigned subtraction handles a wrap of the
+       centisecond counter. */
+    now_cs = monotonic_cs();
+    delta_cs = now_cs - stream_last_cs_g;
+    stream_last_cs_g = now_cs;
+    stream_played_frac_g += (unsigned long)delta_cs *
+                            (unsigned long)stream_rate_g;
+    stream_played_g += stream_played_frac_g / 100UL;
+    stream_played_frac_g %= 100UL;
+    played = stream_played_g;
+
+    if (last_feed_set_g) {
+        unsigned int gap_cs;
+        gap_cs = now_cs - last_feed_cs_g;
+        if (gap_cs > iv_feed_gap_max_cs_g) {
+            iv_feed_gap_max_cs_g = gap_cs;
+        }
+    }
+    last_feed_cs_g = now_cs;
+    last_feed_set_g = 1;
+
+    /* Silence everything the play head has already passed (keeping a
+       margin, since the play position is only an estimate). The ring
+       loops: if the write head ever falls behind and the play head runs
+       off the end of the audio, it would otherwise go on to replay
+       whatever was written a whole lap ago -- audible as old audio
+       coming back during a stall instead of plain silence. */
+    margin = (long)stream_rate_g / 4;
+    if (played > (unsigned long)margin) {
+        limit = played - (unsigned long)margin;
+        if ((long)(limit - stream_cleared_g) > (long)stream_capacity_g) {
+            stream_cleared_g = limit - (unsigned long)stream_capacity_g;
+        }
+        while ((long)(limit - stream_cleared_g) > 0) {
+            stream_buf_g[(int)(stream_cleared_g %
+                               (unsigned long)stream_capacity_g)] = 0;
+            stream_cleared_g++;
+        }
+    }
 
     lead_min = (long)(((long)stream_rate_g * STREAM_LEAD_MIN_MS) / 1000);
     lead_target = (long)(((long)stream_rate_g * stream_lead_target_ms_g) /
                          1000);
-    lead_max = lead_target + (long)(((long)stream_rate_g * 400L) / 1000);
+    /* Room above the target for a burst of input (input arrives in
+       chunks a burst long) plus some slack. */
+    slack = 400;
+    if ((long)stream_burst_ms_g * 2 > slack) {
+        slack = (long)stream_burst_ms_g * 2;
+    }
+    lead_max = lead_target + (long)(((long)stream_rate_g * slack) / 1000);
     if (lead_max > (long)stream_capacity_g - lead_target / 8) {
         lead_max = (long)stream_capacity_g - lead_target / 8;
     }
 
     ahead = (long)(stream_total_written_g - played);
+    if (stream_synced_g && (!iv_have_g || ahead < iv_ahead_min_g)) {
+        iv_ahead_min_g = ahead;
+        iv_have_g = 1;
+    }
 
     if (ahead < lead_min) {
         if (stream_synced_g) {
             stream_underruns_g++;
+            iv_underruns_g++;
         }
         stream_synced_g = 1;
         /* Start-up, or an underrun: the play head has caught up with (or
@@ -518,7 +601,57 @@ int audio_stream_feed(const short *samples, int n)
     }
     stream_total_written_g += (unsigned long)written;
 
+    iv_dropped_g += (unsigned long)(n - written);
+    if (stream_synced_g) {
+        long after;
+        after = ahead + (long)written;
+        if (!iv_have_g) {
+            iv_ahead_min_g = ahead;
+            iv_ahead_max_g = after;
+            iv_have_g = 1;
+        } else if (after > iv_ahead_max_g) {
+            iv_ahead_max_g = after;
+        }
+    }
+
     return written;
+}
+
+int audio_stream_take_interval(int *ahead_min_ms, int *ahead_max_ms,
+                               int *dropped_ms, int *underruns,
+                               int *feed_gap_ms)
+{
+    if (!iv_have_g || stream_rate_g <= 0) {
+        *ahead_min_ms = 0;
+        *ahead_max_ms = 0;
+        *dropped_ms = 0;
+        *underruns = iv_underruns_g;
+        *feed_gap_ms = (int)(iv_feed_gap_max_cs_g * 10);
+        iv_underruns_g = 0;
+        iv_feed_gap_max_cs_g = 0;
+        return 0;
+    }
+    *ahead_min_ms = (int)((iv_ahead_min_g * 1000L) / (long)stream_rate_g);
+    *ahead_max_ms = (int)((iv_ahead_max_g * 1000L) / (long)stream_rate_g);
+    *dropped_ms = (int)(((long)iv_dropped_g * 1000L) / (long)stream_rate_g);
+    *underruns = iv_underruns_g;
+    *feed_gap_ms = (int)(iv_feed_gap_max_cs_g * 10);
+    iv_have_g = 0;
+    iv_dropped_g = 0;
+    iv_underruns_g = 0;
+    iv_feed_gap_max_cs_g = 0;
+    return 1;
+}
+
+void audio_stream_set_burst_ms(int ms)
+{
+    if (ms < 0) {
+        ms = 0;
+    }
+    if (ms > 1000) {
+        ms = 1000;
+    }
+    stream_burst_ms_g = ms;
 }
 
 void audio_stream_set_lead_ms(int ms)

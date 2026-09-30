@@ -595,6 +595,53 @@ void os_find_close(int handle)
     _kernel_swi(SWI_OS_FIND, &regs, &regs);
 }
 
+#define SWI_OS_Module 0x1E
+
+/* Claims/releases a block of the RMA (OS_Module 6 / 7). Used for buffers
+   too big to want in a Wimp task's small application slot (the big USB
+   read buffer). Returns NULL if the claim fails. */
+unsigned char *os_rma_claim(int size)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *err;
+
+    regs.r[0] = 6;
+    regs.r[3] = size;
+    err = _kernel_swi(SWI_OS_Module, &regs, &regs);
+    if (err != NULL) {
+        return NULL;
+    }
+    return (unsigned char *)regs.r[2];
+}
+
+void os_rma_free(unsigned char *p)
+{
+    _kernel_swi_regs regs;
+
+    if (p == NULL) {
+        return;
+    }
+    regs.r[0] = 7;
+    regs.r[2] = (int)p;
+    _kernel_swi(SWI_OS_Module, &regs, &regs);
+}
+
+/* The Wimp app (!RTLSDRView) must not write to stderr -- there is no text
+   window for it to land in -- so it switches the messages off and reads
+   the last error text back instead. */
+static int os_quiet_g = 0;
+static char os_last_error_g[64] = "";
+
+void os_set_quiet(int quiet)
+{
+    os_quiet_g = quiet;
+}
+
+const char *os_last_error(void)
+{
+    return os_last_error_g;
+}
+
 /* Returns bytes actually read (0..len), or -1 on error. Matches
    tools/probe_stream.bas's proven-working SYS "OS_GBPB",4,... call. */
 int os_gbpb_read4(int handle, unsigned char *buf, int len)
@@ -608,7 +655,11 @@ int os_gbpb_read4(int handle, unsigned char *buf, int len)
     regs.r[3] = len;
     err = _kernel_swi(SWI_OS_GBPB, &regs, &regs);
     if (err != NULL) {
-        fprintf(stderr, "os_gbpb_read4(len=%d): %s\n", len, err->errmess);
+        strncpy(os_last_error_g, err->errmess, sizeof(os_last_error_g) - 1);
+        os_last_error_g[sizeof(os_last_error_g) - 1] = '\0';
+        if (!os_quiet_g) {
+            fprintf(stderr, "os_gbpb_read4(len=%d): %s\n", len, err->errmess);
+        }
         return -1;
     }
     return len - regs.r[3];

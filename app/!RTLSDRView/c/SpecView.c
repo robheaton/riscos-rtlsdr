@@ -49,6 +49,7 @@
 #include "Driver.h"
 #include "Audio.h"
 #include "Dsp.h"
+#include "Trace.h"
 
 /* ---- FFT / spectrum geometry ----
    256-point complex FFT. Reading exactly one frame (256 complex I,Q byte
@@ -385,60 +386,58 @@ static int stream_ok_g = 0;
 static int stream_enabled_g = 0;
 static icon_handle icon_stream_g = 0;
 
-/* Diagnostic-only globals, drawn as a text line during redraw (see
-   Redraw_spectrum). Originally added to chase down a real bug: DeviceFS
-   pads short reads to the requested size in its default blocking mode
-   (confirmed via real DeviceFS source, see docs/PLAN.md milestone 5),
-   so os_gbpb_read4() used to claim a full transfer while genuinely
-   writing only ~2 bytes. Fixed by enabling non-blocking mode
-   (os_args_set_nonblocking) and accumulating its now-honest short reads
-   into accum_buf_g instead of demanding a full IQ_BYTES every call.
-   Left these counters in place -- still useful to see the pipeline is
-   alive at a glance. */
-static unsigned long debug_reads_ok_g = 0;
-/* Total raw bytes read from the dongle, as a double so it can't wrap
-   (4.8 MB/s overflows an unsigned long in ~15 minutes). Drives the r=
-   readout: real USB read rate in kilo-complex-samples per second, which
-   should sit near 2400k now that reads return real data. */
-static double usb_bytes_d_g = 0.0;
 /* FFT frames folded into the running average since the last display
-   update, and a chunk counter used to spread them out over the update
+   update, and a slice counter used to spread them out over the update
    interval. The FFT is the only floating-point-heavy part of the
-   per-tick work now, so it is budgeted rather than run on every frame. */
-#define FFT_FRAMES_PER_UPDATE 8
-#define FFT_CHUNK_STRIDE      6
-#define PCM_BUF_SAMPLES       1024
+   per-tick work, so it is budgeted rather than run on every frame; how
+   many frames per update, and from how many of the ~16 KB slices of
+   incoming data, is set at start-up (see main()). */
+#define PCM_BUF_SAMPLES       8192
+static int fft_per_update_g = 4;
+static int fft_stride_g = 1;
+static double avg_alpha_g = 0.04;
 static int fft_frames_g = 0;
 static unsigned long chunk_seq_g = 0;
 
-/* Stall diagnostics. RISC OS multitasks cooperatively: while another task
-   holds the CPU this app isn't polled, so nothing drains the USB buffer
-   or refills the audio ring. gap = the longest interval between
-   consecutive polls of Null_spectrum() (peak-held for a few seconds so it
-   can be read); it includes this app's own tick time, which is bounded by
-   TICK_BUDGET_CS. Compare it with the audio lead and the USB buffer time
-   (buffer size / 4.8 MB/s) to see which one a given stall exceeds. */
-static unsigned int last_poll_cs_g = 0;
-static int last_poll_set_g = 0;
-static unsigned int max_gap_cs_g = 0;    /* since the last display update */
-static unsigned int gap_hold_cs_g = 0;   /* peak-held value that is shown */
-static unsigned int gap_hold_until_g = 0;
-
-/* r= origin: the first moment data is actually read, not app launch
-   (which includes ~2.5 s of tuner set-up before any data flows). */
-static unsigned int usb_t0_cs_g = 0;
-static int usb_t0_set_g = 0;
+/* The USB stream. The dongle's sample rate, the size of each read request
+   and the DeviceFS stream buffer are run-time settings (see main()).
+   The read request size matters far more than the buffer size: USBDriver
+   keeps only ONE bulk transfer in flight per stream, arms the next one
+   only in response to a read call, and sizes each transfer to that read
+   request (16 KB is ~7 ms of data at 2.4 MSPS). Any gap in this app's
+   polling longer than the transfer left the dongle unserviced, and it
+   dropped samples -- whatever the buffer size. A big request gives one
+   big transfer in flight plus one queued behind it: that much time of
+   tolerance for the desktop stalling this app. */
+static long rate_hz_g = 2400000L;        /* dongle sample rate */
+static unsigned char *rx_buf_g = 0;      /* RMA block the reads land in */
+static int rx_buf_size_g = 0;
+static int rx_req_bytes_g = 16384;       /* bytes asked for per read */
+static int rx_recoveries_g = 0;
+static int rx_errors_g = 0;              /* consecutive failed reads */
+static unsigned int usb_last_data_cs_g = 0;
+static unsigned int last_tick_cs_g = 0;
+static int usb_t0_set_g = 0;             /* has any data arrived yet? */
 
 /* Run-time tunables, read once at start-up from RISC OS system variables
-   so different settings can be tried without a rebuild:
-     *Set RTLSDRView$BufKB 512    USB stream buffer, KB (default 512)
-     *Set RTLSDRView$LeadMS 350   audio lead, ms      (default 350)
-   A bigger USB buffer rides out longer desktop stalls without losing
+   so different settings can be tried without a rebuild (an Obey launcher
+   just *Sets them first):
+     RTLSDRView$RateK      dongle sample rate, kSPS: 2400 (default: the
+                           whole 2.4 MHz, ~4.8 MB/s) or 240 (FM audio
+                           only: 10x less USB traffic and CPU)
+     RTLSDRView$XferKB     read request = USB transfer size, KB (default:
+                           ~200 ms of data, 16-128 KB)
+     RTLSDRView$BufKB      DeviceFS stream buffer, KB (default: 4x XferKB)
+     RTLSDRView$LeadMS     audio lead, ms (default 350)
+     RTLSDRView$FFTFrames  spectrum frames per display update (default 4)
+     RTLSDRView$Log        write a per-second trace to this file on exit
+   A bigger transfer rides out longer desktop stalls without losing
    samples; a bigger lead keeps the audio playing through them. Both add
    latency. */
-#define DEFAULT_BUF_KB   512
+#define SAFE_BUF_KB      128    /* the proven-good stream buffer size... */
+#define SAFE_REQ_BYTES   16384  /* ...and read request: the fallback */
 #define DEFAULT_LEAD_MS  350
-static int stream_buf_kb_g = DEFAULT_BUF_KB;
+static int stream_buf_kb_g = 512;
 
 static int env_int(const char *name, int def, int lo, int hi)
 {
@@ -455,18 +454,8 @@ static int env_int(const char *name, int def, int lo, int hi)
     }
     return n;
 }
-/* Set once in main(), right after Event_Initialise() -- used to
-   compute an ACHIEVED throughput figure (debug_reads_ok_g * FFT_SIZE
-   samples, divided by real elapsed wall-clock time) for the
-   diagnostic line below. Added while investigating why STREAM audio
-   plays in short bursts with silence between -- checking directly
-   whether real-world read throughput is anywhere near the 2.4MHz the
-   SDR is actually producing, rather than continuing to guess at the
-   ring-buffer logic (already fixed once -- see docs/PLAN.md -- without
-   resolving the symptom, which points at a throughput shortfall
-   upstream of the buffer entirely). */
+/* Set once in main(), right after Event_Initialise(). */
 static unsigned int app_start_time_g = 0;
-static unsigned long debug_reads_bad_g = 0;
 static double debug_db_min_g = 0.0;
 static double debug_db_max_g = 0.0;
 static double debug_db_dc_g = 0.0;
@@ -474,17 +463,6 @@ static int debug_max_offset_g = 0;
 static double debug_raw_min_g = 0.0;
 static double debug_raw_max_g = 0.0;
 
-/* Four different fixes to HOW reads are issued (fixed chunk size,
-   4-byte alignment, offset-0 scratch buffer) all failed to move
-   s125/s255 off permanent zero while s0 kept varying -- time to look
-   at the actual sequence of `got` values across individual SWI calls,
-   not guess at another mechanism. A rolling window of the last 3 `got`
-   values (shifted in on every read, regardless of frame boundaries)
-   shows the real call pattern directly: e.g. "big,0,0" would mean one
-   real read then silence; "small,small,small" would mean genuinely
-   incremental honest reads that just aren't summing to a full varied
-   frame for some other reason. */
-static int debug_last_gots_g[3] = { -1, -1, -1 };
 
 /* ---- in-place iterative radix-2 DIT FFT, fixed N=FFT_SIZE ---- */
 static void fft256(double *re, double *im)
@@ -567,7 +545,8 @@ static void fft256(double *re, double *im)
    per-bin noise so a persistent real signal stands out. Frames
    complete fast enough now (many per second) that 200 frames is still
    only a couple of seconds of real time, not an unusably slow response. */
-#define AVG_ALPHA 0.02
+/* (The averaging factor is avg_alpha_g now, set in main() from the
+   number of frames per update; 0.02 was tuned for 8 per update.) */
 /* (Retuned from 0.005 when the FFT stopped being run on every frame:
    with real full-rate data the display takes only ~8 frames per 200 ms
    update (~40/s) so the DSP can have the CPU, and 0.005's 200-frame
@@ -636,7 +615,7 @@ static void accumulate_frame(void)
     for (i = 0; i < NUM_BINS; i++) {
         src = (i + NUM_BINS / 2) % NUM_BINS;
         power = re[src] * re[src] + im[src] * im[src];
-        avg_power_g[i] = avg_power_g[i] * (1.0 - AVG_ALPHA) + power * AVG_ALPHA;
+        avg_power_g[i] = avg_power_g[i] * (1.0 - avg_alpha_g) + power * avg_alpha_g;
     }
 }
 
@@ -721,14 +700,27 @@ static void finalize_display(void)
     }
 }
 
+static void report_warning(const char *msg);
+
 static void cleanup_and_exit(void)
 {
+    trace_event(Time_Monotonic(), "exit");
     audio_stream_close();     /* must precede audio_test_tone_close() --
                                   see Audio.h */
     audio_test_tone_close();
     if (stream_handle_g != 0) {
         os_find_close(stream_handle_g);
         stream_handle_g = 0;
+    }
+    if (trace_write() != 0) { /* last: a file write to a network share can
+                                  take a while, and nothing is running now
+                                  that needs servicing */
+        report_warning("Could not write the trace log to the file named "
+                        "by RTLSDRView$Log.");
+    }
+    if (rx_buf_g != 0) {
+        os_rma_free(rx_buf_g);
+        rx_buf_g = 0;
     }
     Event_CloseDown(); /* calls exit(); does not return */
 }
@@ -757,201 +749,205 @@ static void report_warning(const char *msg)
     Wimp_ReportError(&err, 0, "RTLSDRView");
 }
 
-/* Watchdog for a USB stream buffer the driver can't actually service.
-   The buffer size is user-tunable (RTLSDRView$BufKB) and the driver sizes
-   each DMA transfer to the buffer's free space, so a very large setting
-   could open fine yet never deliver data (e.g. if a huge physically
-   contiguous DMA allocation fails when the first transfer starts). If no
-   data has arrived a few seconds after start-up, reopen the stream with
-   the 128 KB size proven to work. */
+/* Opens the USB bulk stream with a DeviceFS buffer of buf_kb and switches
+   it to non-blocking mode. Returns 0 on success (stream_handle_g set). */
+static int open_stream(int buf_kb)
+{
+    char path[112];
+
+    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
+                  "nopad;size%d:%s",
+            RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, buf_kb * 1024,
+            device_name_g);
+    stream_handle_g = os_find_open(path);
+    if (stream_handle_g == 0) {
+        return -1;
+    }
+    if (os_args_set_nonblocking(stream_handle_g, 1) != 0) {
+        os_find_close(stream_handle_g);
+        stream_handle_g = 0;
+        return -1;
+    }
+    stream_buf_kb_g = buf_kb;
+    return 0;
+}
+
+static int stream_settings_are_safe(void)
+{
+    return rx_req_bytes_g == SAFE_REQ_BYTES && stream_buf_kb_g == SAFE_BUF_KB;
+}
+
+/* Watchdog for a USB stream the driver can't actually service. The
+   transfer size is user-tunable, and each USB transfer gets its own
+   physically contiguous DMA buffer, allocated when the transfer starts:
+   a very large setting could open fine yet never deliver data if that
+   allocation fails. If no data arrives a few seconds after start-up (or
+   stops arriving later), reopen the stream with the settings proven to
+   work: 16 KB reads and a 128 KB stream buffer. */
 static unsigned int first_tick_cs_g = 0;
 static int first_tick_set_g = 0;
 
-static void fallback_stream_buffer(void)
+static void fallback_stream(const char *why)
 {
-    char path[96];
+    char msg[80];
 
-    os_find_close(stream_handle_g);
-    rtlsdr_reset_buffer(device_name_g);
-    stream_buf_kb_g = 128;
-    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
-                  "nopad;size131072:%s",
-            RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, device_name_g);
-    stream_handle_g = os_find_open(path);
-    if (stream_handle_g == 0 ||
-        os_args_set_nonblocking(stream_handle_g, 1) != 0) {
-        report_and_die("Could not reopen the bulk stream with the "
-                        "fallback 128 KB buffer.");
+    if (stream_handle_g != 0) {
+        os_find_close(stream_handle_g);
+        stream_handle_g = 0;
     }
-    report_warning("The configured USB buffer delivered no data, so the "
-                    "stream was reopened with a 128 KB buffer. Try a "
-                    "smaller RTLSDRView$BufKB.");
+    rtlsdr_reset_buffer(device_name_g);
+    rx_req_bytes_g = SAFE_REQ_BYTES;
+    if (open_stream(SAFE_BUF_KB) != 0) {
+        report_and_die("Could not reopen the bulk stream with the "
+                        "fallback settings.");
+    }
+    dsp_fm_reset();
+    rx_recoveries_g++;
+    rx_errors_g = 0;
+    usb_last_data_cs_g = Time_Monotonic();
+    sprintf(msg, "fallback to safe USB settings: %.20s", why);
+    trace_event(Time_Monotonic(), msg);
 }
+
+/* Each poll: read whatever the USB stream has buffered (in blocks of up
+   to rx_req_bytes_g, non-blocking: see os_args_set_nonblocking), run every
+   sample through the demodulator when audio/DEM is wanted (it must see
+   the whole stream or the audio would have gaps), feed the audio ring,
+   and take a few FFT frames for the display. A wall-clock budget bounds
+   the work per tick so the desktop stays responsive.
+
+   got==0 means nothing is buffered right now: yield to Wimp_Poll. Note
+   the read call also matters to the USB driver: it is the read call that
+   arms the next bulk transfer (see the comment above rx_req_bytes_g), so
+   polling often and asking for a big block keeps the dongle serviced. */
+#define MAX_READ_ATTEMPTS 64
+/* Wall-clock budget per idle tick, in centiseconds (Time_Monotonic()
+   resolution): stop processing once this much time has elapsed even if
+   data remains, so the Wimp always gets control back promptly. */
+#define TICK_BUDGET_CS 2
 
 static BOOL Null_spectrum(event_pollblock *event, void *reference)
 {
     int i;
     int got;
+    int off;
+    int n;
+    int npcm;
     int dsp_active;
-    unsigned int tick_start_cs;
+    unsigned int tick_start_cs, t_prev, t_now;
+    static short pcm_g[PCM_BUF_SAMPLES];
 
     UNUSED_ARG(event);
     UNUSED_ARG(reference);
 
-    /* Non-blocking mode (enabled once in main() via
-       os_args_set_nonblocking) makes os_gbpb_read4() return HONEST
-       short-read counts instead of the default blocking mode's silent
-       zero-padding to the requested size (see docs/PLAN.md milestone
-       5 -- confirmed on real hardware via a sentinel-fill test).
-       Accumulate across multiple calls into accum_buf_g until a full
-       IQ_BYTES frame is ready, rather than requiring got==IQ_BYTES from
-       a single call, which blocking mode never honestly gave anyway.
-
-       Each honest read tends to return only about HALF of what's
-       requested (confirmed in milestone 5's sentinel test), so filling
-       the last few bytes of a frame can take many more attempts than
-       filling the first half -- with a small fixed attempt cap
-       (previously BATCH_READS=16), a frame could easily need 1-2 extra
-       bytes that don't arrive until the NEXT idle tick, tens of
-       milliseconds later. That means the "frame" handed to the FFT
-       could be a concatenation of samples from genuinely different
-       moments in time -- which would corrupt frequency resolution
-       (smearing real signal energy across every bin) while leaving the
-       DC bin untouched (it's just a sum, order-independent) -- exactly
-       the pattern seen on real hardware: a real ~40dB FM station
-       (confirmed working with this same dongle+antenna in SDR# on
-       Windows) produced an essentially flat computed spectrum here.
-       Non-blocking reads can't hang, so it's safe to loop until a frame
-       is genuinely complete OR the stream truly has nothing more
-       available right now (got==0), rather than capping at a small
-       fixed attempt count. MAX_READ_ATTEMPTS is a generous safety
-       bound against a pathological runaway, not a normal-operation
-       limit.
-
-       BUT: this loop used to also keep going past each completed frame,
-       all the way up to MAX_READ_ATTEMPTS (previously 5000), rather than
-       returning to Wimp_Poll once a handful of frames were done. With
-       real sustained USB throughput, got==0 is rare, so in practice a
-       single Null_spectrum() call was burning through most/all of that
-       5000-attempt budget in one tight, non-yielding loop, every idle
-       tick -- a real regression (confirmed by the user seeing high
-       resource usage on the Pi) from back when small BATCH_READS-style
-       caps and blocking reads naturally throttled how much a single
-       call could do. Capping the number of FRAMES completed per call
-       (not just raw read attempts) restores frequent, cheap returns to
-       Wimp_Poll -- matching the original phase-2 plan's explicit
-       concern about an over-large per-tick batch reintroducing the kind
-       of unresponsiveness phase 1 fought hard to diagnose -- while still
-       processing plenty of frames per second across many idle ticks.
-
-       Raised from 200 now that FIXED_CHUNK_SIZE dropped to 8 (see its
-       comment) -- filling one 512-byte frame can now take well over
-       100 individual read calls if each only delivers ~half of what's
-       requested (as observed at larger chunk sizes), so 200 barely
-       covered one frame, let alone MAX_FRAMES_PER_TICK's worth. Each
-       individual read is still cheap (a single small SWI call, not
-       nested work), and MAX_FRAMES_PER_TICK still bounds how much
-       actual FRAME processing (FFT/averaging) happens before
-       returning to Wimp_Poll -- the two caps serve different purposes
-       and both still apply. */
-#define MAX_READ_ATTEMPTS 1200
-/* Raised from 8 now that `nopad` (see the stream-open path in main())
-   fixes correctness at any chunk size -- measured throughput at
-   FIXED_CHUNK_SIZE=512 with nopad was, surprisingly, WORSE than the
-   old tiny-chunk workaround (r=7k vs. r=23k), even though each frame
-   now fills in far fewer, far cheaper read attempts. That points at
-   THIS cap, not chunk size, as the real remaining bottleneck: overall
-   throughput is roughly (Wimp idle-tick rate) x MAX_FRAMES_PER_TICK x
-   FFT_SIZE, so capping frames-per-tick this low limits total
-   throughput regardless of how efficiently each individual frame
-   fills. Non-blocking reads still can't hang, so this is safe to
-   raise -- the real risk is the SAME category the original 8 was
-   chosen to avoid (reintroducing the CPU-hogging unresponsiveness the
-   very first MAX_FRAMES_PER_TICK cap fixed), so raised by 8x, not
-   removed outright, to test the throughput hypothesis while watching
-   for that regression. */
-/* Wall-clock budget per idle tick, in centiseconds (Time_Monotonic()
-   resolution): stop processing frames once this much time has elapsed
-   even if frames remain, so the Wimp always gets control back promptly. */
-#define TICK_BUDGET_CS 2
     tick_start_cs = Time_Monotonic();
-    if (last_poll_set_g) {
-        unsigned int gap_cs;
-        gap_cs = tick_start_cs - last_poll_cs_g;
-        if (gap_cs > max_gap_cs_g) {
-            max_gap_cs_g = gap_cs;
-        }
-    }
-    last_poll_cs_g = tick_start_cs;
-    last_poll_set_g = 1;
-    if (!usb_t0_set_g && stream_buf_kb_g != 128) {
+    trace_tick_begin(tick_start_cs);
+    t_prev = tick_start_cs;
+
+    /* Is the stream delivering? Not a single byte 3 s after start-up, or
+       none for 3 s in the middle of a run while this app has been
+       polling normally (so it isn't just the desktop having stalled us),
+       means the driver could not service the configured transfer size:
+       drop back to the settings known to work. */
+    if (!usb_t0_set_g) {
         if (!first_tick_set_g) {
             first_tick_cs_g = tick_start_cs;
             first_tick_set_g = 1;
-        } else if (tick_start_cs - first_tick_cs_g > 300) {
-            fallback_stream_buffer();
+        } else if (tick_start_cs - first_tick_cs_g > 300 &&
+                   !stream_settings_are_safe()) {
+            fallback_stream("no data 3 s after start-up");
+            report_warning("The configured USB transfer size delivered no "
+                            "data, so the stream was reopened with 16 KB "
+                            "reads and a 128 KB buffer. Try a smaller "
+                            "RTLSDRView$XferKB / RTLSDRView$BufKB.");
+            first_tick_cs_g = Time_Monotonic();
+            last_tick_cs_g = first_tick_cs_g;
+            trace_tick_end(first_tick_cs_g);
             return FALSE;
         }
+    } else if (tick_start_cs - last_tick_cs_g < 50 &&
+               tick_start_cs - usb_last_data_cs_g > 300 &&
+               !stream_settings_are_safe()) {
+        fallback_stream("no data for 3 s");
+        last_tick_cs_g = Time_Monotonic();
+        trace_tick_end(last_tick_cs_g);
+        return FALSE;
     }
+
     dsp_active = (demod_enabled_g || stream_enabled_g);
     for (i = 0; i < MAX_READ_ATTEMPTS; i++) {
-        static unsigned char read_tmp_g[FIXED_CHUNK_SIZE];
-        static short pcm_g[PCM_BUF_SAMPLES];
-
-        /* Real full-rate data now flows (see Driver.c's rtlsdr_write_reg()
-           for the byte-order bug that used to cap every read at 2
-           bytes), so the shape here is: read a chunk; if the demodulator
-           is wanted, run EVERY sample of it through Dsp.c (integer-only,
-           cheap, and it must see the whole stream or the audio would
-           have gaps); and take at most a few chunks' first frames for
-           the FFT display, which is emulated floating point and the only
-           expensive part. got==0 means nothing is buffered right now:
-           yield to Wimp_Poll. A wall-clock budget bounds the work per
-           idle tick so the desktop stays responsive. */
-        got = os_gbpb_read4(stream_handle_g, read_tmp_g, FIXED_CHUNK_SIZE);
-        debug_last_gots_g[0] = debug_last_gots_g[1];
-        debug_last_gots_g[1] = debug_last_gots_g[2];
-        debug_last_gots_g[2] = got;
+        got = os_gbpb_read4(stream_handle_g, rx_buf_g, rx_req_bytes_g);
+        t_now = Time_Monotonic();
+        trace_read(got, t_now - t_prev);
+        t_prev = t_now;
         if (got < 0) {
-            debug_reads_bad_g++;
+            rx_errors_g++;
+            if (rx_errors_g == 1) {
+                char msg[TRACE_EVENT_TEXT];
+                sprintf(msg, "read error: %.40s", os_last_error());
+                trace_event(t_now, msg);
+            }
+            if (rx_errors_g > 300 && !stream_settings_are_safe()) {
+                fallback_stream("repeated read errors");
+            }
             break;
         }
+        rx_errors_g = 0;
         if (got == 0) {
             break;
         }
-        got &= ~1;   /* whole I/Q pairs only */
-        if (!usb_t0_set_g) {
-            usb_t0_cs_g = Time_Monotonic();
-            usb_t0_set_g = 1;
+        if (got & 1) {
+            trace_event(t_now, "odd-length read (I/Q pairing lost)");
         }
-        usb_bytes_d_g += (double)got;
+        got &= ~1;   /* whole I/Q pairs only */
+        if (got == 0) {
+            break;
+        }
+        if (!usb_t0_set_g) {
+            usb_t0_set_g = 1;
+            trace_event(t_now, "first data");
+        }
+        usb_last_data_cs_g = t_now;
 
-        if (dsp_active) {
-            int npcm;
-            npcm = dsp_fm_process(read_tmp_g, got, pcm_g, PCM_BUF_SAMPLES);
-            if (stream_enabled_g && npcm > 0) {
-                /* Return value (samples accepted) deliberately ignored:
-                   a real-time stream, not a queue -- audio_stream_feed()
-                   drops what it can't safely fit. */
-                audio_stream_feed(pcm_g, npcm);
+        for (off = 0; off < got; off += FIXED_CHUNK_SIZE) {
+            n = got - off;
+            if (n > FIXED_CHUNK_SIZE) {
+                n = FIXED_CHUNK_SIZE;
+            }
+            if (dsp_active) {
+                npcm = dsp_fm_process(rx_buf_g + off, n, pcm_g,
+                                      PCM_BUF_SAMPLES);
+                if (stream_enabled_g && npcm > 0) {
+                    /* Return value (samples accepted) deliberately
+                       ignored: a real-time stream, not a queue --
+                       audio_stream_feed() drops what it can't safely
+                       fit. */
+                    audio_stream_feed(pcm_g, npcm);
+                }
+                t_now = Time_Monotonic();
+                trace_dsp_cs(t_now - t_prev);
+                t_prev = t_now;
+            }
+
+            chunk_seq_g++;
+            if (n >= IQ_BYTES && fft_frames_g < fft_per_update_g &&
+                (chunk_seq_g % (unsigned long)fft_stride_g) == 0) {
+                memcpy(iq_frame_g, rx_buf_g + off, IQ_BYTES);
+                accumulate_frame();
+                fft_frames_g++;
+                t_now = Time_Monotonic();
+                trace_fft_cs(t_now - t_prev, 1);
+                t_prev = t_now;
             }
         }
 
-        chunk_seq_g++;
-        if (got >= IQ_BYTES && fft_frames_g < FFT_FRAMES_PER_UPDATE &&
-            (chunk_seq_g % FFT_CHUNK_STRIDE) == 0) {
-            memcpy(iq_frame_g, read_tmp_g, IQ_BYTES);
-            accumulate_frame();
-            fft_frames_g++;
-            debug_reads_ok_g++;
-        }
-
-        if (Time_Monotonic() - tick_start_cs >= TICK_BUDGET_CS) {
+        if (t_prev - tick_start_cs >= TICK_BUDGET_CS) {
             break;
         }
     }
 
-    if (fft_frames_g > 0 && Time_Monotonic() >= next_update_time_g) {
+    if ((fft_frames_g > 0 || fft_per_update_g == 0) &&
+        t_prev >= next_update_time_g) {
         if (dsp_active) {
             /* Once per display update rather than per tick: this does a
                square root in emulated floating point. */
@@ -963,23 +959,17 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
                                     pk_hz * DEMOD_ALPHA;
             }
         }
-        {
-            /* Peak-hold the worst poll gap for ~5 s so it can be read. */
-            unsigned int now_cs;
-            now_cs = Time_Monotonic();
-            if (max_gap_cs_g >= gap_hold_cs_g ||
-                now_cs - gap_hold_until_g < 0x80000000u) {
-                gap_hold_cs_g = max_gap_cs_g;
-                gap_hold_until_g = now_cs + 500;
-            }
-            max_gap_cs_g = 0;
-        }
         finalize_display();
         Window_ForceRedraw(spectrum_window_g, 0, -WORK_HEIGHT, WORK_WIDTH, 0);
         next_update_time_g = Time_Monotonic() + UPDATE_INTERVAL_CS;
         fft_frames_g = 0;
+        t_now = Time_Monotonic();
+        trace_disp_cs(t_now - t_prev);
+        t_prev = t_now;
     }
 
+    last_tick_cs_g = tick_start_cs;
+    trace_tick_end(t_prev);
     return FALSE;
 }
 
@@ -1109,33 +1099,22 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                (clipping/no real signal, just noise). */
             if (demod_enabled_g) {
                 char line2[64];
-                double elapsed_s;
-                double achieved_ksps;
+                double rate_ksps;
+                unsigned int gap_ms;
 
-                /* Achieved read/process throughput (see
-                   app_start_time_g's comment) -- the real point of
-                   this whole diagnostic: is it anywhere near the
-                   2400 (kHz/ksps) the SDR is actually producing? If
-                   it's a small fraction of that, no amount of
-                   ring-buffer cleverness can make a continuous audio
-                   stream out of it -- the shortfall is upstream, in
-                   how much raw data gets read and processed per real
-                   second. */
-                elapsed_s = usb_t0_set_g
-                    ? (double)(Time_Monotonic() - usb_t0_cs_g) / 100.0
-                    : 0.0;
-                achieved_ksps = (elapsed_s > 0.0)
-                    ? (usb_bytes_d_g / 2.0 / elapsed_s / 1000.0)
-                    : 0.0;
-
-                /* Shortened after this line was reported clipped off
-                   the edge of the window on real hardware -- dropped
-                   "Hz"/"/2400k" (the 2400 target is implicit/known)
-                   and tightened the labels. */
-                sprintf(line2, "pk=%.0fk rms=%.0fk r=%.0fk g%u u%d",
-                        demod_dev_peak_g / 1000.0,
-                        demod_dev_rms_g / 1000.0, achieved_ksps,
-                        gap_hold_cs_g * 10, audio_stream_underruns());
+                /* r = complex samples/s actually read over the last few
+                   seconds, in thousands: should sit at the dongle's
+                   configured rate (2400 or 240). Below that, samples
+                   are being lost -- and no amount of ring-buffer
+                   cleverness can make continuous audio out of a stream
+                   with holes in it. g = the longest time the rest of
+                   the desktop held the CPU between two polls of this
+                   app over the same window (ms); G = the longest ever;
+                   u = audible audio underruns so far. */
+                trace_recent(&rate_ksps, &gap_ms);
+                sprintf(line2, "pk=%.0fk r=%.0fk g%u G%u u%d",
+                        demod_dev_peak_g / 1000.0, rate_ksps, gap_ms,
+                        trace_gap_all_ms(), audio_stream_underruns());
                 GFX_VDU(5);
                 GFX_Move(ox + 4, oy - 158); /* below icon row 2 now */
                 GFX_Write0(line2);
@@ -1202,11 +1181,10 @@ static void update_stream_icon(void)
    captured at the old frequency. */
 static void discard_buffered_stream_data(void)
 {
-    static unsigned char scratch_g[FIXED_CHUNK_SIZE];
     int n;
 
     for (n = 0; n < 64; n++) {
-        if (os_gbpb_read4(stream_handle_g, scratch_g, FIXED_CHUNK_SIZE) <= 0) {
+        if (os_gbpb_read4(stream_handle_g, rx_buf_g, rx_req_bytes_g) <= 0) {
             break;
         }
     }
@@ -1229,6 +1207,13 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
 
     icon = event->data.mouse.icon;
 
+    if (icon < 0) {
+        /* A click on the spectrum itself (not a button): a marker in the
+           trace, to bracket something being tried (a stall test, say). */
+        trace_event(Time_Monotonic(), "MARK");
+        return TRUE;
+    }
+
     if (icon == icon_demod_g) {
         /* Pure software toggle -- no I2C repeater bracket needed,
            unlike every gain/freq control below. */
@@ -1237,6 +1222,7 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
             dsp_fm_reset();
         }
         update_demod_icon();
+        trace_event(Time_Monotonic(), demod_enabled_g ? "DEM on" : "DEM off");
         return TRUE;
     }
 
@@ -1269,6 +1255,8 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
             }
             audio_stream_play(stream_enabled_g);
             update_stream_icon();
+            trace_event(Time_Monotonic(),
+                        stream_enabled_g ? "STREAM on" : "STREAM off");
         }
         return TRUE;
     }
@@ -1318,6 +1306,10 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
         }
 
         if (new_freq != tuned_freq_hz_g) {
+            unsigned int retune_t0;
+            char evmsg[TRACE_EVENT_TEXT];
+
+            retune_t0 = Time_Monotonic();
             /* Only commit the new frequency if the tune actually
                locked -- an attempted retune that failed shouldn't
                leave the displayed/tracked frequency out of sync with
@@ -1340,6 +1332,9 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
                 dsp_fm_reset();
                 reset_averaging();
             }
+            sprintf(evmsg, "retune to %lu Hz took %u cs", new_freq,
+                    Time_Monotonic() - retune_t0);
+            trace_event(Time_Monotonic(), evmsg);
         }
     }
 
@@ -1540,10 +1535,19 @@ int main(void)
 {
     int n;
     int rc;
-    char path[64];
+    int xfer_kb, buf_kb, lead_ms, burst_ms, rate_k;
+    char cfg[240];
 
     Event_Initialise("RTLSDRView");
     app_start_time_g = Time_Monotonic();
+    os_set_quiet(1);    /* no stderr in a Wimp task */
+
+    /* Run-time settings (see the comment above SAFE_BUF_KB). */
+    rate_k = env_int("RTLSDRView$RateK", 2400, 240, 2880);
+    if ((rate_k % 240) != 0 || (rate_k > 300 && rate_k <= 900)) {
+        rate_k = 2400;   /* not a rate the demodulator/dongle can do */
+    }
+    rate_hz_g = 1000L * (long)rate_k;
 
     n = find_device();
     if (n < 0) {
@@ -1590,7 +1594,7 @@ int main(void)
                         "!RTLSDR's diagnostic output for details.");
     }
 
-    if (rtlsdr_set_sample_rate(device_name_g, 2400000UL) != 0) {
+    if (rtlsdr_set_sample_rate(device_name_g, (unsigned long)rate_hz_g) != 0) {
         report_and_die("rtlsdr_set_sample_rate() failed.");
     }
 
@@ -1610,7 +1614,7 @@ int main(void)
         int new_if;
 
         rtlsdr_demod_write_reg(device_name_g, 1, 0x01, 0x18, 1); /* enable I2C repeater */
-        new_if = r82xx_set_bandwidth(&tuner_g, 2400000);
+        new_if = r82xx_set_bandwidth(&tuner_g, (int)rate_hz_g);
         if (new_if >= 0) {
             rtlsdr_set_if_freq(device_name_g, (unsigned long)new_if);
             r82xx_set_freq(&tuner_g, tuned_freq_hz_g);
@@ -1650,30 +1654,71 @@ int main(void)
        without) and has been dropped. `size131072` (a 128 KB DeviceFS
        stream buffer instead of the small default) does help -- ~4.7
        MB/s vs. ~3.5 MB/s in the same investigation -- so it stays. */
-    stream_buf_kb_g = env_int("RTLSDRView$BufKB", DEFAULT_BUF_KB, 32, 8192);
-    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
-                  "nopad;size%d:%s",
-            RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE,
-            stream_buf_kb_g * 1024, device_name_g);
-    stream_handle_g = os_find_open(path);
-    if (stream_handle_g == 0 && stream_buf_kb_g != 128) {
+    /* Read request size: ~200 ms of data unless told otherwise (see the
+       comment above rx_req_bytes_g for why this, not the buffer, is what
+       sets the USB stall tolerance). Whole 1 KB steps keep it a multiple
+       of the bulk endpoint's 512-byte packets. */
+    xfer_kb = env_int("RTLSDRView$XferKB", 0, 1, 1024);
+    if (xfer_kb == 0) {
+        xfer_kb = (int)((rate_hz_g * 2L / 5L) / 1024L);
+        xfer_kb = ((xfer_kb + 8) / 16) * 16;
+        if (xfer_kb > 128) {
+            xfer_kb = 128;
+        }
+        if (xfer_kb < 16) {
+            xfer_kb = 16;
+        }
+    }
+    /* The stream buffer has to hold the transfer in flight, the one
+       just completed but not yet read, and some slack. */
+    buf_kb = env_int("RTLSDRView$BufKB", 0, 32, 8192);
+    if (buf_kb == 0) {
+        buf_kb = 128;
+        while (buf_kb < 4 * xfer_kb) {
+            buf_kb *= 2;
+        }
+    }
+    if (buf_kb < 2 * xfer_kb) {
+        buf_kb = 2 * xfer_kb;
+    }
+
+    rx_req_bytes_g = xfer_kb * 1024;
+    rx_buf_size_g = rx_req_bytes_g;
+    rx_buf_g = os_rma_claim(rx_buf_size_g);
+    if (rx_buf_g == NULL) {
+        /* No room in the RMA for the big read buffer: use the small,
+           proven-good settings instead. */
+        xfer_kb = SAFE_REQ_BYTES / 1024;
+        buf_kb = SAFE_BUF_KB;
+        rx_req_bytes_g = SAFE_REQ_BYTES;
+        rx_buf_size_g = SAFE_REQ_BYTES;
+        rx_buf_g = os_rma_claim(rx_buf_size_g);
+        if (rx_buf_g == NULL) {
+            report_and_die("Out of memory for the USB read buffer.");
+        }
+    }
+
+    if (open_stream(buf_kb) != 0 && buf_kb != SAFE_BUF_KB) {
         /* The configured buffer couldn't be created (too big for the
-           available memory?) -- fall back to the 128 KB size proven to
-           work rather than failing to start. */
-        stream_buf_kb_g = 128;
-        sprintf(path, "devices#endpoint%d;interface%d;bulk;"
-                      "usbtimeout2000;nopad;size131072:%s",
-                RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE,
-                device_name_g);
-        stream_handle_g = os_find_open(path);
+           available memory?) -- fall back to the size proven to work
+           rather than failing to start. */
+        rx_req_bytes_g = SAFE_REQ_BYTES;
+        xfer_kb = SAFE_REQ_BYTES / 1024;
+        buf_kb = SAFE_BUF_KB;
+        open_stream(SAFE_BUF_KB);
     }
     if (stream_handle_g == 0) {
-        report_and_die("Could not open the bulk endpoint stream.");
+        report_and_die("Could not open the bulk endpoint stream (or "
+                        "enable non-blocking mode on it -- see "
+                        "docs/PLAN.md milestone 5).");
     }
-    if (os_args_set_nonblocking(stream_handle_g, 1) != 0) {
-        report_and_die("Could not enable non-blocking mode on the "
-                        "bulk stream -- see docs/PLAN.md milestone 5.");
-    }
+
+    /* Spectrum averaging: about 1.25 s of smoothing whatever the number
+       of frames per update (0.02 per frame at the original 8). */
+    fft_per_update_g = env_int("RTLSDRView$FFTFrames", 4, 0, 16);
+    avg_alpha_g = (fft_per_update_g > 0)
+        ? 0.8 / (double)(fft_per_update_g * 5) : 0.04;
+    fft_stride_g = (rate_hz_g >= 960000L) ? 6 : 1;
 
     spectrum_window_g = create_spectrum_window();
     create_gain_icons(spectrum_window_g);
@@ -1712,12 +1757,22 @@ int main(void)
     /* The demodulator runs whether or not audio output is available
        (the DEM readout uses it too), so configure it either way: the
        mixer's real rate if audio came up, else a nominal 48 kHz. */
+    lead_ms = env_int("RTLSDRView$LeadMS", DEFAULT_LEAD_MS, 100, 1200);
+    burst_ms = (int)(((long)rx_req_bytes_g * 1000L) / (rate_hz_g * 2L));
     if (stream_ok_g) {
-        audio_stream_set_lead_ms(env_int("RTLSDRView$LeadMS",
-                                          DEFAULT_LEAD_MS, 100, 1200));
+        audio_stream_set_lead_ms(lead_ms);
+        audio_stream_set_burst_ms(burst_ms);
     }
     dsp_fm_init((stream_ok_g && audio_stream_rate() > 0)
-                    ? audio_stream_rate() : 48000);
+                    ? audio_stream_rate() : 48000, rate_hz_g);
+
+    sprintf(cfg, "rate=%ld xfer_kb=%d buf_kb=%d burst_ms=%d lead_ms=%d "
+                 "fft_frames=%d fft_stride=%d budget_cs=%d audio_rate=%d",
+            rate_hz_g, xfer_kb, stream_buf_kb_g, burst_ms, lead_ms,
+            fft_per_update_g, fft_stride_g, TICK_BUDGET_CS,
+            stream_ok_g ? audio_stream_rate() : 0);
+    trace_init(getenv("RTLSDRView$Log"), cfg);
+    trace_event(Time_Monotonic(), "started");
 
     Window_Show(spectrum_window_g, open_CENTERED);
 
