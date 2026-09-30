@@ -4,7 +4,9 @@ A native RISC OS driver/app for RTL-SDR (RTL2832U) USB dongles. RISC OS has
 no libusb and no existing RTL-SDR support, so this talks to the dongle
 directly through RISC OS's own DeviceFS USB interface. See
 [`docs/PLAN.md`](docs/PLAN.md) for the full technical plan, API grounding,
-and milestones — start there.
+and milestones — start there. Where it is going next (a proper user
+interface, waterfall, more modes and tools, modelled on SDR++) is in
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Status
 
