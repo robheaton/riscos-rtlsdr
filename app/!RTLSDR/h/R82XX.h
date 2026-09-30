@@ -95,4 +95,9 @@ int r82xx_set_bandwidth(r82xx_t *t, int bw_hz);
    hang hunt in docs/PLAN.md): 10 ms by default, 0 disables it. */
 void r82xx_set_pace_ms(int ms);
 
+/* 1 (the default) lets the tuner code print its step-by-step trace with
+   printf, as the command-line diagnostic wants; 0 silences it (the Wimp
+   app: stdout has nowhere sensible to go). */
+void r82xx_set_trace(int on);
+
 #endif /* R82XX_H */

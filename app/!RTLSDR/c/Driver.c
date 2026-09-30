@@ -16,6 +16,9 @@
 
 #define SCRAP_PATH "<Wimp$ScrapDir>.rtlsdr"
 
+/* Set by the Wimp app: no text output at all (see os_set_quiet below). */
+static int os_quiet_g = 0;
+
 #define SWI_DeviceFS_CallDevice 0x42744
 #define USB_CALL_CONTROL_REQUEST ((int)0x80000000u) /* (1<<31) + 0 */
 
@@ -48,7 +51,9 @@ int usb_ctrl_transfer(const char *device_name, int bm_request_type,
 
     err = _kernel_swi(SWI_DeviceFS_CallDevice, &regs, &regs);
     if (err != NULL) {
-        fprintf(stderr, "usb_ctrl_transfer: %s\n", err->errmess);
+        if (!os_quiet_g) {
+            fprintf(stderr, "usb_ctrl_transfer: %s\n", err->errmess);
+        }
         return -1;
     }
     return 0;
@@ -233,16 +238,20 @@ int find_device(void)
 
     text = run_and_capture("USBDevices");
     if (text == NULL) {
-        printf("(run_and_capture(\"USBDevices\") returned NULL -- the "
-               "OSCLI call or scrap file read/write itself failed, before "
-               "any text-matching happened)\n");
+        if (!os_quiet_g) {
+            printf("(run_and_capture(\"USBDevices\") returned NULL -- the "
+                   "OSCLI call or scrap file read/write itself failed, "
+                   "before any text-matching happened)\n");
+        }
         return -1;
     }
 
-    printf("--- raw *USBDevices capture (%lu bytes) ---\n",
-           (unsigned long)strlen(text));
-    printf("%s", text);
-    printf("--- end capture ---\n");
+    if (!os_quiet_g) {
+        printf("--- raw *USBDevices capture (%lu bytes) ---\n",
+               (unsigned long)strlen(text));
+        printf("%s", text);
+        printf("--- end capture ---\n");
+    }
 
     /* RISC OS text files are CR-terminated, not LF -- splitting on "\n"
        alone found zero delimiters, so the whole buffer became one "line"
@@ -652,7 +661,6 @@ void os_rma_free(unsigned char *p)
 /* The Wimp app (!RTLSDRView) must not write to stderr -- there is no text
    window for it to land in -- so it switches the messages off and reads
    the last error text back instead. */
-static int os_quiet_g = 0;
 static char os_last_error_g[64] = "";
 
 void os_set_quiet(int quiet)
@@ -718,7 +726,9 @@ int os_args_set_nonblocking(int handle, int enable)
     regs.r[2] = (int)block;
     err = _kernel_swi(SWI_OS_Args, &regs, &regs);
     if (err != NULL) {
-        fprintf(stderr, "os_args_set_nonblocking: %s\n", err->errmess);
+        if (!os_quiet_g) {
+            fprintf(stderr, "os_args_set_nonblocking: %s\n", err->errmess);
+        }
         return -1;
     }
     return 0;

@@ -63,7 +63,17 @@ static void r82xx_pace(void)
    TRACE() calls flush immediately so the LAST line printed to screen
    during a hang is the actual last step that ran, pinpointing the call
    that's stuck. Remove once milestone 4's hang is understood and fixed. */
-#define TRACE(msg) do { printf("  [trace] %s\n", msg); fflush(stdout); } while (0)
+static int r82xx_trace_on = 1;
+
+/* The tuner code narrates itself with printf: fine for the command-line
+   diagnostic, but in the Wimp app that text lands on the VDU screen behind
+   the desktop. !RTLSDRView switches it off. */
+void r82xx_set_trace(int on)
+{
+    r82xx_trace_on = on;
+}
+
+#define TRACE(msg) do { if (r82xx_trace_on) { printf("  [trace] %s\n", msg); fflush(stdout); } } while (0)
 
 #define HF_THRESHOLD_HZ   28800000UL   /* 28.8MHz */
 
@@ -485,19 +495,23 @@ static int r82xx_set_pll(r82xx_t *t, unsigned long freq_hz)
     val = vco_fra ? 0x00 : 0x08;
     rc = r82xx_write_reg_mask(t, 0x12, val, 0x08);
     if (rc < 0) return rc;
-    printf("  [trace] set_pll: freq_hz=%lu mix_div=%lu vco_freq=%lu "
-           "nint=%lu vco_fra=%lu pll_ref_khz=%lu -- about to enter "
-           "sigma-delta loop\n",
-           freq_hz, mix_div, vco_freq, nint, vco_fra, pll_ref_khz);
-    fflush(stdout);
+    if (r82xx_trace_on) {
+        printf("  [trace] set_pll: freq_hz=%lu mix_div=%lu vco_freq=%lu "
+               "nint=%lu vco_fra=%lu pll_ref_khz=%lu -- about to enter "
+               "sigma-delta loop\n",
+               freq_hz, mix_div, vco_freq, nint, vco_fra, pll_ref_khz);
+        fflush(stdout);
+    }
 
     n_sdm = 2;
     sdm = 0;
     i = 0;
     while (vco_fra > 1) {
-        printf("  [trace]   sigma-delta iter %d: n_sdm=%lu vco_fra=%lu\n",
-               i, n_sdm, vco_fra);
-        fflush(stdout);
+        if (r82xx_trace_on) {
+            printf("  [trace]   sigma-delta iter %d: n_sdm=%lu vco_fra=%lu\n",
+                   i, n_sdm, vco_fra);
+            fflush(stdout);
+        }
         if (vco_fra > (2 * pll_ref_khz / n_sdm)) {
             sdm = sdm + 32768 / (n_sdm / 2);
             vco_fra = vco_fra - 2 * pll_ref_khz / n_sdm;
@@ -516,10 +530,12 @@ static int r82xx_set_pll(r82xx_t *t, unsigned long freq_hz)
            is unsigned long; this is nowhere near a legitimate need). */
         i++;
         if (i > 64) {
-            printf("  [trace] set_pll: sigma-delta loop exceeded 64 "
-                   "iterations, aborting (vco_fra=%lu n_sdm=%lu)\n",
-                   vco_fra, n_sdm);
-            fflush(stdout);
+            if (r82xx_trace_on) {
+                printf("  [trace] set_pll: sigma-delta loop exceeded 64 "
+                       "iterations, aborting (vco_fra=%lu n_sdm=%lu)\n",
+                       vco_fra, n_sdm);
+                fflush(stdout);
+            }
             return -1;
         }
     }

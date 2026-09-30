@@ -42,6 +42,7 @@
 #include "DeskLib:WimpSWIs.h"
 #include "DeskLib:Window.h"
 #include "DeskLib:Event.h"
+#include "DeskLib:Handler.h"
 #include "DeskLib:GFX.h"
 #include "DeskLib:Time.h"
 #include "RTLSDR.h"
@@ -67,9 +68,12 @@
                                      FFT), since our input is complex I/Q */
 #define IQ_BYTES      (FFT_SIZE * 2)
 
-#define BIN_WIDTH_OS  2
-#define WORK_WIDTH    (NUM_BINS * BIN_WIDTH_OS)  /* 512 OS units */
-#define WORK_HEIGHT   520                        /* OS units -- grown from 360 for the
+#define WORK_WIDTH    640   /* OS units: room for the control panel's
+                               buttons (see Ui.h); the spectrum is
+                               stretched to fit */
+/* x of the left edge of bin i, in work-area units. */
+#define BIN_X(i)      (((i) * WORK_WIDTH) / NUM_BINS)
+#define WORK_HEIGHT   480                        /* OS units -- grown from 360 for the
                                                      control panel, and from
                                                      300 to fit a 6th
                                                      diagnostic text line
@@ -92,10 +96,10 @@
    Grown again to 180 to fit a second icon row (create_tone_icon) plus
    the demod readout text below it, now that row 1 (AGC through DEM)
    is full. */
-#define RESERVED_TOP    320   /* was 180 before the receiver control panel
+#define RESERVED_TOP    280   /* was 180 before the receiver control panel
                                  (Ui.c) added three more rows, a level meter
                                  and a wider readout */
-#define REDRAW_TOP      (-258) /* the part of the window that changes at the
+#define REDRAW_TOP      (-208) /* the part of the window that changes at the
                                  display rate: meter, readout, spectrum */
 #define BAR_MAX_HEIGHT  (WORK_HEIGHT - RESERVED_TOP)
 
@@ -1073,8 +1077,9 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
            and tests this directly. */
         for (i = 0; i < NUM_BINS; i++) {
             if (bin_height_g[i] > 0) {
-                GFX_RectangleFill(ox + i * BIN_WIDTH_OS, oy - WORK_HEIGHT,
-                                   BIN_WIDTH_OS - 1, bin_height_g[i]);
+                GFX_RectangleFill(ox + BIN_X(i), oy - WORK_HEIGHT,
+                                   BIN_X(i + 1) - BIN_X(i) - 1,
+                                   bin_height_g[i]);
             }
         }
 
@@ -1083,7 +1088,7 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
            tuned to the centre). */
         {
             long bin_hz;
-            int bw, half_bins, cx;
+            int bw, half_bins;
 
             bin_hz = rate_hz_g / NUM_BINS;
             bw = (rcv.mode == RX_MODE_WFM) ? 150000 : rcv.bw_hz[rcv.mode];
@@ -1094,11 +1099,10 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
             if (half_bins > NUM_BINS / 2 - 1) {
                 half_bins = NUM_BINS / 2 - 1;
             }
-            cx = ox + (NUM_BINS / 2) * BIN_WIDTH_OS;
             Wimp_SetColour((int)colour_RED);
-            GFX_RectangleFill(cx - half_bins * BIN_WIDTH_OS,
+            GFX_RectangleFill(ox + BIN_X(NUM_BINS / 2 - half_bins),
                                oy - WORK_HEIGHT, 1, BAR_MAX_HEIGHT);
-            GFX_RectangleFill(cx + half_bins * BIN_WIDTH_OS,
+            GFX_RectangleFill(ox + BIN_X(NUM_BINS / 2 + half_bins),
                                oy - WORK_HEIGHT, 1, BAR_MAX_HEIGHT);
             Wimp_SetColour((int)colour_BLACK);
         }
@@ -1135,7 +1139,7 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
         {
             int full_w, w;
 
-            full_w = 496;
+            full_w = WORK_WIDTH - 16;
             w = ((level_db10_g + 1000) * full_w) / 1000;
             if (w < 0) {
                 w = 0;
@@ -1144,11 +1148,11 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                 w = full_w;
             }
             Wimp_SetColour((int)colour_GREY1);
-            GFX_RectangleFill(ox + 8, oy - 282, full_w, 16);
+            GFX_RectangleFill(ox + 8, oy - 232, full_w, 16);
             if (w > 0) {
                 Wimp_SetColour(squelch_open_g ? (int)colour_GREEN
                                               : (int)colour_RED);
-                GFX_RectangleFill(ox + 8, oy - 282, w, 16);
+                GFX_RectangleFill(ox + 8, oy - 232, w, 16);
             }
             Wimp_SetColour((int)colour_BLACK);
         }
@@ -1175,7 +1179,7 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                         trace_gap_all_ms(), audio_stream_underruns());
             }
             GFX_VDU(5);
-            GFX_Move(ox + 4, oy - 302);
+            GFX_Move(ox + 4, oy - 252);
             GFX_Write0(line2);
             GFX_VDU(4);
         }
@@ -1509,6 +1513,7 @@ static window_handle create_spectrum_window(void)
     rwb.behind = -1;
 
     rwb.flags.data.moveable = 1;
+    rwb.flags.data.backicon = 1;
     rwb.flags.data.titlebar = 1;
     rwb.flags.data.closeicon = 1;
     rwb.flags.data.newflags = 1;
@@ -1548,101 +1553,6 @@ static window_handle create_spectrum_window(void)
     return win;
 }
 
-/* One shared helper for all the control-panel buttons -- same look
-   (bordered, filled, centred text, buttontype 3 "Click": Select
-   generates a single Mouse_Click event, the standard RISC OS push-
-   button behaviour), just different position/label. Icons sit in one
-   or more 32-unit-tall rows below the diagnostic text line (which
-   sits at the top, see Redraw_spectrum's line1), clear of the bars
-   below (WORK_HEIGHT is 360; RESERVED_TOP keeps every row and both
-   text lines out of the bars' reach). y1 is the row's top edge; the
-   row is always 32 units tall (y0 = y1 - 32), matching every existing
-   row's spacing. */
-static icon_handle create_button_icon(window_handle win, int x0, int x1,
-                                       int y1, const char *label)
-{
-    icon_createblock cb;
-    icon_handle icon;
-    os_error *err;
-
-    memset(&cb, 0, sizeof(cb));
-    cb.window = win;
-    cb.icondata.workarearect.min.x = x0;
-    cb.icondata.workarearect.min.y = y1 - 32;
-    cb.icondata.workarearect.max.x = x1;
-    cb.icondata.workarearect.max.y = y1;
-
-    cb.icondata.flags.data.text = 1;
-    cb.icondata.flags.data.border = 1;
-    cb.icondata.flags.data.hcentre = 1;
-    cb.icondata.flags.data.vcentre = 1;
-    cb.icondata.flags.data.filled = 1;
-    cb.icondata.flags.data.buttontype = 3; /* Click -- Select = one click */
-    cb.icondata.flags.data.foreground = colour_BLACK;
-    cb.icondata.flags.data.background = colour_GREY1;
-
-    strncpy(cb.icondata.data.text, label, wimp_MAXNAME - 1);
-    cb.icondata.data.text[wimp_MAXNAME - 1] = '\0';
-
-    err = Wimp_CreateIcon(&cb, &icon);
-    if (err != NULL) {
-        report_and_die(err->errmess);
-    }
-    return icon;
-}
-
-/* Row 1 of the control panel, y=-60 (icons span -92..-60). */
-#define ICON_ROW1_Y -60
-/* Row 2, directly below row 1 -- used once row 1 fills up (see
-   create_tone_icon). */
-#define ICON_ROW2_Y -100
-
-static void create_gain_icons(window_handle win)
-{
-    icon_agc_g = create_button_icon(win, 8, 88, ICON_ROW1_Y, "AGC");
-    icon_gaindown_g = create_button_icon(win, 96, 136, ICON_ROW1_Y, "-");
-    icon_gainup_g = create_button_icon(win, 144, 184, ICON_ROW1_Y, "+");
-}
-
-/* Same row as the gain buttons, positioned to their right --
-   WORK_WIDTH is 512, this uses up to x=348, leaving clear margin. */
-static void create_freq_icons(window_handle win)
-{
-    icon_freqdown_g = create_button_icon(win, 220, 280, ICON_ROW1_Y, "F-");
-    icon_frequp_g = create_button_icon(win, 288, 348, ICON_ROW1_Y, "F+");
-}
-
-/* Same row again, further right. 80 wide (matching icon_agc_g, not
-   the 60-wide gain/freq +/- buttons) -- "DEM" is a 3-character label
-   same as "AGC", and 60 units clipped it to "EM" on real hardware. Up
-   to x=436, still clear of WORK_WIDTH=512 -- but that's the last
-   button row 1 has room for (see create_tone_icon). */
-static void create_demod_icon(window_handle win)
-{
-    icon_demod_g = create_button_icon(win, 356, 436, ICON_ROW1_Y, "DEM");
-}
-
-/* Row 1 is full (AGC/-/+/F-/F+/DEM already span 8..436 of the 512-unit
-   width). "TONE" is 4 characters -- one longer than any existing
-   label -- so rather than cram it into row 1's remaining ~70 units
-   (already learned the hard way with DEM that a tight fit clips the
-   label), it gets its own row directly below. RESERVED_TOP/
-   BAR_MAX_HEIGHT and the demod text line's y both account for this
-   row's extra 40 units. */
-static void create_tone_icon(window_handle win)
-{
-    icon_tone_g = create_button_icon(win, 8, 88, ICON_ROW2_Y, "TONE");
-}
-
-/* Same row as TONE, to its right -- "STREAM" (6 characters) gets
-   generous width (160, vs 80 for the 3-4 character labels) given how
-   tight DEM/TONE already were at narrower widths. Up to x=256, well
-   clear of WORK_WIDTH=512. */
-static void create_stream_icon(window_handle win)
-{
-    icon_stream_g = create_button_icon(win, 96, 256, ICON_ROW2_Y, "STREAM");
-}
-
 int main(void)
 {
     int n;
@@ -1653,6 +1563,8 @@ int main(void)
     Event_Initialise("RTLSDRView");
     app_start_time_g = Time_Monotonic();
     os_set_quiet(1);    /* no stderr in a Wimp task */
+    r82xx_set_trace(0); /* ...and no tuner narration on the VDU screen
+                           behind the desktop */
 
     /* What was tuned, and how, last time (defaults if there is nothing
        saved). The frequency is applied by the tuner set-up below; mode,
@@ -1854,12 +1766,15 @@ int main(void)
     fft_stride_g = (rate_hz_g >= 960000L) ? 6 : 1;
 
     spectrum_window_g = create_spectrum_window();
-    create_gain_icons(spectrum_window_g);
-    create_freq_icons(spectrum_window_g);
-    create_demod_icon(spectrum_window_g);
-    create_tone_icon(spectrum_window_g);
-    create_stream_icon(spectrum_window_g);
     ui_create(spectrum_window_g, app_tune);
+    icon_stream_g = ui_icon(UI_STREAM);
+    icon_tone_g = ui_icon(UI_TONE);
+    icon_demod_g = ui_icon(UI_DEM);
+    icon_agc_g = ui_icon(UI_AGC);
+    icon_gaindown_g = ui_icon(UI_GAIN_DN);
+    icon_gainup_g = ui_icon(UI_GAIN_UP);
+    icon_freqdown_g = ui_icon(UI_FDN);
+    icon_frequp_g = ui_icon(UI_FUP);
     update_agc_icon();    /* reflect gain_mode_g's initial AGC state */
     update_demod_icon();  /* reflect demod_enabled_g's initial OFF state */
     update_tone_icon();   /* reflect tone_playing_g's initial OFF state */
@@ -1924,6 +1839,7 @@ int main(void)
     Window_Show(spectrum_window_g, open_CENTERED);
 
     Event_Claim(event_REDRAW, spectrum_window_g, event_ANY, Redraw_spectrum, NULL);
+    Event_Claim(event_OPEN, spectrum_window_g, event_ANY, Handler_OpenWindow, NULL);
     Event_Claim(event_CLOSE, spectrum_window_g, event_ANY, Close_spectrum, NULL);
     Event_Claim(event_CLICK, spectrum_window_g, event_ANY, Click_spectrum, NULL);
     Event_Claim(event_KEY, spectrum_window_g, event_ANY, Key_spectrum, NULL);

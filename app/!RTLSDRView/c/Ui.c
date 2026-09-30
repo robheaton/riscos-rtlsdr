@@ -22,6 +22,8 @@
 #include "Receiver.h"
 #include "Ui.h"
 
+#define PANEL_TOP   (-48)    /* top of the first row; the status text sits
+                                above it */
 #define ROW_PITCH   40
 #define ICON_H      32
 #define TXT_LEN     20
@@ -30,16 +32,6 @@
 #define KEY_ESCAPE  27
 #define KEY_DOWN    0x18E
 #define KEY_UP      0x18F
-
-enum {
-    UI_MODE_NFM, UI_MODE_WFM, UI_MODE_AM,
-    UI_FREQ, UI_FREQ_UNIT,
-    UI_STEP,
-    UI_BW_DN, UI_BW_VAL, UI_BW_UP,
-    UI_SQ_DN, UI_SQ_VAL, UI_SQ_UP,
-    UI_VOL_DN, UI_VOL_VAL, UI_VOL_UP, UI_MUTE,
-    UI_COUNT
-};
 
 /* what sort of icon */
 #define K_BUTTON      0   /* clickable, fixed label */
@@ -56,25 +48,35 @@ typedef struct {
     const char *label;       /* fixed text (initial text for indirected) */
 } ui_item;
 
+/* Widths: 16 x characters + 32, rounded up. The window is 640 units wide. */
 static const ui_item ui_items[] = {
-    { UI_MODE_NFM,  K_BUTTON,     8,  68, 0, "NFM" },
-    { UI_MODE_WFM,  K_BUTTON,    72, 132, 0, "WFM" },
-    { UI_MODE_AM,   K_BUTTON,   136, 196, 0, "AM" },
-    { UI_FREQ,      K_FIELD,    212, 372, 0, "97.400000" },
-    { UI_FREQ_UNIT, K_LABEL,    376, 428, 0, "MHz" },
+    { UI_STREAM,    K_BUTTON,      8, 136, 0, "STREAM" },
+    { UI_TONE,      K_BUTTON,    144, 248, 0, "TONE" },
+    { UI_DEM,       K_BUTTON,    256, 336, 0, "DEM" },
+    { UI_AGC,       K_BUTTON,    376, 456, 0, "AGC" },
+    { UI_GAIN_DN,   K_BUTTON,    464, 504, 0, "-" },
+    { UI_GAIN_UP,   K_BUTTON,    512, 552, 0, "+" },
 
-    { UI_STEP,      K_BUTTON_IND,  8, 128, 1, "Step 100k" },
-    { UI_BW_DN,     K_BUTTON,    140, 172, 1, "-" },
-    { UI_BW_VAL,    K_VALUE,     172, 272, 1, "BW 150k" },
-    { UI_BW_UP,     K_BUTTON,    272, 304, 1, "+" },
-    { UI_SQ_DN,     K_BUTTON,    320, 352, 1, "-" },
-    { UI_SQ_VAL,    K_VALUE,     352, 432, 1, "Sq off" },
-    { UI_SQ_UP,     K_BUTTON,    432, 464, 1, "+" },
+    { UI_MODE_NFM,  K_BUTTON,      8,  92, 1, "NFM" },
+    { UI_MODE_WFM,  K_BUTTON,    100, 184, 1, "WFM" },
+    { UI_MODE_AM,   K_BUTTON,    192, 256, 1, "AM" },
+    { UI_FREQ,      K_FIELD,     272, 456, 1, "97.400000" },
+    { UI_FREQ_UNIT, K_LABEL,     460, 524, 1, "MHz" },
+    { UI_FDN,       K_BUTTON,    532, 580, 1, "F-" },
+    { UI_FUP,       K_BUTTON,    584, 632, 1, "F+" },
 
-    { UI_VOL_DN,    K_BUTTON,      8,  40, 2, "-" },
-    { UI_VOL_VAL,   K_VALUE,      40, 120, 2, "Vol 70" },
-    { UI_VOL_UP,    K_BUTTON,    120, 152, 2, "+" },
-    { UI_MUTE,      K_BUTTON,    164, 224, 2, "Mute" }
+    { UI_STEP,      K_BUTTON_IND,  8, 184, 2, "Step 100k" },
+    { UI_BW_DN,     K_BUTTON,    200, 240, 2, "-" },
+    { UI_BW_VAL,    K_VALUE,     240, 384, 2, "BW 150k" },
+    { UI_BW_UP,     K_BUTTON,    384, 424, 2, "+" },
+
+    { UI_SQ_DN,     K_BUTTON,      8,  48, 3, "-" },
+    { UI_SQ_VAL,    K_VALUE,      48, 176, 3, "Sq off" },
+    { UI_SQ_UP,     K_BUTTON,    176, 216, 3, "+" },
+    { UI_VOL_DN,    K_BUTTON,    240, 280, 3, "-" },
+    { UI_VOL_VAL,   K_VALUE,     280, 424, 3, "Vol 100" },
+    { UI_VOL_UP,    K_BUTTON,    424, 464, 3, "+" },
+    { UI_MUTE,      K_BUTTON,    480, 576, 3, "Mute" }
 };
 
 #define N_ITEMS ((int)(sizeof(ui_items) / sizeof(ui_items[0])))
@@ -91,7 +93,7 @@ static void make_icon(const ui_item *it)
     os_error *err;
     int y1;
 
-    y1 = UI_PANEL_TOP - ROW_PITCH * it->row;
+    y1 = PANEL_TOP - ROW_PITCH * it->row;
     memset(&cb, 0, sizeof(cb));
     cb.window = win_g;
     cb.icondata.workarearect.min.x = it->x0;
@@ -230,6 +232,11 @@ void ui_refresh(void)
     set_selected(UI_MUTE, rcv.muted);
 }
 
+icon_handle ui_icon(int id)
+{
+    return icon_g[id];
+}
+
 void ui_create(window_handle win, int (*tune)(unsigned long hz))
 {
     int i;
@@ -311,6 +318,9 @@ int ui_click(icon_handle icon, int select, int adjust)
     }
     if (id >= UI_COUNT) {
         return 0;
+    }
+    if (id < UI_N_LEGACY) {
+        return 0;     /* stream, tone, gain, F-/F+: SpecView.c's */
     }
     fine = adjust ? 1 : 0;
 
