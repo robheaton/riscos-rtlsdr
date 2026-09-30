@@ -48,14 +48,15 @@ typedef struct {
     const char *label;       /* fixed text (initial text for indirected) */
 } ui_item;
 
-/* Widths: 16 x characters + 32, rounded up. The window is 640 units wide. */
+/* Widths: the button text is in the proportional desktop font, where capital
+   letters run to about 22 units: allow that x characters + 32. The window is
+   640 units wide. */
 static const ui_item ui_items[] = {
-    { UI_STREAM,    K_BUTTON,      8, 136, 0, "STREAM" },
-    { UI_TONE,      K_BUTTON,    144, 248, 0, "TONE" },
-    { UI_DEM,       K_BUTTON,    256, 336, 0, "DEM" },
-    { UI_AGC,       K_BUTTON,    376, 456, 0, "AGC" },
-    { UI_GAIN_DN,   K_BUTTON,    464, 504, 0, "-" },
-    { UI_GAIN_UP,   K_BUTTON,    512, 552, 0, "+" },
+    { UI_STREAM,    K_BUTTON,      8, 176, 0, "STREAM" },
+    { UI_DEM,       K_BUTTON,    184, 272, 0, "DEM" },
+    { UI_AGC,       K_BUTTON,    288, 372, 0, "AGC" },
+    { UI_GAIN_DN,   K_BUTTON,    380, 420, 0, "-" },
+    { UI_GAIN_UP,   K_BUTTON,    428, 468, 0, "+" },
 
     { UI_MODE_NFM,  K_BUTTON,      8,  92, 1, "NFM" },
     { UI_MODE_WFM,  K_BUTTON,    100, 184, 1, "WFM" },
@@ -320,7 +321,7 @@ int ui_click(icon_handle icon, int select, int adjust)
         return 0;
     }
     if (id < UI_N_LEGACY) {
-        return 0;     /* stream, tone, gain, F-/F+: SpecView.c's */
+        return 0;     /* stream, demod, gain, F-/F+: SpecView.c's */
     }
     fine = adjust ? 1 : 0;
 

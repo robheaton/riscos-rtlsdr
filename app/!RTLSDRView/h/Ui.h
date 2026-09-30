@@ -4,9 +4,10 @@
    receiver state in Receiver.h, and calls back into SpecView.c to retune
    the hardware.
 
-   Layout rules (the screen font is 16 OS units per character, and an
-   icon's text is clipped to the icon less its border): a label needs
-   16 x characters + ~32 units of width.
+   Layout rules (button text is in the proportional desktop font, about 22
+   OS units for a capital and less for lower case, and an icon's text is
+   clipped to the icon less its border): a label needs about
+   22 x characters + ~32 units of width.
 
    C89 only (Norcroft). */
 
@@ -16,9 +17,9 @@
 #include "DeskLib:Wimp.h"
 
 /* Control ids. The first UI_N_LEGACY are acted on by SpecView.c (stream,
-   tone, gain, frequency step); the rest by the panel itself. */
+   demod, AGC, gain, frequency step); the rest by the panel itself. */
 enum {
-    UI_STREAM, UI_TONE, UI_DEM, UI_AGC, UI_GAIN_DN, UI_GAIN_UP,
+    UI_STREAM, UI_DEM, UI_AGC, UI_GAIN_DN, UI_GAIN_UP,
     UI_FDN, UI_FUP,
     UI_N_LEGACY,
     UI_MODE_NFM = UI_N_LEGACY, UI_MODE_WFM, UI_MODE_AM,

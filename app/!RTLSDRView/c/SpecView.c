@@ -374,17 +374,13 @@ static double demod_dev_peak_g = 0.0; /* Hz, EMA-smoothed */
 static int level_db10_g = -999;       /* channel level, dBFS x 10 */
 static int squelch_open_g = 1;
 
-/* ---- audio test tone (see Audio.h) ----
-   First-pass proof that RISC OS audio output works at all from this
-   app (TimPlayer module load, RMA buffer, looped sample playback) --
-   a generated 440Hz tone, NOT the real FM-demodulated audio yet.
-   audio_ok_g tracks whether audio_test_tone_init() actually succeeded
-   (TimPlayer might not be present/loadable on a given machine) --
-   toggling icon_tone_g does nothing if it didn't, rather than trying
-   to play into an uninitialised buffer. */
+/* ---- audio set-up (see Audio.h) ----
+   audio_test_tone_init() claims the TimPlayer FX/song handles that
+   audio_stream_init() then reuses (the 440Hz test tone itself is no
+   longer offered in the window). audio_ok_g tracks whether it succeeded
+   (TimPlayer might not be present/loadable on a given machine); if not,
+   streaming is not attempted. */
 static int audio_ok_g = 0;
-static int tone_playing_g = 0;
-static icon_handle icon_tone_g = 0;
 
 /* ---- audio streaming (see Audio.h) ----
    Real FM-demodulated audio (Dsp.c: CIC channel filter, integer
@@ -1128,7 +1124,7 @@ static BOOL Redraw_spectrum(event_pollblock *event, void *reference)
                         bwtxt, gain_index_g, rate_hz_g / 1000L);
             }
             GFX_VDU(5);
-            GFX_Move(ox + 4, oy - 20);
+            GFX_Move(ox + 4, oy - 12);
             GFX_Write0(line1);
             GFX_VDU(4);
         }
@@ -1226,11 +1222,6 @@ static void update_agc_icon(void)
 static void update_demod_icon(void)
 {
     set_icon_selected(icon_demod_g, demod_enabled_g);
-}
-
-static void update_tone_icon(void)
-{
-    set_icon_selected(icon_tone_g, tone_playing_g);
 }
 
 static void update_stream_icon(void)
@@ -1363,21 +1354,8 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
         return TRUE;
     }
 
-    if (icon == icon_tone_g) {
-        /* Also pure software (TimPlayer, not the tuner) -- no I2C
-           repeater bracket. Does nothing if audio_test_tone_init()
-           never succeeded (audio_ok_g), rather than toggling a button
-           that plays nothing. */
-        if (audio_ok_g) {
-            tone_playing_g = !tone_playing_g;
-            audio_test_tone_play(tone_playing_g);
-            update_tone_icon();
-        }
-        return TRUE;
-    }
-
     if (icon == icon_stream_g) {
-        /* Same pattern as TONE -- pure software, does nothing if
+        /* Pure software (no tuner I2C), does nothing if
            audio_stream_init() never succeeded. Turning STREAM on also
            turns DEM on (streaming needs the same per-sample
            computation the DEM readout uses -- no reason to make the
@@ -1768,7 +1746,6 @@ int main(void)
     spectrum_window_g = create_spectrum_window();
     ui_create(spectrum_window_g, app_tune);
     icon_stream_g = ui_icon(UI_STREAM);
-    icon_tone_g = ui_icon(UI_TONE);
     icon_demod_g = ui_icon(UI_DEM);
     icon_agc_g = ui_icon(UI_AGC);
     icon_gaindown_g = ui_icon(UI_GAIN_DN);
@@ -1777,29 +1754,27 @@ int main(void)
     icon_frequp_g = ui_icon(UI_FUP);
     update_agc_icon();    /* reflect gain_mode_g's initial AGC state */
     update_demod_icon();  /* reflect demod_enabled_g's initial OFF state */
-    update_tone_icon();   /* reflect tone_playing_g's initial OFF state */
     update_stream_icon(); /* reflect stream_enabled_g's initial OFF state */
 
     /* Non-fatal: a brand new, experimental subsystem (see Audio.h)
        shouldn't take down the whole proven spectrum display if
-       TimPlayer isn't present/loadable on this machine. The TONE
-       button simply does nothing if this fails (see Click_spectrum). */
+       TimPlayer isn't present/loadable on this machine. */
     audio_ok_g = (audio_test_tone_init() == 0);
     if (!audio_ok_g) {
-        report_warning("Audio test tone setup failed (TimPlayer module "
-                        "not available?) -- the TONE button will do "
-                        "nothing. Everything else is unaffected.");
+        report_warning("Audio setup failed (TimPlayer module "
+                        "not available?) -- there will be no audio. "
+                        "Everything else is unaffected.");
     }
 
     /* Requires audio_ok_g (audio_stream_init() reuses the FX/song
        handles audio_test_tone_init() claims -- see Audio.h). Same
-       non-fatal treatment as the test tone. */
+       non-fatal treatment. */
     if (audio_ok_g) {
         stream_ok_g = (audio_stream_init() == 0);
         if (!stream_ok_g) {
             report_warning("Audio streaming setup failed -- the STREAM "
                             "button will do nothing. Everything else "
-                            "(including TONE) is unaffected.");
+                            "is unaffected.");
         }
     }
 
