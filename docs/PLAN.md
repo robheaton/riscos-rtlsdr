@@ -2486,12 +2486,41 @@ blocked the app for 600 ms; afterwards the lead was back at its normal
   after every I2C transfer, left over from the hang hunt ("remove if it
   doesn't help" -- the freezes stopped for another reason, see above) and
   ~40 transfers per retune. `RTLSDRView$PaceMS 0` disables it after tuner
-  bring-up (launcher `T6`); not yet tried on hardware, and it touches the
-  code path of the historical hangs, so it is opt-in.
+  bring-up (launcher `T6`); tried on hardware with no hang and a retune
+  time of 40-60 ms (next section), so it is now the default -- tuner
+  bring-up itself, where the hangs were seen, stays paced.
+
+### The no-pacing run, and the defaults
+
+`T6` (same as `T1` but `RTLSDRView$PaceMS 0`; log in
+[docs/logs](logs/2026-09-30-T6-240k-96K-pace0.txt)): four retunes (F-/F+/F-/F+)
+took **4, 4, 5 and 6 cs** -- 40-60 ms against 210-600 ms with the pause --
+PLL locked every time (the handler only commits a retune that locked), no
+hang, and none of them underran (each cost ~200 ms of audio lead through
+the discard of the buffered, old-frequency data, which `audio_stream_relead()`
+rebuilt). The same log also shows what a busier desktop does to the 96 KB /
+300 ms profile: three stalls of 0.97-1.27 s (one whole second without a
+single poll), each longer than both the lead and the ~410 ms of USB
+coverage, so three underruns and ~2.6 s of data lost over those 12 seconds.
+
+The user then compared profiles by ear and on the desktop and chose
+**`T5` -- 240 kSPS, 192 KB reads (~400 ms per transfer, ~0.8 s of USB
+coverage), 1024 KB stream buffer, 500 ms lead -- as "the sweet spot": audio
+good, no dropouts while moving windows around.** Those are now the
+built-in defaults (`RateK` 240, `XferKB` ~400 ms of data, `BufKB` 4x that,
+`LeadMS` 500 at 240 kSPS), together with `PaceMS` 0. Every one is still a
+system variable, and `tools/launchers/` has the Obey files for the other
+profiles (`T1`-`T6`).
+
+The trade is latency: steady-state the audio lead swings between 500 and
+~900 ms, and the USB data in front of it is up to 0.4 s old, so the
+air-to-speaker delay is roughly 0.7-1 s. A retune now costs ~50 ms of
+blocking plus ~200 ms of lead that is rebuilt with silence.
 
 ### Status
 
-Pending on hardware: `T3` (2.4 MSPS, 128 KB reads -- the wide-spectrum mode
-can at best cover ~27-54 ms of stall), `T5` (192 KB reads, 500 ms lead), `T6`
-(no pacing), and a subjective listening report for 240 kSPS audio.
-
+Pending: `Log5` (the `T5` profile's own trace -- written when its window is
+closed) to see what stalls the user's desktop actually produces against it;
+`T3` (2.4 MSPS, 128 KB reads). Not attempted: adapting the lead to the
+stalls actually seen (low latency in quiet periods, more lead after a long
+stall); squelch, volume control, stereo/RDS.

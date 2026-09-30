@@ -52,13 +52,15 @@ milliseconds in its ring. See `docs/PLAN.md` "milestone 7" for the evidence.
 
 **Known limitations.**
 - **A stall longer than the audio lead is an audible pause** (RISC OS
-  cooperative multitasking; the lead is `RTLSDRView$LeadMS`, default 350 ms
-  -- more lead, more latency). Desktop drags measured 80-110 ms worst gaps
-  and were absorbed completely at 240 kSPS.
-- **A retune (F+/F-) mutes the audio for 0.2-0.6 s** while the tuner's I2C
-  transfers run (see `RTLSDRView$PaceMS`).
-- At the full 2.4 MSPS a transfer is only ~27 ms of data, so that mode
-  cannot ride out stalls the way the 240 kSPS audio mode does.
+  cooperative multitasking; the lead is `RTLSDRView$LeadMS`, default 500 ms
+  -- more lead, more latency). The defaults (240 kSPS, 192 KB reads, 500 ms
+  lead) are the profile that held up best against real desktop use
+  (window dragging, NAS folder windows); the price is ~0.7-1 s between the
+  air and the speaker, so tuning feedback is not instant. Stalls of 1 s or
+  more, which happen occasionally, still cause a pause with a shorter lead.
+- The default 240 kSPS mode shows a 240 kHz-wide spectrum (one station);
+  `RTLSDRView$RateK 2400` gives the whole 2.4 MHz, but a transfer is then
+  only ~27 ms of data, so that mode cannot ride out stalls.
 - Mono only (no stereo decode, no RDS); no squelch, so weak stations hiss;
   no volume control yet; the station must be at the centre of the capture
   (tune with F-/F+).
@@ -170,17 +172,22 @@ rest of the desktop held the CPU between two polls, in the last few seconds
 variables read at start-up (an Obey launcher just `*Set`s them first):
 
 ```
-*Set RTLSDRView$RateK 240     dongle sample rate, kSPS: 2400 (default) or 240
-*Set RTLSDRView$XferKB 96     read request = USB transfer size, KB
-                              (default: ~200 ms of data, 16-128 KB)
-*Set RTLSDRView$BufKB 512     DeviceFS stream buffer, KB (default 4x XferKB)
-*Set RTLSDRView$LeadMS 300    audio lead, ms (default 350)
+*Set RTLSDRView$RateK 240     dongle sample rate, kSPS: 240 (default) or 2400
+*Set RTLSDRView$XferKB 192    read request = USB transfer size, KB
+                              (default: ~400 ms of data; 128 KB at 2.4 MSPS)
+*Set RTLSDRView$BufKB 1024    DeviceFS stream buffer, KB
+                              (default 4x XferKB, power of two)
+*Set RTLSDRView$LeadMS 500    audio lead, ms (default 500 at 240 kSPS, 350 above)
 *Set RTLSDRView$FFTFrames 4   spectrum frames per display update (default 4)
-*Set RTLSDRView$PaceMS 0      0 = no pause after each tuner I2C transfer once
-                              running (default 10; 0 untested -- the pause is
-                              a leftover from the hang hunt)
+*Set RTLSDRView$PaceMS 10     pause after each tuner I2C transfer once running
+                              (default 0: a retune takes ~50 ms instead of
+                              200-600 ms; the pause is a leftover from the
+                              hang hunt -- 10 restores it)
 *Set RTLSDRView$Log <Obey$Dir>.Log1    write a per-second trace here on exit
 ```
+
+Ready-made Obey launchers for the profiles compared during the stall work
+are in [`tools/launchers/`](tools/launchers/).
 
 If the driver can't service the configured transfer size (no data for 3 s),
 the app falls back to 16 KB reads and a 128 KB buffer and says so.

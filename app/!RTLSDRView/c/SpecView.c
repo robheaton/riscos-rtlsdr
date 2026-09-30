@@ -429,22 +429,29 @@ static unsigned int poll_idle_cs_g = 0;
 
 /* Run-time tunables, read once at start-up from RISC OS system variables
    so different settings can be tried without a rebuild (an Obey launcher
-   just *Sets them first):
-     RTLSDRView$RateK      dongle sample rate, kSPS: 2400 (default: the
-                           whole 2.4 MHz, ~4.8 MB/s) or 240 (FM audio
-                           only: 10x less USB traffic and CPU)
+   just *Sets them first). The defaults are the profile that worked best
+   on real hardware (240 kSPS audio mode, 192 KB reads, 500 ms lead):
+     RTLSDRView$RateK      dongle sample rate, kSPS: 240 (default: FM
+                           audio, ~10x less USB traffic and CPU; the
+                           spectrum then spans 240 kHz) or 2400 (the whole
+                           2.4 MHz, ~4.8 MB/s)
      RTLSDRView$XferKB     read request = USB transfer size, KB (default:
-                           ~200 ms of data, 16-128 KB)
-     RTLSDRView$BufKB      DeviceFS stream buffer, KB (default: 4x XferKB)
-     RTLSDRView$LeadMS     audio lead, ms (default 350)
+                           ~400 ms of data -- 192 KB at 240 kSPS, 128 KB at
+                           2.4 MSPS)
+     RTLSDRView$BufKB      DeviceFS stream buffer, KB (default: 4x XferKB
+                           rounded up to a power of two)
+     RTLSDRView$LeadMS     audio lead, ms (default 500 at 240 kSPS, 350
+                           above that)
      RTLSDRView$FFTFrames  spectrum frames per display update (default 4)
+     RTLSDRView$PaceMS     0 (default) = no pause after each tuner I2C
+                           transfer once running; 10 = the old pause
      RTLSDRView$Log        write a per-second trace to this file on exit
    A bigger transfer rides out longer desktop stalls without losing
    samples; a bigger lead keeps the audio playing through them. Both add
    latency. */
 #define SAFE_BUF_KB      128    /* the proven-good stream buffer size... */
 #define SAFE_REQ_BYTES   16384  /* ...and read request: the fallback */
-#define DEFAULT_LEAD_MS  350
+#define DEFAULT_LEAD_MS  350   /* above 480 kSPS (see main()) */
 static int stream_buf_kb_g = 512;
 
 static int env_int(const char *name, int def, int lo, int hi)
@@ -762,11 +769,18 @@ static void report_warning(const char *msg)
 static int open_stream(int buf_kb)
 {
     char path[112];
+    int timeout_ms;
 
-    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout2000;"
+    /* The driver's per-transfer timeout must comfortably outlast one
+       transfer (req bytes at rate * 2 bytes/s): at least 2 s. */
+    timeout_ms = (int)(((long)rx_req_bytes_g * 3000L) / (rate_hz_g * 2L));
+    if (timeout_ms < 2000) {
+        timeout_ms = 2000;
+    }
+    sprintf(path, "devices#endpoint%d;interface%d;bulk;usbtimeout%d;"
                   "nopad;size%d:%s",
-            RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, buf_kb * 1024,
-            device_name_g);
+            RTLSDR_BULK_ENDPOINT, RTLSDR_BULK_INTERFACE, timeout_ms,
+            buf_kb * 1024, device_name_g);
     stream_handle_g = os_find_open(path);
     if (stream_handle_g == 0) {
         return -1;
@@ -1579,9 +1593,9 @@ int main(void)
     os_set_quiet(1);    /* no stderr in a Wimp task */
 
     /* Run-time settings (see the comment above SAFE_BUF_KB). */
-    rate_k = env_int("RTLSDRView$RateK", 2400, 240, 2880);
+    rate_k = env_int("RTLSDRView$RateK", 240, 240, 2880);
     if ((rate_k % 240) != 0 || (rate_k > 300 && rate_k <= 900)) {
-        rate_k = 2400;   /* not a rate the demodulator/dongle can do */
+        rate_k = 240;    /* not a rate the demodulator/dongle can do */
     }
     rate_hz_g = 1000L * (long)rate_k;
 
@@ -1664,9 +1678,11 @@ int main(void)
 
     /* Tuner bring-up is done (it stays paced: that is where the hangs
        were). Pacing after every I2C transfer is what made a retune take
-       200-600 ms; RTLSDRView$PaceMS 0 turns it off for runtime retunes
+       200-600 ms; with it off (the default now) a retune takes 40-60 ms
+       -- measured over four retunes on the Pi, no hangs, PLL locked each
+       time. RTLSDRView$PaceMS 10 restores the pause for runtime retunes
        and gain changes. */
-    pace_ms = env_int("RTLSDRView$PaceMS", 10, 0, 100);
+    pace_ms = env_int("RTLSDRView$PaceMS", 0, 0, 100);
     r82xx_set_pace_ms(pace_ms);
 
     rtlsdr_reset_buffer(device_name_g);
@@ -1697,20 +1713,26 @@ int main(void)
        without) and has been dropped. `size131072` (a 128 KB DeviceFS
        stream buffer instead of the small default) does help -- ~4.7
        MB/s vs. ~3.5 MB/s in the same investigation -- so it stays. */
-    /* Read request size: ~200 ms of data unless told otherwise (see the
+    /* Read request size: ~400 ms of data unless told otherwise (see the
        comment above rx_req_bytes_g for why this, not the buffer, is what
        sets the USB stall tolerance). Whole 1 KB steps keep it a multiple
-       of the bulk endpoint's 512-byte packets. */
+       of the bulk endpoint's 512-byte packets. At 2.4 MSPS that would be
+       nearly 2 MB: capped at 128 KB there, the largest size whose DMA
+       allocation is known to work at that rate. Never longer than ~1.5 s
+       of data, or a transfer would outlast the driver's 2 s timeout. */
     xfer_kb = env_int("RTLSDRView$XferKB", 0, 1, 1024);
     if (xfer_kb == 0) {
-        xfer_kb = (int)((rate_hz_g * 2L / 5L) / 1024L);
+        xfer_kb = (int)((rate_hz_g * 4L / 5L) / 1024L);
         xfer_kb = ((xfer_kb + 8) / 16) * 16;
-        if (xfer_kb > 128) {
-            xfer_kb = 128;
+        if (xfer_kb > ((rate_hz_g > 1000000L) ? 128 : 192)) {
+            xfer_kb = (rate_hz_g > 1000000L) ? 128 : 192;
         }
         if (xfer_kb < 16) {
             xfer_kb = 16;
         }
+    }
+    if ((long)xfer_kb * 1024L > rate_hz_g * 3L) {
+        xfer_kb = (int)((rate_hz_g * 3L) / 1024L);
     }
     /* The stream buffer has to hold the transfer in flight, the one
        just completed but not yet read, and some slack. */
@@ -1800,7 +1822,9 @@ int main(void)
     /* The demodulator runs whether or not audio output is available
        (the DEM readout uses it too), so configure it either way: the
        mixer's real rate if audio came up, else a nominal 48 kHz. */
-    lead_ms = env_int("RTLSDRView$LeadMS", DEFAULT_LEAD_MS, 100, 1200);
+    lead_ms = env_int("RTLSDRView$LeadMS",
+                      (rate_hz_g <= 480000L) ? 500 : DEFAULT_LEAD_MS,
+                      100, 1200);
     burst_ms = (int)(((long)rx_req_bytes_g * 1000L) / (rate_hz_g * 2L));
     if (stream_ok_g) {
         audio_stream_set_lead_ms(lead_ms);

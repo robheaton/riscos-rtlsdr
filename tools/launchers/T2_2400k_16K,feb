@@ -1,0 +1,7 @@
+Set RTLSDRView$RateK 2400
+Set RTLSDRView$XferKB 16
+Set RTLSDRView$BufKB 512
+Set RTLSDRView$LeadMS 350
+Set RTLSDRView$PaceMS 10
+Set RTLSDRView$Log <Obey$Dir>.Log2
+<Obey$Dir>.RTLSDRView
