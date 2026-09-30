@@ -80,6 +80,9 @@ static int playing_g = 0;
                                       what matter */
 static int stream_lead_target_ms_g = STREAM_LEAD_DEFAULT_MS;
 static int stream_burst_ms_g = 0;    /* how long a burst of input covers */
+static int stream_pending_ms_g = 0;  /* audio the caller has ready to feed
+                                        right now (see set_pending_ms) */
+static int stream_relead_g = 0;      /* top the lead up at the next feed */
 static int stream_synced_g = 0;      /* has the first sync happened yet? */
 static int stream_underruns_g = 0;
 
@@ -547,12 +550,19 @@ int audio_stream_feed(const short *samples, int n)
     }
 
     ahead = (long)(stream_total_written_g - played);
-    if (stream_synced_g && (!iv_have_g || ahead < iv_ahead_min_g)) {
-        iv_ahead_min_g = ahead;
-        iv_have_g = 1;
+    if (stream_synced_g) {
+        if (!iv_have_g) {
+            iv_ahead_min_g = ahead;
+            iv_ahead_max_g = ahead;
+            iv_have_g = 1;
+        } else if (ahead < iv_ahead_min_g) {
+            iv_ahead_min_g = ahead;
+        }
     }
 
     if (ahead < lead_min) {
+        long backlog, fill;
+
         if (stream_synced_g) {
             stream_underruns_g++;
             iv_underruns_g++;
@@ -566,17 +576,50 @@ int audio_stream_feed(const short *samples, int n)
            seconds later), which is exactly the "burst of static every
            couple of seconds" symptom. Instead, jump the write head to a
            fixed lead ahead of the play head, and silence everything in
-           between: the play head is about to sweep through that region,
-           and it still holds audio from the previous lap of the loop.
-           (When ahead is negative the gap starts at the play head, not
-           at the stale write head.) */
+           between.
+
+           How much silence: enough that the lead, just before the NEXT
+           burst of input arrives, is lead_target. If the caller is
+           already holding more than one burst of audio (a backlog that
+           built up while the desktop had this app stalled) that audio
+           is about to be written straight after the silence and counts
+           towards the lead, so less silence is needed -- without this,
+           every recovery from a long stall added the whole backlog on top
+           of the lead and the latency ratcheted up for good. (Measured:
+           lead 300-490 ms before a 950 ms stall, 510-705 ms after.) */
+        backlog = ((long)stream_pending_ms_g - (long)stream_burst_ms_g) *
+                  (long)stream_rate_g / 1000;
+        if (backlog < 0) {
+            backlog = 0;
+        }
+        fill = lead_target - backlog;
+        if (fill < lead_min) {
+            fill = lead_min;
+        }
+        /* When ahead is negative the gap starts at the play head, not at
+           the stale write head. */
         p = (ahead > 0) ? stream_total_written_g : played;
-        while (p < played + (unsigned long)lead_target) {
+        while (p < played + (unsigned long)fill) {
             stream_buf_g[(int)(p % (unsigned long)stream_capacity_g)] = 0;
             p++;
         }
-        stream_total_written_g = played + (unsigned long)lead_target;
-        ahead = lead_target;
+        stream_total_written_g = played + (unsigned long)fill;
+        ahead = fill;
+        stream_relead_g = 0;
+    } else if (stream_relead_g) {
+        /* Something (a retune) threw away audio that was on its way to
+           the ring, or kept the app busy for a while: rebuild the lead
+           with silence rather than run on with a thin one. */
+        stream_relead_g = 0;
+        if (ahead < lead_target) {
+            p = stream_total_written_g;
+            while (p < played + (unsigned long)lead_target) {
+                stream_buf_g[(int)(p % (unsigned long)stream_capacity_g)] = 0;
+                p++;
+            }
+            stream_total_written_g = played + (unsigned long)lead_target;
+            ahead = lead_target;
+        }
     }
 
     /* Don't let the write head run further ahead than lead_max: that
@@ -606,6 +649,7 @@ int audio_stream_feed(const short *samples, int n)
         long after;
         after = ahead + (long)written;
         if (!iv_have_g) {
+            /* first sync of an interval: the lead range starts here */
             iv_ahead_min_g = ahead;
             iv_ahead_max_g = after;
             iv_have_g = 1;
@@ -641,6 +685,16 @@ int audio_stream_take_interval(int *ahead_min_ms, int *ahead_max_ms,
     iv_underruns_g = 0;
     iv_feed_gap_max_cs_g = 0;
     return 1;
+}
+
+void audio_stream_set_pending_ms(int ms)
+{
+    stream_pending_ms_g = (ms < 0) ? 0 : ms;
+}
+
+void audio_stream_relead(void)
+{
+    stream_relead_g = 1;
 }
 
 void audio_stream_set_burst_ms(int ms)

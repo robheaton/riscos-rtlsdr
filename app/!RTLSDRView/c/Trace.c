@@ -16,6 +16,7 @@
 typedef struct {
     unsigned long  bytes;         /* bytes read off the USB stream */
     unsigned long  maxread;       /* largest single read, bytes */
+    unsigned long  backlog;       /* most bytes found waiting unread */
     unsigned short reads;         /* read calls that returned data */
     unsigned short empty;         /* read calls that returned nothing */
     unsigned short ticks;         /* polls of the null-event handler */
@@ -59,6 +60,7 @@ static unsigned int t0_cs_g = 0;
 static trace_event_rec events_g[TRACE_MAX_EVENTS];
 static int nevents_g = 0;
 
+static unsigned int idle_cs_g = 0;
 static unsigned int last_begin_g = 0;
 static int last_begin_set_g = 0;
 static unsigned int last_busy_g = 0;
@@ -156,7 +158,15 @@ void trace_tick_begin(unsigned int now_cs)
         int c;
 
         gap_cs = now_cs - last_begin_g;
-        fg = (gap_cs > last_busy_g) ? (gap_cs - last_busy_g) : 0;
+        fg = (gap_cs > last_busy_g + idle_cs_g)
+                 ? (gap_cs - last_busy_g - idle_cs_g) : 0;
+        /* The clock ticks every 10 ms and polls can be microseconds
+           apart, so two polls either side of a tick boundary differ by
+           1 cs however close they really were: a one-tick "gap" is
+           quantisation, not the desktop. Only two or more is real. */
+        if (fg < 2) {
+            fg = 0;
+        }
         if (fg > cur_g.fgap_max_cs) {
             cur_g.fgap_max_cs = (unsigned short)((fg > 65535U) ? 65535U : fg);
         }
@@ -177,6 +187,18 @@ void trace_tick_end(unsigned int now_cs)
 {
     last_busy_g = now_cs - tick_begin_g;
     ADD16(cur_g.tick_cs, last_busy_g);
+}
+
+void trace_set_idle_cs(unsigned int idle_cs)
+{
+    idle_cs_g = idle_cs;
+}
+
+void trace_backlog(unsigned long bytes)
+{
+    if (bytes > cur_g.backlog) {
+        cur_g.backlog = bytes;
+    }
 }
 
 void trace_read(int nbytes, unsigned int usb_cs)
@@ -274,22 +296,22 @@ int trace_write(void)
     fprintf(f, "# %s\n", config_g);
     fprintf(f, "# columns (one row per second): sec bytes reads empty "
                "ticks tick_cs usb_cs dsp_cs fft_cs disp_cs fft_frames "
-               "fgap_max_cs maxread ahead_min_ms ahead_max_ms dropped_ms "
-               "feed_gap_ms underruns\n");
+               "fgap_max_cs maxread backlog ahead_min_ms ahead_max_ms "
+               "dropped_ms feed_gap_ms underruns\n");
     fprintf(f, "# (cs = centiseconds; fgap = longest time the rest of the "
                "desktop held the CPU between two polls of this app; ahead "
                "= how far the audio write head ran ahead of the estimated "
                "play position; -999 = no audio data that second)\n");
     for (i = 0; i < nbuckets_g; i++) {
         const trace_bucket *b = &buckets_g[i];
-        fprintf(f, "%d %lu %u %u %u %u %u %u %u %u %u %u %lu %d %d %d %d "
-                   "%u\n",
+        fprintf(f, "%d %lu %u %u %u %u %u %u %u %u %u %u %lu %lu %d %d %d "
+                   "%d %u\n",
                 i, b->bytes, (unsigned int)b->reads,
                 (unsigned int)b->empty, (unsigned int)b->ticks,
                 (unsigned int)b->tick_cs, (unsigned int)b->usb_cs,
                 (unsigned int)b->dsp_cs, (unsigned int)b->fft_cs,
                 (unsigned int)b->disp_cs, (unsigned int)b->fft_frames,
-                (unsigned int)b->fgap_max_cs, b->maxread,
+                (unsigned int)b->fgap_max_cs, b->maxread, b->backlog,
                 b->audio_valid ? (int)b->ahead_min_ms : -999,
                 b->audio_valid ? (int)b->ahead_max_ms : -999,
                 b->audio_valid ? (int)b->dropped_ms : -999,

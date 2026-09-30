@@ -94,6 +94,20 @@ void audio_stream_set_lead_ms(int ms);
    before excess audio is dropped. */
 void audio_stream_set_burst_ms(int ms);
 
+/* Milliseconds of audio the caller has ready to feed right now: what
+   is left of the block currently being processed, plus whatever else is
+   already waiting in the USB buffer. Call before each audio_stream_feed().
+   Only used when the ring has to re-sync after an underrun: anything
+   beyond one burst is a backlog that piled up during a stall and
+   counts towards the lead, so less silence has to be inserted ahead of
+   it (otherwise the latency ratchets up with every long stall). */
+void audio_stream_set_pending_ms(int ms);
+
+/* Asks for the lead to be topped back up to its target, with silence,
+   at the next audio_stream_feed() (if it is below target by then). For
+   after something threw audio away or kept the app busy: a retune. */
+void audio_stream_relead(void);
+
 /* Number of genuine underruns (re-syncs after playback had already
    started) since audio_stream_init(). Each one is an audible pause. */
 int audio_stream_underruns(void);

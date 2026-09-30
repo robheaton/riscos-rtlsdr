@@ -35,6 +35,16 @@ void trace_init(const char *log_path, const char *config_text);
 void trace_tick_begin(unsigned int now_cs);
 void trace_tick_end(unsigned int now_cs);
 
+/* The interval (centiseconds) the main loop asks the Wimp to sleep
+   between polls (Wimp_PollIdle). It is time the app chose not to run,
+   not desktop interference, so it is not counted as a foreign gap. */
+void trace_set_idle_cs(unsigned int idle_cs);
+
+/* How many bytes were waiting unread in the USB stream buffer when a
+   block was read (biggest value per second is logged): shows how much
+   the USB pipe captured while the app was stalled. */
+void trace_backlog(unsigned long bytes);
+
 /* One os_gbpb_read4() call: bytes returned (0 = nothing buffered) and
    how many centiseconds the call itself took. */
 void trace_read(int nbytes, unsigned int usb_cs);

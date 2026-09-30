@@ -54,6 +54,29 @@ int usb_ctrl_transfer(const char *device_name, int bm_request_type,
     return 0;
 }
 
+/* Bytes currently waiting unread in the DeviceFS stream buffer of an open
+   USB bulk stream (DeviceCall_USB_BufferSpace, reason 0x80000002: R2 =
+   the fileswitch handle from os_find_open(); returns R3 = buffer size,
+   R4 = free space). -1 if the call fails. Cheap, moves no data. */
+#define USB_CALL_BUFFER_SPACE ((int)0x80000002u)
+
+int usb_stream_used_bytes(const char *device_name, int stream_handle)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *err;
+
+    regs.r[0] = USB_CALL_BUFFER_SPACE;
+    regs.r[1] = (int)device_name;
+    regs.r[2] = stream_handle;
+    regs.r[3] = 0;
+    regs.r[4] = 0;
+    err = _kernel_swi(SWI_DeviceFS_CallDevice, &regs, &regs);
+    if (err != NULL) {
+        return -1;
+    }
+    return regs.r[3] - regs.r[4];
+}
+
 /* Declared in RTLSDR.h -- also shared with c/R82XX.c, for GPIO control
    (SYS block). */
 int rtlsdr_read_reg(const char *dev, int block, int addr, int len)

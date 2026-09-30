@@ -419,6 +419,14 @@ static unsigned int usb_last_data_cs_g = 0;
 static unsigned int last_tick_cs_g = 0;
 static int usb_t0_set_g = 0;             /* has any data arrived yet? */
 
+/* How long (centiseconds) the main loop asks the Wimp to sleep between
+   polls of this app (Wimp_PollIdle). With big USB transfers there is
+   nothing to gain from polling faster than a fraction of one transfer's
+   duration, and spinning at 70,000 polls a second (which the log showed)
+   burned ~15% of the CPU in empty read calls. 0 = poll flat out, which
+   the small-request settings need. */
+static unsigned int poll_idle_cs_g = 0;
+
 /* Run-time tunables, read once at start-up from RISC OS system variables
    so different settings can be tried without a rebuild (an Obey launcher
    just *Sets them first):
@@ -834,6 +842,7 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
     int n;
     int npcm;
     int dsp_active;
+    int waiting, used;
     unsigned int tick_start_cs, t_prev, t_now;
     static short pcm_g[PCM_BUF_SAMPLES];
 
@@ -909,6 +918,16 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
         }
         usb_last_data_cs_g = t_now;
 
+        /* How much data was waiting (this block plus whatever is still
+           buffered behind it): a backlog means the app was stalled and
+           the USB pipe kept capturing meanwhile. */
+        waiting = got;
+        used = usb_stream_used_bytes(device_name_g, stream_handle_g);
+        if (used > 0) {
+            waiting += used;
+        }
+        trace_backlog((unsigned long)waiting);
+
         for (off = 0; off < got; off += FIXED_CHUNK_SIZE) {
             n = got - off;
             if (n > FIXED_CHUNK_SIZE) {
@@ -918,6 +937,13 @@ static BOOL Null_spectrum(event_pollblock *event, void *reference)
                 npcm = dsp_fm_process(rx_buf_g + off, n, pcm_g,
                                       PCM_BUF_SAMPLES);
                 if (stream_enabled_g && npcm > 0) {
+                    /* Tell the ring how much audio is ready right now
+                       (this slice, the rest of the block, and anything
+                       still buffered): if it has to re-sync after an
+                       underrun, a backlog counts towards the lead. */
+                    audio_stream_set_pending_ms(
+                        (int)(((long)(waiting - off) * 1000L) /
+                              (rate_hz_g * 2L)));
                     /* Return value (samples accepted) deliberately
                        ignored: a real-time stream, not a queue --
                        audio_stream_feed() drops what it can't safely
@@ -1331,6 +1357,11 @@ static BOOL Click_spectrum(event_pollblock *event, void *reference)
                 discard_buffered_stream_data();
                 dsp_fm_reset();
                 reset_averaging();
+                /* The retune kept the app busy for a couple of hundred
+                   ms and the buffered audio was thrown away: rebuild the
+                   audio lead (with a moment of silence) rather than carry
+                   on with a thin one. */
+                audio_stream_relead();
             }
             sprintf(evmsg, "retune to %lu Hz took %u cs", new_freq,
                     Time_Monotonic() - retune_t0);
@@ -1421,6 +1452,11 @@ static window_handle create_spectrum_window(void)
     rwb.workarearect.max.y = 0;
 
     rwb.titleflags.data.text = 1;
+
+    /* Work-area button type 3 (click): without it the Wimp never reports
+       clicks on the bare graph (icon -1) -- the trace markers, see
+       Click_spectrum. */
+    rwb.workflags.data.buttontype = 3;
 
     rwb.spritearea = NULL;
     rwb.minsize_x = 0;
@@ -1771,7 +1807,15 @@ int main(void)
             rate_hz_g, xfer_kb, stream_buf_kb_g, burst_ms, lead_ms,
             fft_per_update_g, fft_stride_g, TICK_BUDGET_CS,
             stream_ok_g ? audio_stream_rate() : 0);
+    /* Sleep between polls for up to 20 ms when a transfer lasts long
+       enough that it makes no difference (see poll_idle_cs_g). */
+    poll_idle_cs_g = (unsigned int)(burst_ms / 40);
+    if (poll_idle_cs_g > 2) {
+        poll_idle_cs_g = 2;
+    }
+    sprintf(cfg + strlen(cfg), " poll_idle_cs=%u", poll_idle_cs_g);
     trace_init(getenv("RTLSDRView$Log"), cfg);
+    trace_set_idle_cs(poll_idle_cs_g);
     trace_event(Time_Monotonic(), "started");
 
     Window_Show(spectrum_window_g, open_CENTERED);
@@ -1785,7 +1829,7 @@ int main(void)
     next_update_time_g = Time_Monotonic();
 
     while (TRUE) {
-        Event_Poll();
+        Event_PollIdle(poll_idle_cs_g);
     }
 
     return 0; /* unreached */

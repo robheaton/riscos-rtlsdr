@@ -69,6 +69,9 @@ int os_gbpb_read4(int handle, unsigned char *buf, int len);
 void os_set_quiet(int quiet);
 const char *os_last_error(void);
 
+/* Bytes waiting unread in an open USB stream's DeviceFS buffer, or -1. */
+int usb_stream_used_bytes(const char *device_name, int stream_handle);
+
 /* RMA block claim/release (OS_Module 6/7); NULL on failure. */
 unsigned char *os_rma_claim(int size);
 void os_rma_free(unsigned char *p);
